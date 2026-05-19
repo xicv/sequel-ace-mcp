@@ -2,6 +2,28 @@
 
 All notable changes to **sequel-mcp** are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-05-19
+
+### Added
+
+- **Session-scoped confirm grants** — the elicit prompt fired by `confirm` actions is no longer a free-text `CONFIRM` field. The client now surfaces a four-choice radio: **Allow once** (this statement only), **Allow for session** (skip prompts for the same `(connection, database, category)` until the MCP server process exits), **Allow always** (persists `policy[category] = 'allow'` via the same writer `set_policy` uses), and **Decline**. Session grants live in an in-memory `GrantStore` (`src/policy/grants.ts`), are scoped per `(connection, database, category)`, and never touch disk — restarts re-arm the gate. Touch ID, the multi-DB strictest-wins resolver, and `deny` short-circuits are all unchanged: a session grant never bypasses Touch ID, and a grant on `staging` does not cover `prod`.
+
+### Changed
+
+- `evaluatePolicy` (`src/policy/gate.ts`) gained `grants`, `grantDatabase`, and `onAlwaysGrant` parameters; signature is backward-compatible for direct callers that only supply the original four args, since the new fields are optional.
+- `makeConfirmFn` (`src/elicit/confirm.ts`) now returns `'once' | 'session' | 'always' | 'decline'` instead of `boolean`. Non-accept responses and unknown values map to `'decline'` so missing/old clients fall back to the safest path.
+- Audit log shape unchanged for this release. Statements that pass via a session grant still log as `decision: 'confirm', confirmed: true` — recording grant origin in the audit row is deferred to a future minor release behind an additive column.
+
+### Tests
+
+- New: `tests/grants.test.ts` (7) — store consume/grantOnce/grantSession semantics, scope isolation across (conn, db, category), `clear` with and without filter, snapshot output.
+- Updated: `tests/gate.test.ts` — existing four cases migrated to the new `GrantChoice` return type, plus four new cases covering (a) session-grant skip, (b) `'session'` choice registering a grant for subsequent statements, (c) `'always'` invoking `onAlwaysGrant` exactly once with the right category, (d) cross-database scope isolation.
+- **Total: 181** (was 169 at 0.5.0, unchanged at 0.5.1). All previous tests still pass — zero behavioral regression for any code path where the user picks `Allow once`, which is the literal old `CONFIRM`-on-each-call behavior.
+
+### Notes
+
+- Local MCP clients that read `npx -y sequel-mcp` will pick up the new prompt automatically on the next session start (npx cache resolves to latest unless pinned). Existing connections, saved policies, and Keychain entries are untouched — purely additive.
+
 ## [0.5.1] — 2026-05-07
 
 ### Changed

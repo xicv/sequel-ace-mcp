@@ -1,3 +1,5 @@
+import type { GrantChoice } from '../elicit/confirm.js';
+import type { GrantStore } from './grants.js';
 import {
   PolicyConfirmationDeclinedError,
   PolicyDeniedError,
@@ -11,13 +13,15 @@ export interface ElicitConfirmFn {
     category: SqlCategory;
     statement: string;
     connectionName: string;
-  }): Promise<boolean>;
+  }): Promise<GrantChoice>;
 }
 
 export interface PolicyDecision {
   category: SqlCategory;
   action: PolicyAction;
   confirmed: boolean;
+  grantUsed?: 'once' | 'session' | null;
+  choiceApplied?: GrantChoice | null;
 }
 
 function actionForCategory(policy: Policy, category: SqlCategory): PolicyAction {
@@ -41,6 +45,9 @@ export async function evaluatePolicy(args: {
   statement: string;
   connectionName: string;
   elicitConfirm: ElicitConfirmFn;
+  grants?: GrantStore;
+  grantDatabase?: string | null;
+  onAlwaysGrant?: (category: SqlCategory) => Promise<void> | void;
 }): Promise<PolicyDecision> {
   const action = actionForCategory(args.policy, args.category);
   if (action === 'deny') {
@@ -49,13 +56,44 @@ export async function evaluatePolicy(args: {
   if (action === 'allow') {
     return { category: args.category, action, confirmed: false };
   }
-  const accepted = await args.elicitConfirm({
+
+  const grantKey = {
+    connection: args.connectionName,
+    database: args.grantDatabase ?? null,
+    category: args.category,
+  };
+
+  if (args.grants?.consume(grantKey)) {
+    return {
+      category: args.category,
+      action,
+      confirmed: true,
+      grantUsed: 'session',
+      choiceApplied: null,
+    };
+  }
+
+  const choice = await args.elicitConfirm({
     category: args.category,
     statement: args.statement,
     connectionName: args.connectionName,
   });
-  if (!accepted) {
+
+  if (choice === 'decline') {
     throw new PolicyConfirmationDeclinedError(args.category);
   }
-  return { category: args.category, action, confirmed: true };
+  if (choice === 'session') {
+    args.grants?.grantSession(grantKey);
+  } else if (choice === 'always') {
+    if (args.onAlwaysGrant) {
+      await args.onAlwaysGrant(args.category);
+    }
+  }
+  return {
+    category: args.category,
+    action,
+    confirmed: true,
+    grantUsed: null,
+    choiceApplied: choice,
+  };
 }

@@ -1,6 +1,6 @@
 {
   "name": "sequel-mcp",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "MCP server that lets Claude run MySQL/MariaDB queries with policy-gated action sets (allow/confirm/deny per category) and macOS Keychain credential storage. Optional one-time import of Sequel Ace favorites.",
   "type": "module",
   "bin": {

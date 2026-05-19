@@ -39,9 +39,10 @@ import { importFromSequelAce } from './importer/sequelAcePlist.js';
 import { readSequelAceHistory, statSequelAceHistory } from './importer/sequelAceHistory.js';
 import { searchUnifiedHistory } from './audit/history-search.js';
 import { makeConfirmFn } from './elicit/confirm.js';
+import { createGrantStore, type GrantStore } from './policy/grants.js';
 
 const PACKAGE_NAME = 'sequel-mcp';
-const PACKAGE_VERSION = '0.2.0';
+const PACKAGE_VERSION = '0.6.0';
 
 function toolError(text: string): CallToolResult {
   return { isError: true, content: [{ type: 'text', text }] };
@@ -91,6 +92,7 @@ export function buildServer(opts: AppOptions = {}): McpServer {
 
   const secretStore: SecretStore = opts.secretStore ?? new KeychainSecretStore();
   const confirmFn = makeConfirmFn(mcp.server);
+  const grants = createGrantStore();
   const auth = new SessionAuthenticator({ available: false, prompt: async () => false });
   void getTouchID().then((tid) => {
     Object.assign(auth, new SessionAuthenticator(tid));
@@ -100,7 +102,7 @@ export function buildServer(opts: AppOptions = {}): McpServer {
     .then((cfg) => maybeAutoCleanup(cfg.retention))
     .catch(() => undefined);
 
-  registerTools(mcp, { secretStore, confirmFn, auth });
+  registerTools(mcp, { secretStore, confirmFn, auth, grants });
   registerPrompts(mcp);
   registerResources(mcp, { secretStore });
 
@@ -111,6 +113,7 @@ interface ToolDeps {
   secretStore: SecretStore;
   confirmFn: ReturnType<typeof makeConfirmFn>;
   auth: SessionAuthenticator;
+  grants: GrantStore;
 }
 
 function registerTools(mcp: McpServer, deps: ToolDeps): void {
@@ -913,10 +916,11 @@ async function runSqlTool(params: {
   secretStore: SecretStore;
   confirmFn: ReturnType<typeof makeConfirmFn>;
   auth: SessionAuthenticator;
+  grants: GrantStore;
   args: { connection?: string; sql: string; database?: string };
   expectReadOnly: boolean;
 }): Promise<CallToolResult> {
-  const { args, secretStore, confirmFn, auth, expectReadOnly } = params;
+  const { args, secretStore, confirmFn, auth, grants, expectReadOnly } = params;
   const conn = await resolveConnection(args.connection);
   if (!conn) return toolError(noConnectionMessage(args.connection));
 
@@ -956,6 +960,11 @@ async function runSqlTool(params: {
           ? [conn.database]
           : [];
 
+  const grantDatabase =
+    resolved.contributingDatabase ??
+    (databasesForLog.length > 0 ? databasesForLog[0] : null) ??
+    null;
+
   try {
     await evaluatePolicy({
       policy: resolved.effective,
@@ -963,6 +972,14 @@ async function runSqlTool(params: {
       statement: args.sql,
       connectionName: conn.name,
       elicitConfirm: confirmFn,
+      grants,
+      grantDatabase,
+      onAlwaysGrant: async (category) => {
+        const fresh = await getConnection(conn.name);
+        if (!fresh) return;
+        const nextPolicy = PolicySchema.parse({ ...fresh.policy, [category]: 'allow' });
+        await upsertConnection({ ...fresh, policy: nextPolicy });
+      },
     });
   } catch (e) {
     const declined = e instanceof PolicyConfirmationDeclinedError;

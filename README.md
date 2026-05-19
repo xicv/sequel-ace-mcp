@@ -10,7 +10,7 @@ A Model Context Protocol server for **MySQL/MariaDB** with policy-gated action s
 
 ## Capabilities
 
-Current release: **v0.5.0**. Full version history: [CHANGELOG.md](./CHANGELOG.md).
+Current release: **v0.6.0**. Full version history: [CHANGELOG.md](./CHANGELOG.md).
 
 - **Two-layer permissions** — connection-level baseline + per-database overrides; strictest-wins for multi-DB statements (fail-closed).
 - **Pre-mutation backups** for UPDATE / DELETE / REPLACE / INSERT / TRUNCATE / DROP / ALTER, including multi-table UPDATE/DELETE.
@@ -22,6 +22,7 @@ Current release: **v0.5.0**. Full version history: [CHANGELOG.md](./CHANGELOG.md
 - **Database inside a remote Docker container** *(0.5.0)* — five access patterns documented; first-class support for the closed-container case via SSH + `docker exec` stdio bridge with allowlist-validated commands.
 - **SSH host key verification** *(0.5.0, opt-in)* — `hostKeyPolicy: 'strict'` matches against `~/.ssh/known_hosts`; SHA-256 fingerprint logged on every connect so users can opt in. `@revoked` markers honored even in lenient mode.
 - **TLS server name preservation through tunnel** *(0.5.0, opt-in)* — `sslServerName` forwards original hostname into TLS handshake so cert SAN verification works against the real DB host instead of the tunnel's `127.0.0.1`.
+- **Session-scoped confirm grants** *(0.6.0)* — `confirm` prompts now surface a four-choice radio (Allow once / Allow for session / Allow always / Decline). "Allow for session" skips further prompts for the same `(connection, database, category)` until the MCP server restarts; "Allow always" persists the policy as `allow`. Grants are RAM-only and per-(conn, db, category) — a session grant on `staging` does not cover `prod`.
 
 ## Install
 
@@ -116,7 +117,7 @@ Each connection has a policy with five categories. Each is `allow` | `confirm` |
 | `admin`  | `GRANT`, `REVOKE`, `SET GLOBAL`, `KILL`, `FLUSH`, `LOAD` |
 | `txCtrl` | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`               |
 
-`confirm` triggers an MCP **elicitation** — the client surfaces a dialog requiring you to type `CONFIRM` (uppercase, exact). The prompt is **server-issued per call** — no client allowlist can bypass it.
+`confirm` triggers an MCP **elicitation** — the client surfaces a radio with four choices: **Allow once** (this statement), **Allow for session** (skip prompts for the same `(connection, database, category)` until the MCP server restarts), **Allow always** (persist the policy as `allow` — equivalent to `set_policy`), or **Decline**. The prompt is **server-issued per call** — no client allowlist can bypass it.
 
 ### Presets
 
@@ -204,14 +205,30 @@ When `write=confirm`:
    --- SQL ---
    UPDATE staging.users SET email = 'x' WHERE id = 1
    --- end ---
-   Type CONFIRM (uppercase, exact) to proceed. Anything else cancels.
+
+   Pick an authorization scope.
+     ( ) Allow once (this statement only)
+     ( ) Allow for session (all WRITE statements until restart)
+     ( ) Allow always (persist policy as allow)
+     ( ) Decline
    ```
-3. Type `CONFIRM`. Anything else (typo, "yes", empty) cancels.
+3. Pick a scope. **Decline** (or closing the dialog) cancels.
 4. **Backup captured** via `SELECT … FOR UPDATE` in the same tx.
 5. Statement runs.
 6. Audit log entry written, linked to `backup_id`.
 
-You'd see this exact flow even if Claude is being prompt-injected — the prompt isn't bypassable from the model side.
+#### Choosing the right scope
+
+| Scope | Effect | Survives restart? | Use when |
+|-------|--------|-------------------|----------|
+| **Allow once** | This statement only. Next write re-prompts. | n/a (single shot) | One-off write — you want to review every subsequent statement too. |
+| **Allow for session** | Skips the prompt for the same `(connection, database, category)` on every later statement in this MCP session. | **No** — dies when the MCP server process exits. | You're running a batch (migration, bulk update) and don't want N prompts. Each restart re-arms the gate. |
+| **Allow always** | Mutates the saved policy: `policy[category] = 'allow'`. Equivalent to calling `set_policy`. | **Yes** — written to the config JSON. | The category should genuinely no longer be gated on this connection. |
+| **Decline** | Statement does not run; audit entry recorded as `declined`. | n/a | Reject this attempt. |
+
+Session grants are scoped per `(connection, database, category)`. A session grant for `acme-prod/staging:write` does **not** cover `acme-prod/prod:write` — the strictest-wins multi-DB resolver still applies, so a cross-DB statement that touches both is gated on the prod side until you grant that too. Session grants do **not** bypass Touch ID — `requireTouchID: true` still prompts independently.
+
+You'd see this exact flow even if Claude is being prompt-injected — the prompt isn't bypassable from the model side. And telling Claude in chat "I allow this" cannot register a grant on its own; the grant has to enter through the elicit dialog (or a future explicit grant tool).
 
 ### Reviewing the audit log (weekly habit)
 
