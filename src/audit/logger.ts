@@ -42,42 +42,42 @@ export function writeAuditEntry(entry: AuditEntryInput, opts: WriteAuditOptions)
   const sqlRaw = opts.redactSqlInLog ? sqlRedacted : entry.sql;
   const databases = JSON.stringify(entry.databases);
 
-  let prevHash: Buffer | null = null;
-  let rowHash: Buffer | null = null;
-
-  if (opts.tamperEvidentChain) {
-    const last = db
-      .prepare('SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1')
-      .get() as { row_hash: Buffer | null } | undefined;
-    prevHash = last?.row_hash ?? null;
-    const canonical = JSON.stringify({
-      ts,
-      requestId: entry.requestId,
-      connection: entry.connection,
-      databases,
-      category: entry.category,
-      astType: entry.astType ?? null,
-      sqlRedacted,
-      decision: entry.decision,
-      confirmed: entry.confirmed ? 1 : 0,
-      outcome: entry.outcome,
-      affectedRows: entry.affectedRows ?? null,
-      durationMs: entry.durationMs ?? null,
-      error: entry.error ?? null,
-      backupId: entry.backupId ?? null,
-    });
-    rowHash = hashRow(prevHash, canonical);
-  }
-
-  const result = db
-    .prepare(
-      `INSERT INTO audit_log
+  const insertStmt = db.prepare(
+    `INSERT INTO audit_log
         (ts, request_id, connection, databases, category, ast_type,
          sql_raw, sql_redacted, decision, confirmed, outcome,
          affected_rows, duration_ms, error_msg, backup_id, prev_hash, row_hash)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .run(
+  );
+  const tailStmt = db.prepare('SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1');
+
+  const writeTxn = db.transaction((): number => {
+    let prevHash: Buffer | null = null;
+    let rowHash: Buffer | null = null;
+
+    if (opts.tamperEvidentChain) {
+      const last = tailStmt.get() as { row_hash: Buffer | null } | undefined;
+      prevHash = last?.row_hash ?? null;
+      const canonical = JSON.stringify({
+        ts,
+        requestId: entry.requestId,
+        connection: entry.connection,
+        databases,
+        category: entry.category,
+        astType: entry.astType ?? null,
+        sqlRedacted,
+        decision: entry.decision,
+        confirmed: entry.confirmed ? 1 : 0,
+        outcome: entry.outcome,
+        affectedRows: entry.affectedRows ?? null,
+        durationMs: entry.durationMs ?? null,
+        error: entry.error ?? null,
+        backupId: entry.backupId ?? null,
+      });
+      rowHash = hashRow(prevHash, canonical);
+    }
+
+    const result = insertStmt.run(
       ts,
       entry.requestId,
       entry.connection,
@@ -96,7 +96,10 @@ export function writeAuditEntry(entry: AuditEntryInput, opts: WriteAuditOptions)
       prevHash,
       rowHash,
     );
-  return Number(result.lastInsertRowid);
+    return Number(result.lastInsertRowid);
+  });
+
+  return writeTxn.immediate();
 }
 
 export interface AuditSearchFilters {

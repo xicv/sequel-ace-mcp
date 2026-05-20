@@ -106,7 +106,6 @@ function looksLikeMultipleStatements(sql: string): boolean {
   const stripped = stripComments(sql);
   const trimmed = stripped.replace(/;\s*$/, '').trim();
   if (trimmed.length === 0) return false;
-  const inSingle = false;
   let q: '\'' | '"' | '`' | null = null;
   let depth = 0;
   for (let i = 0; i < trimmed.length; i++) {
@@ -124,7 +123,6 @@ function looksLikeMultipleStatements(sql: string): boolean {
     else if (c === ')') depth--;
     else if (c === ';' && depth === 0) return true;
   }
-  void inSingle;
   return false;
 }
 

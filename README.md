@@ -10,12 +10,12 @@ A Model Context Protocol server for **MySQL/MariaDB** with policy-gated action s
 
 ## Capabilities
 
-Current release: **v0.6.0**. Full version history: [CHANGELOG.md](./CHANGELOG.md).
+Current release: **v0.7.0**. Full version history: [CHANGELOG.md](./CHANGELOG.md).
 
 - **Two-layer permissions** — connection-level baseline + per-database overrides; strictest-wins for multi-DB statements (fail-closed).
 - **Pre-mutation backups** for UPDATE / DELETE / REPLACE / INSERT / TRUNCATE / DROP / ALTER, including multi-table UPDATE/DELETE.
 - **Restore from any backup** via `restore_backup`. Plans + executes; default `dryRun=true`. Subject to the same policy gate as live writes.
-- **Append-only audit log** at `~/.local/share/sequel-mcp/audit.sqlite` — redacted SQL, decision, outcome, duration, backup_id linkage; optional SHA-256 prev-hash chain.
+- **Append-only audit log** at `~/.local/share/sequel-mcp/audit.sqlite` — redacted SQL, decision, outcome, duration, backup_id linkage; optional SHA-256 prev-hash chain (now written inside a single `BEGIN IMMEDIATE` transaction for atomic chain integrity).
 - **Per-category retention** — `read=7d / write=30d / ddl=90d / admin=180d / txCtrl=7d`; auto-cleanup on boot.
 - **Unified history search** — merges our audit log with Sequel Ace's `queryHistory.db` (when present) into one timeline.
 - **macOS-native security** — Keychain-stored passwords (non-syncable, `WhenUnlockedThisDeviceOnly`); Touch ID via `LocalAuthentication`; SSH tunnels via `ssh2`.
@@ -23,6 +23,9 @@ Current release: **v0.6.0**. Full version history: [CHANGELOG.md](./CHANGELOG.md
 - **SSH host key verification** *(0.5.0, opt-in)* — `hostKeyPolicy: 'strict'` matches against `~/.ssh/known_hosts`; SHA-256 fingerprint logged on every connect so users can opt in. `@revoked` markers honored even in lenient mode.
 - **TLS server name preservation through tunnel** *(0.5.0, opt-in)* — `sslServerName` forwards original hostname into TLS handshake so cert SAN verification works against the real DB host instead of the tunnel's `127.0.0.1`.
 - **Session-scoped confirm grants** *(0.6.0)* — `confirm` prompts now surface a four-choice radio (Allow once / Allow for session / Allow always / Decline). "Allow for session" skips further prompts for the same `(connection, database, category)` until the MCP server restarts; "Allow always" persists the policy as `allow`. Grants are RAM-only and per-(conn, db, category) — a session grant on `staging` does not cover `prod`.
+- **Companion Claude Code Skill** *(0.7.0)* — ships `skills/using-sequel-mcp/SKILL.md` plus references for policy, recovery, and connections. Teaches Claude when to use `query` vs `execute`, how to relay the confirm grant scope, and the restore-from-backup workflow. Follows the May-2026 Anthropic skill authoring guideline (gerund name, third-person description, progressive disclosure).
+- **Structured tool results** *(0.7.0)* — every JSON-returning tool now emits `structuredContent` alongside the legacy text block per the latest MCP spec. Modern clients (Claude Code, Inspector) render structured responses; older clients are unaffected.
+- **Server modularized** *(0.7.0)* — `src/server.ts` split from a 1180-line monolith into `src/server/{shared,run-sql,prompts,resources}.ts` + `src/server/tools/{sql,connections,policy,audit,backup,doctor}.ts`. Public `buildServer` API unchanged. Touch ID resolves lazily on first use (fixes a boot-window race + mutation). `restore_backup` honors the user's *Decline* choice (was previously ignored).
 
 ## Install
 
@@ -71,6 +74,17 @@ claude mcp list   # sequel-mcp should appear with ✓ Connected
 ```
 
 In a Claude Code session, `/mcp` lists every tool the server exposes (25 at v0.5.0).
+
+### Install the companion Claude Code Skill (optional, v0.7.0+)
+
+The Skill at `skills/using-sequel-mcp/` teaches Claude *when* to use each tool — read-vs-execute decisions, confirm-grant scopes, the recovery workflow. Install it once:
+
+```bash
+mkdir -p ~/.claude/skills
+ln -sf "$(pwd)/skills/using-sequel-mcp" ~/.claude/skills/using-sequel-mcp
+```
+
+Claude Code picks up the SKILL.md frontmatter on next session start. The Skill loads body content only when relevant, so token cost is ~100 tokens per session until triggered.
 
 ### Wire into Claude Desktop
 

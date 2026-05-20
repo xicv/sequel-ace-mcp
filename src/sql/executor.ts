@@ -36,8 +36,10 @@ export function buildBaseOptions(args: {
 }): ConnectionOptions {
   let ssl: ConnectionOptions['ssl'];
   if (args.connection.ssl) {
+    // mysql2 forwards the ssl object to tls.connect, so `servername` is honored at
+    // runtime even though mysql2's SslOptions type doesn't list it.
     ssl = args.connection.sslServerName
-      ? ({ servername: args.connection.sslServerName } as unknown as ConnectionOptions['ssl'])
+      ? ({ servername: args.connection.sslServerName } as ConnectionOptions['ssl'])
       : {};
   }
   return {

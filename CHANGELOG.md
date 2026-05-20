@@ -2,6 +2,39 @@
 
 All notable changes to **sequel-mcp** are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] — 2026-05-20
+
+### Added
+
+- **Companion Claude Code Skill** — ships `skills/using-sequel-mcp/SKILL.md` + `references/{policy,recovery,connections}.md`, following the May-2026 Anthropic skill authoring guideline (gerund-form name, third-person ≤1024-char description, body ≤500 lines, refs one-level-deep). Teaches Claude when to pick `query` vs `execute`, how to surface the four-choice confirm grant scope, the recover-from-bad-mutation workflow, and where credentials/audit live.
+- **Repo `CLAUDE.md`** — fast orientation for Claude Code sessions: module layout, run/verify commands, repo conventions (immutability, single-statement rule, fail-closed policy), runtime paths.
+- **Tool results now emit `structuredContent`** — every `jsonResult`-returning tool (24 tools) returns both a legacy text block AND a `structuredContent` object per the latest MCP spec. Modern clients (Claude Code, Inspector) can render structured responses; older clients keep the text block unchanged. No tool argument or behavior change.
+
+### Changed
+
+- **`src/server.ts` split into `src/server/` modules** — the 1180-line monolith is now a 61-line orchestrator. Tool registrations live under `src/server/tools/{sql,connections,policy,audit,backup,doctor}.ts`. Shared helpers in `src/server/shared.ts`. Prompts and resources in their own files. Public API (`buildServer`) unchanged; no impact on consumers.
+- **Lazy Touch ID resolution** — replaced the `Object.assign(auth, …)` mutation + boot-window race with `createLazyAuth(provider)`. The TouchID prompt is resolved exactly once on the first `ensureAuthenticated` call. Provider is now injectable for tests.
+- **Audit-log writes wrapped in a single `BEGIN IMMEDIATE` transaction** — the previous `SELECT row_hash ORDER BY id DESC LIMIT 1` then `INSERT` sequence was not atomic; concurrent writers (or any future multi-writer scenario) could break the SHA-256 hash chain. The tail-read and insert now share one immediate transaction, so each `prev_hash` deterministically equals the previous row's `row_hash`.
+- **`list_connections` keychain lookup parallelized** — replaced the serial `for…await` over `secretStore.hasPassword(...)` with `Promise.all(map(...))`. N connections now resolve in 1× keychain RTT instead of N×.
+
+### Fixed
+
+- **`restore_backup` no longer ignores user decline** — the confirm path previously checked `if (!ok)` where `ok` was a `GrantChoice` string (`'once' | 'session' | 'always' | 'decline'`), all truthy. Declining a restore did nothing and the replay proceeded. Now correctly aborts when the choice is `'decline'`.
+- **Graceful shutdown** — `src/index.ts` registers `SIGINT`/`SIGTERM`/`beforeExit` hooks that WAL-checkpoint + close `better-sqlite3` so a kill mid-write does not leave WAL pages unmerged.
+- **Dead code** — removed an unused `inSingle` local + `void inSingle` in `policy/classifier.ts` left from a prior refactor.
+- **`executor.ts` ssl type** — drop the `as unknown as ConnectionOptions['ssl']` cast in favor of a typed assertion with an inline justification comment.
+
+### Tests
+
+- New: `tests/shared.test.ts` (10) — covers `jsonResult` structuredContent emission, scalar/array/null wrapping, `toolError` / `textResult` / `noConnectionMessage` semantics, and `createLazyAuth` provider-injection invariants (single resolution under 3-way concurrency, prompt failure propagates).
+- Updated: `tests/audit-logger.test.ts` — now verifies the SHA-256 chain itself (row N's `prev_hash` must equal row N-1's `row_hash`) plus a 20-row rapid-write test that proves the immediate-transaction wrapping holds the chain.
+- **Total: 193** (was 181 at 0.6.0). All previous tests still pass — zero behavioral regression for existing call paths.
+
+### Notes
+
+- No breaking API changes. `npx -y sequel-mcp` users pick up 0.7.0 on the next session start.
+- No SDK upgrade. `@modelcontextprotocol/sdk@1.29.0` (released 2026-03-30) remains the latest published version on npm.
+
 ## [0.6.0] — 2026-05-19
 
 ### Added

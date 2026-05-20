@@ -3,7 +3,7 @@ import os from 'node:os';
 import fs from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { writeAuditEntry, searchAuditLog } from '../src/audit/logger.js';
-import { closeAuditDb } from '../src/audit/db.js';
+import { closeAuditDb, openAuditDb } from '../src/audit/db.js';
 
 let dbFile: string;
 
@@ -53,8 +53,36 @@ describe('audit logger', () => {
     const common = { connection: 'c', databases: ['app'], category: 'read' as const, decision: 'allow' as const, confirmed: false, outcome: 'success' as const };
     writeAuditEntry({ ...common, requestId: 'r1', sql: 'SELECT 1' }, { redactSqlInLog: false, tamperEvidentChain: true, pathOverride: dbFile });
     writeAuditEntry({ ...common, requestId: 'r2', sql: 'SELECT 2' }, { redactSqlInLog: false, tamperEvidentChain: true, pathOverride: dbFile });
-    const rows = searchAuditLog({}, { pathOverride: dbFile });
-    expect(rows).toHaveLength(2);
+
+    // Verify the hash chain itself: row 1's row_hash must equal row 2's prev_hash.
+    const db = openAuditDb({ pathOverride: dbFile });
+    const raw = db
+      .prepare('SELECT id, prev_hash, row_hash FROM audit_log ORDER BY id ASC')
+      .all() as { id: number; prev_hash: Buffer | null; row_hash: Buffer | null }[];
+    expect(raw).toHaveLength(2);
+    expect(raw[0]?.prev_hash).toBeNull();
+    expect(raw[0]?.row_hash).toBeInstanceOf(Buffer);
+    expect(raw[1]?.prev_hash).toBeInstanceOf(Buffer);
+    expect(raw[1]?.row_hash).toBeInstanceOf(Buffer);
+    expect(raw[1]?.prev_hash?.equals(raw[0]!.row_hash!)).toBe(true);
+  });
+
+  it('writes the row inside a single transaction (no chain corruption across rapid writes)', () => {
+    const common = { connection: 'c', databases: [], category: 'read' as const, decision: 'allow' as const, confirmed: false, outcome: 'success' as const };
+    for (let i = 0; i < 20; i++) {
+      writeAuditEntry(
+        { ...common, requestId: `r${i}`, sql: `SELECT ${i}` },
+        { redactSqlInLog: false, tamperEvidentChain: true, pathOverride: dbFile },
+      );
+    }
+    const db = openAuditDb({ pathOverride: dbFile });
+    const raw = db
+      .prepare('SELECT id, prev_hash, row_hash FROM audit_log ORDER BY id ASC')
+      .all() as { id: number; prev_hash: Buffer | null; row_hash: Buffer | null }[];
+    expect(raw).toHaveLength(20);
+    for (let i = 1; i < raw.length; i++) {
+      expect(raw[i]?.prev_hash?.equals(raw[i - 1]!.row_hash!)).toBe(true);
+    }
   });
 
   it('filter by outcome', () => {
