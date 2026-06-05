@@ -4,6 +4,7 @@ const require = createRequire(import.meta.url);
 const { Parser } = require('node-sql-parser') as typeof import('node-sql-parser');
 
 const parser = new Parser();
+export type SqlDialect = 'mysql' | 'sqlite';
 
 export type BackupSpec =
   | { kind: 'none'; reason?: string }
@@ -69,14 +70,16 @@ function buildSelectFor(args: {
   fromTables: TableRef[];
   where: unknown;
   forUpdate: boolean;
+  dialect: SqlDialect;
 }): string | null {
+  const lockSuffix = args.forUpdate && args.dialect === 'mysql' ? ' FOR UPDATE' : '';
   if (args.fromTables.length === 0) return null;
   if (args.fromTables.length === 1) {
     const t = args.fromTables[0]!;
     if (!t.table) return null;
     if (!args.where) {
       const base = `SELECT ${args.selectColumns} FROM ${tableRefSql(t.db ?? null, t.table)}`;
-      return args.forUpdate ? `${base} FOR UPDATE` : base;
+      return `${base}${lockSuffix}`;
     }
   }
 
@@ -97,9 +100,9 @@ function buildSelectFor(args: {
         orderby: null,
         limit: null,
       };
-      const sql = parser.sqlify(tmpAst as unknown as Parameters<typeof parser.sqlify>[0], { database: 'mysql' });
+      const sql = parser.sqlify(tmpAst as unknown as Parameters<typeof parser.sqlify>[0], { database: args.dialect });
       if (typeof sql !== 'string') return null;
-      return args.forUpdate ? `${sql} FOR UPDATE` : sql;
+      return `${sql}${lockSuffix}`;
     } catch {
       return null;
     }
@@ -129,11 +132,13 @@ function buildPerTableSelect(args: {
   target: TableRef;
   fullFrom: TableRef[];
   where: unknown;
+  dialect: SqlDialect;
 }): string | null {
+  const lockSuffix = args.dialect === 'mysql' ? ' FOR UPDATE' : '';
   const targetName = args.target.as ?? args.target.table;
   const colExpr = `${quoteId(targetName!)}.*`;
   if (args.fullFrom.length === 1 && !args.where) {
-    return `SELECT ${colExpr} FROM ${tableRefSql(args.target.db ?? null, args.target.table!)} FOR UPDATE`;
+    return `SELECT ${colExpr} FROM ${tableRefSql(args.target.db ?? null, args.target.table!)}${lockSuffix}`;
   }
   try {
     const tmpAst = {
@@ -149,9 +154,9 @@ function buildPerTableSelect(args: {
       orderby: null,
       limit: null,
     };
-    const sql = parser.sqlify(tmpAst as unknown as Parameters<typeof parser.sqlify>[0], { database: 'mysql' });
+    const sql = parser.sqlify(tmpAst as unknown as Parameters<typeof parser.sqlify>[0], { database: args.dialect });
     if (typeof sql !== 'string') return null;
-    return `${sql} FOR UPDATE`;
+    return `${sql}${lockSuffix}`;
   } catch {
     return null;
   }
@@ -185,10 +190,15 @@ function guessPkColumn(columns: string[]): { name: string; index: number } | nul
   return null;
 }
 
-export function extractBackupSpec(sql: string, astType: string): BackupSpec {
+export function extractBackupSpec(
+  sql: string,
+  astType: string,
+  opts: { dialect?: SqlDialect } = {},
+): BackupSpec {
+  const dialect = opts.dialect ?? 'mysql';
   let ast: UpdateLikeAst | null = null;
   try {
-    const parsed = parser.astify(sql, { database: 'mysql' });
+    const parsed = parser.astify(sql, { database: dialect });
     ast = (Array.isArray(parsed) ? parsed[0] : parsed) as UpdateLikeAst | null;
   } catch (e) {
     return { kind: 'none', reason: `parse error: ${(e as Error).message}` };
@@ -204,25 +214,43 @@ export function extractBackupSpec(sql: string, astType: string): BackupSpec {
     if (fromTables.length === 1) {
       const target = fromTables[0]!;
       if (!target.table) return { kind: 'none', reason: 'UPDATE missing table name' };
-      const selectSql = buildSelectFor({ selectColumns: '*', fromTables, where: ast.where, forUpdate: true });
+      const selectSql = buildSelectFor({
+        selectColumns: '*',
+        fromTables,
+        where: ast.where,
+        forUpdate: true,
+        dialect,
+      });
       if (!selectSql) return { kind: 'none', reason: 'failed to construct backup SELECT' };
       return {
         kind: 'rows',
-        tables: [{ db: target.db ?? null, table: target.table, selectSql, locking: 'FOR UPDATE' }],
+        tables: [
+          {
+            db: target.db ?? null,
+            table: target.table,
+            selectSql,
+            locking: dialect === 'mysql' ? 'FOR UPDATE' : 'NONE',
+          },
+        ],
       };
     }
 
     const setEntries = ast.set ?? [];
     if (setEntries.length === 0) return { kind: 'none', reason: 'multi-table UPDATE has no SET' };
     const mutated = inferMutatedTables(setEntries, fromTables);
-    const tables: { db: string | null; table: string; selectSql: string; locking: 'FOR UPDATE' }[] = [];
+    const tables: { db: string | null; table: string; selectSql: string; locking: 'FOR UPDATE' | 'NONE' }[] = [];
     for (const target of mutated) {
       if (!target.table) continue;
-      const selectSql = buildPerTableSelect({ target, fullFrom: fromTables, where: ast.where });
+      const selectSql = buildPerTableSelect({ target, fullFrom: fromTables, where: ast.where, dialect });
       if (!selectSql) {
         return { kind: 'none', reason: `failed to construct backup SELECT for table "${target.table}"` };
       }
-      tables.push({ db: target.db ?? null, table: target.table, selectSql, locking: 'FOR UPDATE' });
+      tables.push({
+        db: target.db ?? null,
+        table: target.table,
+        selectSql,
+        locking: dialect === 'mysql' ? 'FOR UPDATE' : 'NONE',
+      });
     }
     if (tables.length === 0) return { kind: 'none', reason: 'no mutated tables identified in multi-table UPDATE' };
     return { kind: 'rows', tables };
@@ -236,25 +264,43 @@ export function extractBackupSpec(sql: string, astType: string): BackupSpec {
     if (fromTables.length === 1) {
       const target = fromTables[0]!;
       if (!target.table) return { kind: 'none', reason: 'DELETE missing table name' };
-      const selectSql = buildSelectFor({ selectColumns: '*', fromTables, where: ast.where, forUpdate: true });
+      const selectSql = buildSelectFor({
+        selectColumns: '*',
+        fromTables,
+        where: ast.where,
+        forUpdate: true,
+        dialect,
+      });
       if (!selectSql) return { kind: 'none', reason: 'failed to construct backup SELECT' };
       return {
         kind: 'rows',
-        tables: [{ db: target.db ?? null, table: target.table, selectSql, locking: 'FOR UPDATE' }],
+        tables: [
+          {
+            db: target.db ?? null,
+            table: target.table,
+            selectSql,
+            locking: dialect === 'mysql' ? 'FOR UPDATE' : 'NONE',
+          },
+        ],
       };
     }
 
     const targets = deleteTargets.length > 0 ? deleteTargets : fromTables;
-    const tables: { db: string | null; table: string; selectSql: string; locking: 'FOR UPDATE' }[] = [];
+    const tables: { db: string | null; table: string; selectSql: string; locking: 'FOR UPDATE' | 'NONE' }[] = [];
     for (const target of targets) {
       const ref = target.table ? findRefForName(fromTables, target.table) : null;
       const actual = ref ?? target;
       if (!actual?.table) continue;
-      const selectSql = buildPerTableSelect({ target: actual, fullFrom: fromTables, where: ast.where });
+      const selectSql = buildPerTableSelect({ target: actual, fullFrom: fromTables, where: ast.where, dialect });
       if (!selectSql) {
         return { kind: 'none', reason: `failed to construct backup SELECT for table "${actual.table}"` };
       }
-      tables.push({ db: actual.db ?? null, table: actual.table, selectSql, locking: 'FOR UPDATE' });
+      tables.push({
+        db: actual.db ?? null,
+        table: actual.table,
+        selectSql,
+        locking: dialect === 'mysql' ? 'FOR UPDATE' : 'NONE',
+      });
     }
     if (tables.length === 0) return { kind: 'none', reason: 'no DELETE targets identified' };
     return { kind: 'rows', tables };
@@ -270,11 +316,19 @@ export function extractBackupSpec(sql: string, astType: string): BackupSpec {
     if (cols.length > 0 && pk && allRows && allRows.length > 0) {
       const pkValues = allRows.map((row) => row[pk.index]);
       const placeholders = pkValues.map(() => '?').join(', ');
-      const selectSql = `SELECT * FROM ${tableRefSql(target.db ?? null, target.table)} WHERE ${quoteId(pk.name)} IN (${placeholders}) FOR UPDATE`;
+      const lockSuffix = dialect === 'mysql' ? ' FOR UPDATE' : '';
+      const selectSql = `SELECT * FROM ${tableRefSql(target.db ?? null, target.table)} WHERE ${quoteId(pk.name)} IN (${placeholders})${lockSuffix}`;
       const bound = bindLiterals(selectSql, pkValues);
       return {
         kind: 'rows',
-        tables: [{ db: target.db ?? null, table: target.table, selectSql: bound, locking: 'FOR UPDATE' }],
+        tables: [
+          {
+            db: target.db ?? null,
+            table: target.table,
+            selectSql: bound,
+            locking: dialect === 'mysql' ? 'FOR UPDATE' : 'NONE',
+          },
+        ],
       };
     }
     return { kind: 'none', reason: 'REPLACE without identifiable PK column; no backup taken' };

@@ -1,5 +1,8 @@
 import type mysql from 'mysql2/promise';
+import type Database from 'better-sqlite3';
 import { getBackup } from './capture.js';
+
+type RestoreDialect = 'mysql' | 'sqlite';
 
 function quoteId(id: string): string {
   return '`' + id.replace(/`/g, '``') + '`';
@@ -9,12 +12,12 @@ function tableRefSql(db: string | null, table: string): string {
   return db ? `${quoteId(db)}.${quoteId(table)}` : quoteId(table);
 }
 
-function escapeValue(v: unknown): string {
+function escapeValue(v: unknown, dialect: RestoreDialect): string {
   if (v === null || v === undefined) return 'NULL';
   if (typeof v === 'number' || typeof v === 'bigint') return String(v);
   if (typeof v === 'boolean') return v ? '1' : '0';
   if (v instanceof Date) return `'${v.toISOString().slice(0, 19).replace('T', ' ')}'`;
-  if (Buffer.isBuffer(v)) return `0x${v.toString('hex')}`;
+  if (Buffer.isBuffer(v)) return dialect === 'sqlite' ? `X'${v.toString('hex')}'` : `0x${v.toString('hex')}`;
   if (typeof v === 'object') return `'${JSON.stringify(v).replace(/'/g, "''").replace(/\\/g, '\\\\')}'`;
   return `'${String(v).replace(/'/g, "''").replace(/\\/g, '\\\\')}'`;
 }
@@ -26,9 +29,13 @@ export interface RestorePlan {
   warnings: string[];
 }
 
-export function planRestore(backupId: number, opts?: { pathOverride?: string }): RestorePlan {
+export function planRestore(
+  backupId: number,
+  opts?: { pathOverride?: string; dialect?: RestoreDialect },
+): RestorePlan {
   const backup = getBackup(backupId, opts);
   if (!backup) throw new Error(`backup #${backupId} not found`);
+  const dialect = opts?.dialect ?? 'mysql';
 
   const statements: string[] = [];
   const warnings: string[] = [];
@@ -63,7 +70,7 @@ export function planRestore(backupId: number, opts?: { pathOverride?: string }):
     } else {
       const colExpr = meta.columns.map(quoteId).join(', ');
       const valueRows = meta.values
-        .map((row) => `(${row.map((v) => escapeValue(v)).join(', ')})`)
+        .map((row) => `(${row.map((v) => escapeValue(v, dialect)).join(', ')})`)
         .join(', ');
       statements.push(`DELETE FROM ${tref} WHERE (${colExpr}) IN (${valueRows});`);
     }
@@ -76,13 +83,22 @@ export function planRestore(backupId: number, opts?: { pathOverride?: string }):
     const sample = backup.rows[0] as Record<string, unknown>;
     const cols = Object.keys(sample);
     const colList = cols.map(quoteId).join(', ');
-    const updateClause = cols.map((c) => `${quoteId(c)} = VALUES(${quoteId(c)})`).join(', ');
+    const updateClause =
+      dialect === 'sqlite'
+        ? cols.map((c) => `${quoteId(c)} = excluded.${quoteId(c)}`).join(', ')
+        : cols.map((c) => `${quoteId(c)} = VALUES(${quoteId(c)})`).join(', ');
 
     for (const row of backup.rows as Record<string, unknown>[]) {
-      const values = cols.map((c) => escapeValue(row[c])).join(', ');
-      statements.push(
-        `INSERT INTO ${tref} (${colList}) VALUES (${values}) ON DUPLICATE KEY UPDATE ${updateClause};`,
-      );
+      const values = cols.map((c) => escapeValue(row[c], dialect)).join(', ');
+      if (dialect === 'sqlite') {
+        statements.push(
+          `INSERT INTO ${tref} (${colList}) VALUES (${values}) ON CONFLICT DO UPDATE SET ${updateClause};`,
+        );
+      } else {
+        statements.push(
+          `INSERT INTO ${tref} (${colList}) VALUES (${values}) ON DUPLICATE KEY UPDATE ${updateClause};`,
+        );
+      }
     }
   }
 
@@ -98,6 +114,24 @@ export async function executeRestore(args: {
     const [r] = await args.conn.query(stmt);
     if (r && typeof r === 'object' && 'affectedRows' in r) {
       affected += Number((r as { affectedRows: number }).affectedRows ?? 0);
+    }
+  }
+  return { statementsRun: args.plan.statements.length, affected };
+}
+
+export function executeRestoreSqlite(args: {
+  db: Database.Database;
+  plan: RestorePlan;
+}): { statementsRun: number; affected: number } {
+  let affected = 0;
+  for (const stmtRaw of args.plan.statements) {
+    const stmtText = stmtRaw.replace(/;\s*$/, '');
+    const stmt = args.db.prepare(stmtText);
+    if (stmt.reader) {
+      stmt.all();
+    } else {
+      const r = stmt.run();
+      affected += r.changes;
     }
   }
   return { statementsRun: args.plan.statements.length, affected };

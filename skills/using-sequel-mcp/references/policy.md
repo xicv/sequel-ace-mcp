@@ -27,7 +27,7 @@ Every classified statement maps to exactly one category. Misclassification is fa
 
 ## Presets
 
-`sequel-mcp:add_connection` accepts `policyPreset` ∈ `{ read-only, dev, admin }`.
+`sequel-mcp:add_connection` and `sequel-mcp:add_sqlite_connection` accept `policyPreset` ∈ `{ read-only, dev, admin }`.
 
 | Preset | read | write | ddl | admin | txCtrl | rowCap | stmtTimeoutMs | requireTouchID |
 |--------|------|-------|-----|-------|--------|--------|---------------|----------------|

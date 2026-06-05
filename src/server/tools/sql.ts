@@ -1,7 +1,16 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { runSqlTool } from '../run-sql.js';
-import type { ToolDeps } from '../shared.js';
+import { noConnectionMessage, toolError, type ToolDeps } from '../shared.js';
+import { resolveConnection } from '../../vault/config.js';
+
+function quoteId(id: string): string {
+  return '`' + id.replace(/`/g, '``') + '`';
+}
+
+function quoteString(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
 
 export function registerSqlTools(mcp: McpServer, deps: ToolDeps): void {
   const queryShape = {
@@ -11,7 +20,7 @@ export function registerSqlTools(mcp: McpServer, deps: ToolDeps): void {
       .optional()
       .describe('Configured connection name. Omit to use the default connection set via set_default_connection.'),
     sql: z.string().min(1).describe('Single SQL statement (multi-statement input rejected)'),
-    database: z.string().optional().describe('Override default database'),
+    database: z.string().optional().describe('Override default database/schema'),
   };
 
   mcp.registerTool(
@@ -19,7 +28,7 @@ export function registerSqlTools(mcp: McpServer, deps: ToolDeps): void {
     {
       title: 'Run a read-only SQL query',
       description:
-        'Run a single read-only SQL statement (SELECT/SHOW/DESCRIBE/EXPLAIN). Wrapped in START TRANSACTION READ ONLY. Server-side enforced even if the connection user has write privileges.',
+        'Run a single read-only SQL statement (SELECT/SHOW/DESCRIBE/EXPLAIN, plus read-only SQLite PRAGMA). MySQL/MariaDB uses START TRANSACTION READ ONLY; SQLite opens a read-only file handle.',
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -52,7 +61,7 @@ export function registerSqlTools(mcp: McpServer, deps: ToolDeps): void {
     'describe_table',
     {
       title: 'Describe a table',
-      description: 'Run DESCRIBE <table>. Always read-only.',
+      description: 'Describe a table. Uses DESCRIBE on MySQL/MariaDB and PRAGMA table_info on SQLite. Always read-only.',
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
       inputSchema: {
         connection: z.string().min(1).optional(),
@@ -61,9 +70,14 @@ export function registerSqlTools(mcp: McpServer, deps: ToolDeps): void {
       },
     },
     async (args) => {
-      const sql = args.database
-        ? `DESCRIBE \`${args.database}\`.\`${args.table}\``
-        : `DESCRIBE \`${args.table}\``;
+      const conn = await resolveConnection(args.connection);
+      if (!conn) return toolError(noConnectionMessage(args.connection));
+      const sql =
+        conn.driver === 'sqlite'
+          ? `PRAGMA ${quoteId(args.database ?? conn.database ?? 'main')}.table_info(${quoteString(args.table)})`
+          : args.database
+            ? `DESCRIBE ${quoteId(args.database)}.${quoteId(args.table)}`
+            : `DESCRIBE ${quoteId(args.table)}`;
       return runSqlTool({
         deps,
         args: { connection: args.connection, sql, database: args.database },
@@ -76,15 +90,21 @@ export function registerSqlTools(mcp: McpServer, deps: ToolDeps): void {
     'list_databases',
     {
       title: 'List databases',
-      description: 'SHOW DATABASES on the given connection.',
+      description: 'SHOW DATABASES on MySQL/MariaDB or PRAGMA database_list on SQLite.',
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
       inputSchema: { connection: z.string().min(1).optional() },
     },
-    async (args) =>
-      runSqlTool({
+    async (args) => {
+      const conn = await resolveConnection(args.connection);
+      if (!conn) return toolError(noConnectionMessage(args.connection));
+      return runSqlTool({
         deps,
-        args: { connection: args.connection, sql: 'SHOW DATABASES' },
+        args: {
+          connection: args.connection,
+          sql: conn.driver === 'sqlite' ? 'PRAGMA database_list' : 'SHOW DATABASES',
+        },
         expectReadOnly: true,
-      }),
+      });
+    },
   );
 }

@@ -1,37 +1,38 @@
 ---
 name: using-sequel-mcp
-description: Run safe MySQL/MariaDB queries through the sequel-mcp server with policy-gated writes, pre-mutation backups, and macOS Keychain credentials. Use when the user wants to inspect, query, or modify a MySQL/MariaDB database from Claude, recover from a bad mutation, audit recent SQL activity, or import existing Sequel Ace connections. Covers read-only queries, gated writes/DDL/admin statements, restore-from-backup, per-database policy overrides, and SSH/Docker tunnel connections.
+description: Run safe MySQL/MariaDB or SQLite queries through the sequel-mcp server with policy-gated writes, pre-mutation backups, MySQL/MariaDB Keychain credentials, and passwordless SQLite file connections. Use when the user wants to inspect, query, or modify a MySQL/MariaDB or SQLite database from an AI coding agent such as Claude Code or Codex, recover from a bad mutation, audit recent SQL activity, or import existing Sequel Ace connections. Covers read-only queries, gated writes/DDL/admin statements, restore-from-backup, per-database policy overrides, SQLite files, and SSH/Docker tunnel connections.
 ---
 
 # Using sequel-mcp
 
-`sequel-mcp` is an MCP server that lets Claude run real MySQL/MariaDB SQL behind a policy gate. Every statement is classified (`read` / `write` / `ddl` / `admin` / `txCtrl`) and the corresponding action — `allow`, `confirm`, `deny` — is applied per-connection (and per-database, if overrides exist). Mutations are backed up before execution so they can be replayed if the result is wrong.
+`sequel-mcp` is an MCP server that lets an AI coding agent run real MySQL/MariaDB or SQLite SQL behind a policy gate. Every statement is classified (`read` / `write` / `ddl` / `admin` / `txCtrl`) and the corresponding action — `allow`, `confirm`, `deny` — is applied per-connection (and per-database/schema, if overrides exist). Mutations are backed up before execution so they can be replayed if the result is wrong.
 
 ## When to use this skill
 
-- The user asks to query, modify, or inspect a MySQL or MariaDB database.
+- The user asks to query, modify, or inspect a MySQL, MariaDB, or SQLite database.
 - The user wants to recover from a recent `UPDATE` / `DELETE` / `DROP` they (or you) ran.
 - The user wants to audit what SQL was run, when, and from which connection.
 - The user wants to import their existing Sequel Ace favorites.
 
-Do not use for: Postgres, SQLite, MSSQL, NoSQL, or generic "run shell SQL" requests outside MySQL/MariaDB.
+Do not use for: Postgres, MSSQL, NoSQL, or generic "run shell SQL" requests outside supported MySQL/MariaDB/SQLite connections.
 
 ## Tools at a glance
 
-All tools are namespaced as `sequel-mcp:tool_name`.
+Client UIs render MCP tool names differently. Claude Code commonly shows `sequel-mcp:query`; Codex may expose the same tool as `mcp__sequel-mcp__query` or another namespaced form. Map those names back to the core tool names below.
 
 **Read path (always safe):**
 - `sequel-mcp:list_connections` — what's configured (no secrets)
 - `sequel-mcp:get_default_connection` / `sequel-mcp:set_default_connection`
 - `sequel-mcp:list_databases` / `sequel-mcp:describe_table`
-- `sequel-mcp:query` — single read-only statement wrapped in `START TRANSACTION READ ONLY`
+- `sequel-mcp:query` — single read-only statement. MySQL/MariaDB reads are wrapped in `START TRANSACTION READ ONLY`; SQLite reads open the file read-only.
 
 **Write path (policy-gated):**
 - `sequel-mcp:execute` — `INSERT/UPDATE/DELETE/DDL/admin`. The server elicits a 4-choice confirm when the category is `confirm`: *once / session / always / decline*.
 - `sequel-mcp:restore_backup` — replay a pre-mutation backup; `dryRun=true` by default.
 
 **Policy + setup:**
-- `sequel-mcp:add_connection` / `sequel-mcp:remove_connection` — password is captured via elicitation, never via tool args.
+- `sequel-mcp:add_connection` / `sequel-mcp:remove_connection` — MySQL/MariaDB password is captured via elicitation, never via tool args.
+- `sequel-mcp:add_sqlite_connection` — SQLite file connection; no password or Keychain entry.
 - `sequel-mcp:set_policy` — change baseline action set + caps.
 - `sequel-mcp:set_database_policy` / `sequel-mcp:clear_database_policy` / `sequel-mcp:list_database_policies` — per-DB overrides; strictest wins for multi-DB statements.
 - `sequel-mcp:select_database` — change a connection's default DB.
@@ -49,7 +50,7 @@ All tools are namespaced as `sequel-mcp:tool_name`.
 
 | Statement | Tool |
 |-----------|------|
-| `SELECT`, `SHOW`, `DESCRIBE`, `EXPLAIN` | `sequel-mcp:query` |
+| `SELECT`, `SHOW`, `DESCRIBE`, `EXPLAIN`, read-only SQLite `PRAGMA` | `sequel-mcp:query` |
 | `INSERT`, `UPDATE`, `DELETE`, `REPLACE`, `TRUNCATE` | `sequel-mcp:execute` |
 | `CREATE`, `DROP`, `ALTER`, `RENAME` (DDL) | `sequel-mcp:execute` |
 | `GRANT`, `REVOKE`, `FLUSH`, `KILL`, `SET GLOBAL` (admin) | `sequel-mcp:execute` |
@@ -99,7 +100,7 @@ A session grant on `staging` does **not** cover `prod`. Surface the scope clearl
 
 ## Common mistakes to avoid
 
-1. **Do not include passwords in `add_connection` arguments.** The server collects the password through a separate elicitation channel and writes to the macOS Keychain. Tool arguments are logged; the elicitation reply is not.
+1. **Do not include passwords in `add_connection` arguments.** The server collects MySQL/MariaDB passwords through a separate elicitation channel and writes to the macOS Keychain. Tool arguments are logged; the elicitation reply is not. SQLite uses `add_sqlite_connection` and has no password.
 2. **Do not stack statements.** `SELECT 1; SELECT 2;` is rejected. Issue two calls instead.
 3. **Do not bypass policy by asking the user to lower it.** If the user wants to allow `write` permanently, walk them through the *"Allow always"* choice in the confirm prompt — that's the same outcome but with explicit consent.
 4. **Do not lose the `backup_id`.** Whenever `sequel-mcp:execute` returns a non-null `backupId`, mention it to the user in your reply — it's their rollback handle.
@@ -109,7 +110,7 @@ A session grant on `staging` does **not** cover `prod`. Surface the scope clearl
 
 - Policy + per-DB overrides + presets: see [references/policy.md](references/policy.md)
 - Recovery + restore semantics + insert-hint backups: see [references/recovery.md](references/recovery.md)
-- Connection types (direct, SSH, SSH+Docker, TLS-through-tunnel): see [references/connections.md](references/connections.md)
+- Connection types (SQLite, direct MySQL/MariaDB, SSH, SSH+Docker, TLS-through-tunnel): see [references/connections.md](references/connections.md)
 
 ## File paths used by the server
 
@@ -117,4 +118,4 @@ A session grant on `staging` does **not** cover `prod`. Surface the scope clearl
 - Audit DB: `~/.local/share/sequel-mcp/audit.sqlite` (WAL mode, mmap, foreign keys on)
 - Keychain service prefix: `sequel-mcp : <connection-name>`
 
-Audit + backup data is local to the user's machine; no telemetry, no network calls beyond MySQL/MariaDB + SSH targets the user configures.
+Audit + backup data is local to the user's machine; no telemetry, no network calls beyond MySQL/MariaDB + SSH targets the user configures. SQLite connections access only the configured local database file path.

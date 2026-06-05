@@ -7,7 +7,7 @@ export function registerPrompts(mcp: McpServer): void {
     {
       title: 'Set up a new database connection',
       description:
-        'Walks through host, port, user, database, then asks for a password via elicitation and stores it in the macOS Keychain.',
+        'Walks through adding either a MySQL/MariaDB connection with Keychain password capture or a SQLite file connection with no password.',
       argsSchema: {
         suggestedName: z.string().optional(),
       },
@@ -19,8 +19,8 @@ export function registerPrompts(mcp: McpServer): void {
           content: {
             type: 'text',
             text:
-              `I want to add a new MySQL/MariaDB connection${args.suggestedName ? ` called "${args.suggestedName}"` : ''}.\n\n` +
-              `Use the "add_connection" tool. Ask me for: name, host, port (default 3306), user, database (optional), ssl (default false), policy preset (read-only | dev | admin), and optional SSH tunnel (host/port/user/keyPath). The tool will then prompt me for the password via elicitation. Do NOT include the password in the tool arguments — the tool collects it through the secure elicitation channel.`,
+              `I want to add a new database connection${args.suggestedName ? ` called "${args.suggestedName}"` : ''}.\n\n` +
+              `First ask whether it is MySQL/MariaDB or SQLite. For MySQL/MariaDB, use "add_connection" and ask for: name, host, port (default 3306), user, database (optional), ssl (default false), policy preset (read-only | dev | admin), and optional SSH tunnel (host/port/user/keyPath). The tool will then prompt me for the password via elicitation. Do NOT include the password in the tool arguments. For SQLite, use "add_sqlite_connection" and ask for name, path, database/schema (usually main), and policy preset; no password is used.`,
           },
         },
       ],
@@ -42,8 +42,8 @@ export function registerPrompts(mcp: McpServer): void {
             type: 'text',
             text:
               `Analyze table \`${args.table}\`${args.database ? ` in database \`${args.database}\`` : ''} on connection "${args.connection}". ` +
-              `Use only read-only tools: describe_table, list_databases, and query (SELECT/SHOW only). Specifically: ` +
-              `1) describe schema, 2) SHOW INDEX FROM the table, 3) SELECT COUNT(*), 4) SELECT * LIMIT 5. Summarize findings.`,
+              `Use only read-only tools: describe_table, list_databases, and query (SELECT/SHOW or read-only SQLite PRAGMA only). Specifically: ` +
+              `1) describe schema, 2) inspect indexes (SHOW INDEX for MySQL/MariaDB; PRAGMA index_list/index_info for SQLite), 3) SELECT COUNT(*), 4) SELECT * LIMIT 5. Summarize findings.`,
           },
         },
       ],

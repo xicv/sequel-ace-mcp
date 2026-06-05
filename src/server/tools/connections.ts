@@ -1,7 +1,9 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
-  ConnectionSchema,
+  MySqlConnectionSchema,
+  SqliteConnectionSchema,
+  isMySqlConnection,
   type PolicyPresetName,
 } from '../../types.js';
 import {
@@ -31,12 +33,14 @@ export function registerConnectionTools(mcp: McpServer, deps: ToolDeps): void {
       const sanitized = await Promise.all(
         cfg.connections.map(async (c) => ({
           name: c.name,
-          host: c.host,
-          port: c.port,
-          user: c.user,
+          driver: c.driver,
+          host: isMySqlConnection(c) ? c.host : undefined,
+          port: isMySqlConnection(c) ? c.port : undefined,
+          user: isMySqlConnection(c) ? c.user : undefined,
+          path: isMySqlConnection(c) ? undefined : c.path,
           database: c.database,
-          ssl: c.ssl,
-          ssh: c.ssh
+          ssl: isMySqlConnection(c) ? c.ssl : undefined,
+          ssh: isMySqlConnection(c) && c.ssh
             ? {
                 host: c.ssh.host,
                 user: c.ssh.user,
@@ -51,7 +55,9 @@ export function registerConnectionTools(mcp: McpServer, deps: ToolDeps): void {
             : null,
           policy: c.policy,
           isDefault: c.name === cfg.defaultConnection,
-          hasStoredPassword: await deps.secretStore.hasPassword(c.name, c.user),
+          hasStoredPassword: isMySqlConnection(c)
+            ? await deps.secretStore.hasPassword(c.name, c.user)
+            : false,
         })),
       );
       return jsonResult({ defaultConnection: cfg.defaultConnection ?? null, connections: sanitized });
@@ -67,9 +73,9 @@ export function registerConnectionTools(mcp: McpServer, deps: ToolDeps): void {
   mcp.registerTool(
     'add_connection',
     {
-      title: 'Add or update a connection',
+      title: 'Add or update a MySQL/MariaDB connection',
       description:
-        'Persist a connection. The password is captured via elicitation and stored in the macOS Keychain; it never appears in tool arguments or logs.',
+        'Persist a MySQL/MariaDB connection. The password is captured via elicitation and stored in the macOS Keychain; it never appears in tool arguments or logs.',
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
@@ -141,7 +147,8 @@ export function registerConnectionTools(mcp: McpServer, deps: ToolDeps): void {
             }
           : undefined;
 
-      const connection = ConnectionSchema.parse({
+      const connection = MySqlConnectionSchema.parse({
+        driver: 'mysql',
         name: args.name,
         host: args.host,
         port: args.port,
@@ -163,10 +170,51 @@ export function registerConnectionTools(mcp: McpServer, deps: ToolDeps): void {
   );
 
   mcp.registerTool(
+    'add_sqlite_connection',
+    {
+      title: 'Add or update a SQLite connection',
+      description:
+        'Persist a SQLite database file connection. Stores only the local file path and policy; no password or Keychain entry is used.',
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      inputSchema: {
+        name: z.string().min(1).max(128),
+        path: z.string().min(1).max(4096).describe('SQLite database file path. "~/" is expanded at execution time.'),
+        database: z
+          .string()
+          .min(1)
+          .max(64)
+          .default('main')
+          .describe('SQLite schema name used for policy scope and metadata lookups. Usually "main".'),
+        policyPreset: z.enum(['read-only', 'dev', 'admin']).default('read-only'),
+      },
+    },
+    async (args) => {
+      const connection = SqliteConnectionSchema.parse({
+        driver: 'sqlite',
+        name: args.name,
+        path: args.path,
+        database: args.database,
+        policy: policyFromPreset(args.policyPreset as PolicyPresetName),
+      });
+
+      await upsertConnection(connection);
+
+      return textResult(
+        `Saved SQLite connection "${connection.name}" with policy preset "${args.policyPreset}". No password was stored.`,
+      );
+    },
+  );
+
+  mcp.registerTool(
     'remove_connection',
     {
       title: 'Remove a connection',
-      description: 'Delete the connection from config and its Keychain password.',
+      description: 'Delete the connection from config and delete any associated MySQL/MariaDB Keychain password.',
       annotations: {
         readOnlyHint: false,
         destructiveHint: true,
@@ -178,8 +226,10 @@ export function registerConnectionTools(mcp: McpServer, deps: ToolDeps): void {
     async (args) => {
       const c = await getConnection(args.name);
       if (!c) return toolError(`Connection "${args.name}" not found`);
-      await deps.secretStore.deletePassword(c.name, c.user);
-      if (c.ssh) {
+      if (isMySqlConnection(c)) {
+        await deps.secretStore.deletePassword(c.name, c.user);
+      }
+      if (isMySqlConnection(c) && c.ssh) {
         await deps.secretStore.deletePassword(`${c.name}::ssh`, c.ssh.user);
       }
       await removeConnectionByName(args.name);

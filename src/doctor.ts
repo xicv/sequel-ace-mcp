@@ -2,8 +2,8 @@
 /**
  * sequel-mcp doctor — diagnostic report for the local install.
  *
- * Prints a sanitized summary: versions, configured connections (host/user/db only,
- * NEVER passwords), Keychain entry presence, SSH key file presence, MCP boot
+ * Prints a sanitized summary: versions, configured connections (host/user/db for
+ * MySQL/MariaDB, path/schema for SQLite, NEVER passwords), Keychain entry presence, SSH key file presence, MCP boot
  * smoke check. Intended for sharing with maintainers when filing a bug.
  *
  * Usage:
@@ -20,18 +20,20 @@ import { loadConfig, getDefaultConnectionName } from './vault/config.js';
 import { KeychainSecretStore } from './vault/keyring.js';
 import { configDir, configPath, sequelAceFavoritesPlistPath } from './vault/paths.js';
 import { getTouchID } from './vault/touchid.js';
-import type { Connection } from './types.js';
+import { isMySqlConnection, type Connection } from './types.js';
 
 const require = createRequire(import.meta.url);
 const pkg = require('../package.json') as { name: string; version: string };
 
 interface ConnectionReport {
   name: string;
-  host: string;
-  port: number;
-  user: string;
+  driver: Connection['driver'];
+  host: string | null;
+  port: number | null;
+  user: string | null;
+  path: string | null;
   database: string | null;
-  ssl: boolean;
+  ssl: boolean | null;
   sslServerName: string | null;
   ssh:
     | {
@@ -148,11 +150,13 @@ async function buildReport(opts: { probe: boolean }): Promise<DoctorReport> {
 
   const connections: ConnectionReport[] = [];
   for (const c of cfg.connections) {
-    const hasPwd = await store.hasPassword(c.name, c.user);
-    const hasSsh = c.ssh ? await store.hasPassword(`${c.name}::ssh`, c.ssh.user) : false;
+    const hasPwd = isMySqlConnection(c) ? await store.hasPassword(c.name, c.user) : false;
+    const hasSsh = isMySqlConnection(c) && c.ssh
+      ? await store.hasPassword(`${c.name}::ssh`, c.ssh.user)
+      : false;
 
     let sshReport: ConnectionReport['ssh'] = null;
-    if (c.ssh) {
+    if (isMySqlConnection(c) && c.ssh) {
       const keyPath = c.ssh.privateKeyPath ?? null;
       const expanded = keyPath ? expandTilde(keyPath) : null;
       sshReport = {
@@ -175,12 +179,14 @@ async function buildReport(opts: { probe: boolean }): Promise<DoctorReport> {
 
     const report: ConnectionReport = {
       name: c.name,
-      host: c.host,
-      port: c.port,
-      user: c.user,
+      driver: c.driver,
+      host: isMySqlConnection(c) ? c.host : null,
+      port: isMySqlConnection(c) ? c.port : null,
+      user: isMySqlConnection(c) ? c.user : null,
+      path: isMySqlConnection(c) ? null : c.path,
       database: c.database ?? null,
-      ssl: c.ssl,
-      sslServerName: c.sslServerName ?? null,
+      ssl: isMySqlConnection(c) ? c.ssl : null,
+      sslServerName: isMySqlConnection(c) ? c.sslServerName ?? null : null,
       ssh: sshReport,
       policy: c.policy,
       hasStoredPassword: hasPwd,
@@ -241,8 +247,14 @@ function renderText(r: DoctorReport): string {
   } else {
     lines.push('connections:');
     for (const c of r.connections) {
-      lines.push(`  - ${pad(c.name, 24)} ${pad(`${c.user}@${c.host}:${c.port}`, 38)} db=${c.database ?? '(none)'}${c.isDefault ? '  [default]' : ''}`);
-      lines.push(`      pwd-stored      : ${badge(c.hasStoredPassword)}`);
+      const endpoint =
+        c.driver === 'sqlite'
+          ? `sqlite:${c.path ?? '(missing path)'}`
+          : `${c.user}@${c.host}:${c.port}`;
+      lines.push(`  - ${pad(c.name, 24)} ${pad(endpoint, 38)} db=${c.database ?? '(none)'}${c.isDefault ? '  [default]' : ''}`);
+      if (c.driver === 'mysql') {
+        lines.push(`      pwd-stored      : ${badge(c.hasStoredPassword)}`);
+      }
       if (c.ssh) {
         lines.push(`      ssh-tunnel      : ${c.ssh.user}@${c.ssh.host}:${c.ssh.port} (auth=${c.ssh.authMethod})`);
         if (c.ssh.privateKeyPath) {
@@ -267,7 +279,7 @@ function renderText(r: DoctorReport): string {
     }
   }
   lines.push('');
-  lines.push('NOTE: this report contains NO passwords and NO Keychain secrets. It does include hostnames, DB usernames, and key paths from your local config — review and redact before sharing publicly.');
+  lines.push('NOTE: this report contains NO passwords and NO Keychain secrets. It does include hostnames, DB usernames, SQLite paths, and key paths from your local config — review and redact before sharing publicly.');
   return lines.join('\n');
 }
 

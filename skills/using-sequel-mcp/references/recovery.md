@@ -14,9 +14,9 @@ Before executing one of these `write` / `ddl` statements, the server captures a 
 
 | AST type | Backup kind |
 |----------|-------------|
-| `update`, `delete`, `replace` | `rows` (PRE-image of targeted rows via `SELECT … FOR UPDATE`) |
-| `truncate`, `drop_table` | `combined` (rows + `SHOW CREATE TABLE`) |
-| `alter_table` | `schema` (`SHOW CREATE TABLE`) |
+| `update`, `delete`, `replace` | `rows` (PRE-image of targeted rows; MySQL uses `SELECT … FOR UPDATE`, SQLite captures inside `BEGIN IMMEDIATE`) |
+| `truncate`, `drop_table` | `combined` (rows + schema SQL where supported) |
+| `alter_table` | `schema` (schema SQL where supported) |
 | `insert` | `insert-hint` (POST-execution; uses `LAST_INSERT_ID()` or explicit `id` values) |
 
 If backup capture fails (overflow + `onBackupOverflow=abort`), the mutation is **not run**. The audit row reflects an error outcome.
@@ -55,7 +55,7 @@ Restore strategy by backup kind:
 
 | Kind | Restore SQL |
 |------|-------------|
-| `rows` | `INSERT … ON DUPLICATE KEY UPDATE col=VALUES(col)` per captured row |
+| `rows` | MySQL/MariaDB: `INSERT … ON DUPLICATE KEY UPDATE col=VALUES(col)` per captured row. SQLite: `INSERT … ON CONFLICT DO UPDATE SET col=excluded.col` |
 | `schema` | Re-issues the captured `CREATE TABLE` |
 | `combined` | `CREATE TABLE` then row inserts |
 | `insert-hint` | `DELETE FROM <t> WHERE id IN/BETWEEN …` |

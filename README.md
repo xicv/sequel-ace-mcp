@@ -4,26 +4,27 @@
 [![CI](https://github.com/xicv/sequel-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/xicv/sequel-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-A Model Context Protocol server for **MySQL/MariaDB** with policy-gated action sets, pre-mutation backups, an immutable audit log, macOS Keychain credential storage, and optional Touch ID. Designed so Claude (or any MCP client) can run real SQL safely enough to use every day.
+A Model Context Protocol server for **MySQL/MariaDB and SQLite** with policy-gated action sets, pre-mutation backups, an immutable audit log, macOS Keychain credential storage for MySQL/MariaDB, and optional Touch ID. Designed so Claude Code, Codex CLI, or any MCP client can run real SQL safely enough to use every day.
 
-> **Sequel Ace is OPTIONAL.** This is a fully standalone MCP. Sequel Ace integration is a *bootstrap convenience* (one-time import of saved favorites) and a *history augment* (read its query history alongside our audit log). If you don't have Sequel Ace installed, 23 of 25 tools still work — only `import_from_sequel_ace` and `sequel_ace_history` will fail with a clear "not found" error. Use `add_connection` instead.
+> **Sequel Ace is OPTIONAL.** This is a fully standalone MCP. Sequel Ace integration is a *bootstrap convenience* (one-time import of saved MySQL/MariaDB favorites) and a *history augment* (read its query history alongside our audit log). If you don't have Sequel Ace installed, all core tools still work — only `import_from_sequel_ace` and `sequel_ace_history` will fail with a clear "not found" error. Use `add_connection` or `add_sqlite_connection` instead.
 
 ## Capabilities
 
-Current release: **v0.7.0**. Full version history: [CHANGELOG.md](./CHANGELOG.md).
+Current release: **v0.8.0**. Full version history: [CHANGELOG.md](./CHANGELOG.md).
 
 - **Two-layer permissions** — connection-level baseline + per-database overrides; strictest-wins for multi-DB statements (fail-closed).
+- **SQLite connections** — first-class `driver: sqlite` connections via `add_sqlite_connection`, no password required, with `PRAGMA database_list` / `PRAGMA table_info` metadata support.
 - **Pre-mutation backups** for UPDATE / DELETE / REPLACE / INSERT / TRUNCATE / DROP / ALTER, including multi-table UPDATE/DELETE.
 - **Restore from any backup** via `restore_backup`. Plans + executes; default `dryRun=true`. Subject to the same policy gate as live writes.
 - **Append-only audit log** at `~/.local/share/sequel-mcp/audit.sqlite` — redacted SQL, decision, outcome, duration, backup_id linkage; optional SHA-256 prev-hash chain (now written inside a single `BEGIN IMMEDIATE` transaction for atomic chain integrity).
 - **Per-category retention** — `read=7d / write=30d / ddl=90d / admin=180d / txCtrl=7d`; auto-cleanup on boot.
 - **Unified history search** — merges our audit log with Sequel Ace's `queryHistory.db` (when present) into one timeline.
-- **macOS-native security** — Keychain-stored passwords (non-syncable, `WhenUnlockedThisDeviceOnly`); Touch ID via `LocalAuthentication`; SSH tunnels via `ssh2`.
+- **macOS-native security** — Keychain-stored MySQL/MariaDB passwords (non-syncable, `WhenUnlockedThisDeviceOnly`); Touch ID via `LocalAuthentication`; SSH tunnels via `ssh2`.
 - **Database inside a remote Docker container** *(0.5.0)* — five access patterns documented; first-class support for the closed-container case via SSH + `docker exec` stdio bridge with allowlist-validated commands.
 - **SSH host key verification** *(0.5.0, opt-in)* — `hostKeyPolicy: 'strict'` matches against `~/.ssh/known_hosts`; SHA-256 fingerprint logged on every connect so users can opt in. `@revoked` markers honored even in lenient mode.
 - **TLS server name preservation through tunnel** *(0.5.0, opt-in)* — `sslServerName` forwards original hostname into TLS handshake so cert SAN verification works against the real DB host instead of the tunnel's `127.0.0.1`.
 - **Session-scoped confirm grants** *(0.6.0)* — `confirm` prompts now surface a four-choice radio (Allow once / Allow for session / Allow always / Decline). "Allow for session" skips further prompts for the same `(connection, database, category)` until the MCP server restarts; "Allow always" persists the policy as `allow`. Grants are RAM-only and per-(conn, db, category) — a session grant on `staging` does not cover `prod`.
-- **Companion Claude Code Skill** *(0.7.0)* — ships `skills/using-sequel-mcp/SKILL.md` plus references for policy, recovery, and connections. Teaches Claude when to use `query` vs `execute`, how to relay the confirm grant scope, and the restore-from-backup workflow. Follows the May-2026 Anthropic skill authoring guideline (gerund name, third-person description, progressive disclosure).
+- **Companion Claude Code / Codex Skill** *(0.7.0)* — ships `skills/using-sequel-mcp/SKILL.md` plus references for policy, recovery, and connections. Teaches agents when to use `query` vs `execute`, how to relay the confirm grant scope, and the restore-from-backup workflow. Includes Codex-facing `agents/openai.yaml` metadata.
 - **Structured tool results** *(0.7.0)* — every JSON-returning tool now emits `structuredContent` alongside the legacy text block per the latest MCP spec. Modern clients (Claude Code, Inspector) render structured responses; older clients are unaffected.
 - **Server modularized** *(0.7.0)* — `src/server.ts` split from a 1180-line monolith into `src/server/{shared,run-sql,prompts,resources}.ts` + `src/server/tools/{sql,connections,policy,audit,backup,doctor}.ts`. Public `buildServer` API unchanged. Touch ID resolves lazily on first use (fixes a boot-window race + mutation). `restore_backup` honors the user's *Decline* choice (was previously ignored).
 
@@ -73,18 +74,63 @@ Verify:
 claude mcp list   # sequel-mcp should appear with ✓ Connected
 ```
 
-In a Claude Code session, `/mcp` lists every tool the server exposes (25 at v0.5.0).
+In a Claude Code session, `/mcp` lists every tool the server exposes.
 
-### Install the companion Claude Code Skill (optional, v0.7.0+)
+### Wire into Codex CLI
 
-The Skill at `skills/using-sequel-mcp/` teaches Claude *when* to use each tool — read-vs-execute decisions, confirm-grant scopes, the recovery workflow. Install it once:
+```bash
+codex mcp add sequel-mcp -- npx -y sequel-mcp
+```
+
+For a local source clone, replace the command after building:
+
+```bash
+codex mcp add sequel-mcp -- node /absolute/path/to/sequel-mcp/dist/index.js
+```
+
+Equivalent `~/.codex/config.toml` entry:
+
+```toml
+[mcp_servers.sequel-mcp]
+command = "npx"
+args = ["-y", "sequel-mcp"]
+startup_timeout_sec = 20
+tool_timeout_sec = 600
+```
+
+Verify:
+
+```bash
+codex mcp list
+```
+
+This repo also includes `.codex/config.toml` for trusted project-scoped Codex sessions. It wires the MCP server through the published `npx -y sequel-mcp` package; install the Skill separately with one of the options below. Use the local source command above when developing unpublished server changes.
+
+### Install the companion Skill (optional, v0.7.0+)
+
+The Skill at `skills/using-sequel-mcp/` teaches Claude Code and Codex *when* to use each tool — read-vs-execute decisions, confirm-grant scopes, the recovery workflow. Install it once for the client you use:
 
 ```bash
 mkdir -p ~/.claude/skills
 ln -sf "$(pwd)/skills/using-sequel-mcp" ~/.claude/skills/using-sequel-mcp
 ```
 
-Claude Code picks up the SKILL.md frontmatter on next session start. The Skill loads body content only when relevant, so token cost is ~100 tokens per session until triggered.
+For Codex, either place the skill in your Codex skills directory:
+
+```bash
+mkdir -p ~/.codex/skills
+ln -sf "$(pwd)/skills/using-sequel-mcp" ~/.codex/skills/using-sequel-mcp
+```
+
+Or point Codex at the skill from `~/.codex/config.toml`:
+
+```toml
+[[skills.config]]
+path = "/absolute/path/to/sequel-mcp/skills/using-sequel-mcp"
+enabled = true
+```
+
+Claude Code and Codex pick up the `SKILL.md` frontmatter on next session start. The Skill loads body content only when relevant, so token cost stays low until triggered.
 
 ### Wire into Claude Desktop
 
@@ -109,15 +155,25 @@ Any client that speaks the MCP stdio transport works. Point its `command` at `np
 
 ### First-run quickstart
 
+MySQL/MariaDB:
+
 ```text
 "Add a sequel-mcp connection 'local' on 127.0.0.1:3306, user root, database app, read-only preset."
 "Set the default connection to local."
 "Count rows in users."
 ```
 
+SQLite:
+
+```text
+"Add a SQLite sequel-mcp connection 'local-sqlite' at ~/Projects/app/dev.sqlite, read-only preset."
+"Set the default connection to local-sqlite."
+"Count rows in users."
+```
+
 Already use Sequel Ace? `"Import my Sequel Ace connections."` instead — macOS prompts once per favorite to allow Keychain access (click *Always Allow*).
 
-Passwords are elicited mid-call into the macOS Keychain. **No credentials in any config file.**
+MySQL/MariaDB passwords are elicited mid-call into the macOS Keychain. SQLite connections store only the database file path. **No credentials in any config file.**
 
 ## Action sets — the permission model
 
@@ -125,7 +181,7 @@ Each connection has a policy with five categories. Each is `allow` | `confirm` |
 
 | Category | What it covers                                           |
 |----------|----------------------------------------------------------|
-| `read`   | `SELECT`, `SHOW`, `DESCRIBE`, `EXPLAIN`                  |
+| `read`   | `SELECT`, `SHOW`, `DESCRIBE`, `EXPLAIN`, read-only SQLite `PRAGMA` |
 | `write`  | `INSERT`, `UPDATE`, `DELETE`, `REPLACE`                  |
 | `ddl`    | `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `RENAME`          |
 | `admin`  | `GRANT`, `REVOKE`, `SET GLOBAL`, `KILL`, `FLUSH`, `LOAD` |
@@ -143,16 +199,17 @@ Each connection has a policy with five categories. Each is `allow` | `confirm` |
 
 Adjust per-connection via `set_policy` or per-database via `set_database_policy` — no JSON editing.
 
-## Tools (25)
+## Tools (26)
 
 | Tool                       | Annotation               | What it does |
 |----------------------------|--------------------------|--------------|
-| `query`                    | readOnly                 | Single read SELECT/SHOW/DESCRIBE/EXPLAIN. Wrapped in `START TRANSACTION READ ONLY`. |
+| `query`                    | readOnly                 | Single read SELECT/SHOW/DESCRIBE/EXPLAIN, plus read-only SQLite PRAGMA statements. MySQL/MariaDB reads are wrapped in `START TRANSACTION READ ONLY`; SQLite reads open the file read-only. |
 | `execute`                  | destructive              | Single non-read statement; subject to policy. Backup captured automatically. |
-| `describe_table`           | readOnly                 | `DESCRIBE table` (identifier-validated). |
-| `list_databases`           | readOnly                 | `SHOW DATABASES`. |
+| `describe_table`           | readOnly                 | `DESCRIBE table` on MySQL/MariaDB; `PRAGMA table_info` on SQLite. |
+| `list_databases`           | readOnly                 | `SHOW DATABASES` on MySQL/MariaDB; `PRAGMA database_list` on SQLite. |
 | `list_connections`         | readOnly                 | Saved connections (no secrets). Marks `isDefault`. |
-| `add_connection`           | -                        | Add/update connection. Password via elicitation → Keychain. |
+| `add_connection`           | -                        | Add/update MySQL/MariaDB connection. Password via elicitation → Keychain. |
+| `add_sqlite_connection`    | -                        | Add/update SQLite file connection. No password or Keychain entry. |
 | `remove_connection`        | destructive              | Forget a connection + delete Keychain entry. |
 | `set_policy`               | -                        | Change a connection's baseline action set or limits. |
 | `set_database_policy`      | -                        | Per-database policy override. Takes precedence over baseline. |
@@ -165,7 +222,7 @@ Adjust per-connection via `set_policy` or per-database via `set_database_policy`
 | `audit_cleanup`            | destructive              | Prune entries past retention. `dryRun=true` to preview. |
 | `set_retention`            | -                        | Configure per-category windows + size caps. |
 | `list_backups`             | readOnly                 | Show recent pre-mutation backups. |
-| `restore_backup`           | destructive              | Replay a backup back into MySQL. Default `dryRun=true`. Goes through the policy gate. |
+| `restore_backup`           | destructive              | Replay a backup back into the originating MySQL/MariaDB or SQLite connection. Default `dryRun=true`. Goes through the policy gate. |
 | `history_search`           | readOnly                 | Unified timeline: MCP audit + Sequel Ace queryHistory.db (when present). |
 | `import_from_sequel_ace`   | -                        | One-time import from Sequel Ace's `Favorites.plist` + Keychain. **Requires Sequel Ace installed.** |
 | `sequel_ace_history`       | readOnly                 | Read Sequel Ace's GUI query history (read-only). **Requires Sequel Ace installed.** |
@@ -227,7 +284,7 @@ When `write=confirm`:
      ( ) Decline
    ```
 3. Pick a scope. **Decline** (or closing the dialog) cancels.
-4. **Backup captured** via `SELECT … FOR UPDATE` in the same tx.
+4. **Backup captured** in the same transaction (`SELECT … FOR UPDATE` on MySQL/MariaDB; `BEGIN IMMEDIATE` + pre-image `SELECT` on SQLite).
 5. Statement runs.
 6. Audit log entry written, linked to `backup_id`.
 
@@ -272,7 +329,7 @@ When something goes sideways:
 
 "Restore backup #142."
    → restore_backup({backupId: 142, dryRun: false})
-   Re-confirmation. Plays back via INSERT … ON DUPLICATE KEY UPDATE
+   Re-confirmation. Plays back via dialect-specific upsert statements
    (for UPDATE/DELETE) or DELETE BETWEEN/IN (for INSERT-hint).
 ```
 
@@ -416,9 +473,9 @@ If your cert SAN was actually issued for `127.0.0.1` (unusual, sometimes done fo
 ### When NOT to use this MCP
 
 - **You need Multi-statement scripts.** Out of scope. The MCP rejects them at parse time *and* at the driver level. Use a migration tool.
-- **High-write-throughput automation.** `SELECT … FOR UPDATE` for backup acquires row locks; not a good fit for >1000 mutations/min.
+- **High-write-throughput automation.** Backup capture adds transactional reads/locks; not a good fit for >1000 mutations/min.
 - **Production deploys.** Use a real migration framework (Liquibase, Flyway, Atlas). This MCP is for ad-hoc + investigative use.
-- **Other tools modifying the same rows.** The MCP holds row locks during backup; concurrent writers may serialize.
+- **Other tools modifying the same rows.** The MCP holds transactional locks during backup; concurrent writers may serialize.
 
 ### Recommended starting policy for a real workplace setup
 
@@ -489,14 +546,14 @@ Backups for these statement types:
 
 | Statement | Backup |
 |---|---|
-| UPDATE | `SELECT * FROM <table> WHERE <where> FOR UPDATE` |
+| UPDATE | MySQL/MariaDB: `SELECT * FROM <table> WHERE <where> FOR UPDATE`; SQLite: pre-image `SELECT` inside `BEGIN IMMEDIATE` |
 | DELETE | Same |
 | Multi-table UPDATE/DELETE | One backup per mutated table |
-| REPLACE | `SELECT * FROM <table> WHERE id IN (<keys>) FOR UPDATE` |
+| REPLACE | MySQL/MariaDB: `SELECT * FROM <table> WHERE id IN (<keys>) FOR UPDATE`; SQLite: same pre-image without `FOR UPDATE` |
 | INSERT | Post-mutation hint: `{kind:'range', start, end}` (auto-inc) or `{kind:'explicit', values}` |
-| TRUNCATE | `SELECT *` (capped) + `SHOW CREATE TABLE` |
+| TRUNCATE | MySQL/MariaDB: `SELECT *` (capped) + `SHOW CREATE TABLE` |
 | DROP TABLE | Same combined |
-| ALTER / RENAME | `SHOW CREATE TABLE` (schema-only) |
+| ALTER / RENAME | Schema-only where supported |
 
 Caps: `maxBackupRows=10000`, `maxBackupBytes=50MB` per backup. Default behavior on overflow: **abort** the mutation (configurable).
 
@@ -544,7 +601,7 @@ If Sequel Ace is **not installed**, three things are unavailable; everything els
 
 | Tool | If Sequel Ace missing |
 |---|---|
-| `import_from_sequel_ace` | "Favorites.plist not found" — use `add_connection` instead |
+| `import_from_sequel_ace` | "Favorites.plist not found" — use `add_connection` or `add_sqlite_connection` instead |
 | `sequel_ace_history` | "queryHistory.db not found" — use `audit_search` instead |
 | `history_search({source:'both'})` | Degrades silently to `source:'mcp'` (audit log only) |
 
@@ -571,16 +628,18 @@ Set once, omit on every subsequent call:
 "On prod, count rows in audit."   → explicit override; default untouched
 ```
 
+For SQLite, the `database` value is the schema name used for policy scope and metadata lookup, usually `main`.
+
 ## Defence in depth
 
 1. **AST classification** via `node-sql-parser` — closed-world: unknown statement types are denied.
 2. **Multi-statement input rejected** at parse time AND at driver (`multipleStatements: false`).
-3. **Server-side `START TRANSACTION READ ONLY`** for read category — MySQL itself rejects writes (error 1792).
+3. **Read-only driver enforcement** — MySQL/MariaDB reads use `START TRANSACTION READ ONLY`; SQLite reads open the database file with a read-only handle.
 4. **Two-layer policy gate** — per-DB override + baseline cascade; strictest wins; fail-closed.
 5. **Elicitation confirmation** — typed `CONFIRM` token, server-issued, uncircumventable.
-6. **Pre-mutation backup** — same-tx `SELECT … FOR UPDATE` for UPDATE/DELETE; SHOW CREATE TABLE for DDL; row + byte caps.
+6. **Pre-mutation backup** — same-transaction pre-image rows for UPDATE/DELETE; schema capture for DDL where supported; row + byte caps.
 7. **Audit log** — append-only SQLite; optional SHA-256 chain.
-8. **Row cap + statement timeout** — `MAX_EXECUTION_TIME` hint per category.
+8. **Row cap + statement timeout** — `MAX_EXECUTION_TIME` hint for MySQL/MariaDB reads; SQLite uses the configured busy timeout.
 9. **Touch ID** — optional per-session unlock via macOS LocalAuthentication.
 10. **SSH host key verification** *(0.5.0)* — opt-in `hostKeyPolicy='strict'` matches against `~/.ssh/known_hosts`; rejects unknown hosts and key mismatches. `@revoked` markers honored in all modes. Defends against MitM on the SSH leg of every tunnel.
 11. **TLS server name preservation** *(0.5.0)* — opt-in `sslServerName` forwards original hostname into mysql2's TLS handshake. SNI + cert SAN verification target the real DB host, not the tunnel's `127.0.0.1`.
@@ -588,10 +647,11 @@ Set once, omit on every subsequent call:
 
 ## Credentials — local-only by design
 
-- Stored via `@napi-rs/keyring` → macOS Keychain Services API.
+- MySQL/MariaDB passwords are stored via `@napi-rs/keyring` → macOS Keychain Services API.
 - Default attributes: **non-syncable**, `WhenUnlockedThisDeviceOnly`. Not iCloud Keychain.
 - Service name: `sequel-mcp : <connection-name>`. Account: DB user. Visible in `Keychain Access.app` so you can revoke any time.
 - We **never** read Sequel Ace's keychain at runtime. The one-time `import_from_sequel_ace` shells out to `/usr/bin/security` — macOS prompts "Always Allow / Allow / Deny" — and we copy the result into our own service namespace.
+- SQLite connections store only a local file path in `config.json`; no password is requested or stored.
 
 ## SSH tunnels
 
@@ -727,7 +787,7 @@ Or as an MCP tool:
 "Run sequel-mcp doctor and show the report."
 ```
 
-The report includes runtime versions, every configured connection (host, user, database, SSH key path), policy, `hasStoredPassword` boolean, retention config, Sequel Ace history availability. **No passwords or Keychain secrets.** Hostnames + DB usernames + key paths ARE included — review before pasting publicly.
+The report includes runtime versions, every configured connection (host/user/database for MySQL/MariaDB, file path/schema for SQLite, SSH key path when present), policy, `hasStoredPassword` boolean, retention config, Sequel Ace history availability. **No passwords or Keychain secrets.** Hostnames + DB usernames + SQLite paths + key paths ARE included — review before pasting publicly.
 
 ## Development
 
@@ -735,7 +795,7 @@ The report includes runtime versions, every configured connection (host, user, d
 npm install
 npm run typecheck
 npm run lint
-npm test                                  # 169 tests as of v0.5.0
+npm test                                  # 200 tests as of v0.8.0
 npm run build
 npm run build:touchid                     # macOS only — Swift LocalAuthentication helper
 npm run security:scan                     # local secret regex scan

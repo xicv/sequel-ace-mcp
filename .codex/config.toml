@@ -1,0 +1,7 @@
+# Project-scoped Codex setup. Codex loads this only after the project is trusted.
+
+[mcp_servers.sequel-mcp]
+command = "npx"
+args = ["-y", "sequel-mcp"]
+startup_timeout_sec = 20
+tool_timeout_sec = 600

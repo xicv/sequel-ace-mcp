@@ -1,4 +1,5 @@
 import type mysql from 'mysql2/promise';
+import type Database from 'better-sqlite3';
 import { openAuditDb } from '../audit/db.js';
 import type { BackupSpec } from './extractor.js';
 import type { Policy } from '../types.js';
@@ -18,6 +19,8 @@ export class BackupOverflowError extends Error {
   }
 }
 
+type SqliteDb = Database.Database;
+
 async function showCreateTable(conn: mysql.Connection, db: string | null, table: string): Promise<string | null> {
   const target = db ? `\`${db}\`.\`${table}\`` : `\`${table}\``;
   try {
@@ -26,6 +29,29 @@ async function showCreateTable(conn: mysql.Connection, db: string | null, table:
     if (!r) return null;
     const create = r['Create Table'] ?? r['Create View'];
     return typeof create === 'string' ? create : null;
+  } catch {
+    return null;
+  }
+}
+
+function quoteId(id: string): string {
+  return '`' + id.replace(/`/g, '``') + '`';
+}
+
+function showCreateTableSqlite(db: SqliteDb, database: string | null, table: string): string | null {
+  const schemaTable = database ? `${quoteId(database)}.sqlite_schema` : 'sqlite_schema';
+  try {
+    const row = db
+      .prepare(
+        `SELECT sql
+           FROM ${schemaTable}
+          WHERE name = ?
+            AND type IN ('table', 'view')
+          ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END
+          LIMIT 1`,
+      )
+      .get(table) as { sql?: unknown } | undefined;
+    return typeof row?.sql === 'string' ? row.sql : null;
   } catch {
     return null;
   }
@@ -44,6 +70,26 @@ async function fetchRows(args: {
   const usable = truncatedRows ? rowsRaw.slice(0, args.rowCap) : rowsRaw;
   const json = JSON.stringify(usable);
   const bytes = Buffer.byteLength(json, 'utf8');
+  return {
+    rows: usable as unknown[],
+    totalBytes: bytes,
+    truncated: truncatedRows,
+  };
+}
+
+function fetchRowsSqlite(args: {
+  db: SqliteDb;
+  selectSql: string;
+  rowCap: number;
+  byteCap: number;
+}): { rows: unknown[]; totalBytes: number; truncated: boolean } {
+  const cappedSql = `${args.selectSql.replace(/;\s*$/, '')} LIMIT ${Math.max(args.rowCap + 1, 1)}`;
+  const rowsRaw = args.db.prepare(cappedSql).all();
+  const truncatedRows = rowsRaw.length > args.rowCap;
+  const usable = truncatedRows ? rowsRaw.slice(0, args.rowCap) : rowsRaw;
+  const json = JSON.stringify(usable);
+  const bytes = Buffer.byteLength(json, 'utf8');
+  void args.byteCap;
   return {
     rows: usable as unknown[],
     totalBytes: bytes,
@@ -115,6 +161,90 @@ export async function captureBackup(args: {
       ts,
       args.connectionName,
       args.database ?? t.db ?? null,
+      t.table,
+      args.spec.kind,
+      rowsJson,
+      schemaSql,
+      null,
+      rowCount,
+      truncated ? 1 : 0,
+      bytes,
+    );
+
+    if (firstId === null) firstId = Number(ins.lastInsertRowid);
+    perTable.push({ db: t.db, table: t.table, rowCount, truncated });
+    totalRows += rowCount;
+    totalBytes += bytes;
+    truncatedAny = truncatedAny || truncated;
+  }
+
+  if (firstId === null) return null;
+  return { backupId: firstId, totalRows, totalBytes, truncated: truncatedAny, perTable };
+}
+
+export function captureBackupSqlite(args: {
+  db: SqliteDb;
+  spec: BackupSpec;
+  connectionName: string;
+  database: string | undefined;
+  policy: Policy;
+  pathOverride?: string;
+}): CapturedBackup | null {
+  if (args.spec.kind === 'none') return null;
+  if (args.spec.kind === 'insert-hint') return null;
+
+  const auditDb = openAuditDb({ pathOverride: args.pathOverride });
+  const ts = new Date().toISOString();
+  const stmt = auditDb.prepare(
+    `INSERT INTO backup
+       (ts, connection, database, table_name, backup_kind, rows_json, schema_sql, primary_key, row_count, truncated, size_bytes)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+
+  const rowCap = args.policy.maxBackupRows;
+  const byteCap = args.policy.maxBackupBytes;
+  const onOverflow = args.policy.onBackupOverflow;
+  const perTable: CapturedBackup['perTable'] = [];
+  let totalRows = 0;
+  let totalBytes = 0;
+  let truncatedAny = false;
+  let firstId: number | null = null;
+
+  for (const t of args.spec.tables) {
+    let rowsJson: string | null = null;
+    let schemaSql: string | null = null;
+    let rowCount = 0;
+    let truncated = false;
+    let bytes = 0;
+
+    const database = t.db ?? args.database ?? null;
+    if (args.spec.kind === 'schema' || args.spec.kind === 'combined') {
+      schemaSql = showCreateTableSqlite(args.db, database, t.table);
+    }
+    if (args.spec.kind === 'rows' || args.spec.kind === 'combined') {
+      const tt = t as { db: string | null; table: string; selectSql: string; locking: 'FOR UPDATE' | 'NONE' };
+      const fetch = fetchRowsSqlite({
+        db: args.db,
+        selectSql: tt.selectSql,
+        rowCap,
+        byteCap,
+      });
+      if (fetch.truncated && onOverflow === 'abort') {
+        throw new BackupOverflowError({ kind: 'rows', cap: rowCap }, rowCap + 1);
+      }
+      if (fetch.totalBytes > byteCap && onOverflow === 'abort') {
+        throw new BackupOverflowError({ kind: 'bytes', cap: byteCap }, fetch.totalBytes);
+      }
+      rowsJson = JSON.stringify(fetch.rows);
+      rowCount = fetch.rows.length;
+      truncated = fetch.truncated;
+      bytes = fetch.totalBytes;
+    }
+
+    const ins = stmt.run(
+      ts,
+      args.connectionName,
+      database,
       t.table,
       args.spec.kind,
       rowsJson,

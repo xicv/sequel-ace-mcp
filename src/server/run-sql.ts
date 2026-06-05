@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import {
+  isMySqlConnection,
   PolicyConfirmationDeclinedError,
   PolicyDeniedError,
   PolicySchema,
@@ -29,7 +30,9 @@ export async function runSqlTool(params: {
   const conn = await resolveConnection(args.connection);
   if (!conn) return toolError(noConnectionMessage(args.connection));
 
-  const classified = classifyStatement(args.sql);
+  const classified = classifyStatement(args.sql, {
+    dialect: conn.driver === 'sqlite' ? 'sqlite' : 'mysql',
+  });
   if (!classified.ok) return toolError(`Cannot run statement: ${classified.error}`);
 
   if (expectReadOnly && classified.category !== 'read') {
@@ -113,8 +116,10 @@ export async function runSqlTool(params: {
     throw e;
   }
 
-  const creds = await loadCredentials({ store: secretStore, connection: conn });
-  if (!creds) {
+  const creds = isMySqlConnection(conn)
+    ? await loadCredentials({ store: secretStore, connection: conn })
+    : { password: undefined, sshPassword: undefined };
+  if (isMySqlConnection(conn) && !creds) {
     return toolError(
       `No password stored for connection "${conn.name}". Run add_connection or import_from_sequel_ace first.`,
     );
@@ -123,8 +128,8 @@ export async function runSqlTool(params: {
   try {
     const result = await executeStatement({
       connection: conn,
-      password: creds.password,
-      sshPassword: creds.sshPassword,
+      password: creds?.password,
+      sshPassword: creds?.sshPassword,
       sql: args.sql,
       category: classified.category,
       astType: classified.astType,

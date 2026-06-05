@@ -1,14 +1,21 @@
 import mysql, { type ConnectionOptions } from 'mysql2/promise';
-import type { Connection, Policy, SqlCategory } from '../types.js';
+import {
+  isSqliteConnection,
+  type Connection,
+  type MySqlConnection,
+  type Policy,
+  type SqlCategory,
+} from '../types.js';
 import { openSshTunnel, type TunnelHandle } from './tunnel.js';
 import { openSshDockerTunnel } from './dockerTunnel.js';
 import { injectMaxExecutionTime } from './hints.js';
 import { extractBackupSpec, isBackupRequired } from '../backup/extractor.js';
 import { captureBackup, captureInsertHint, BackupOverflowError } from '../backup/capture.js';
+import { executeSqliteStatement } from './sqlite.js';
 
 export interface ExecuteParams {
   connection: Connection;
-  password: string;
+  password?: string;
   sshPassword?: string;
   sql: string;
   category: SqlCategory;
@@ -30,7 +37,7 @@ export interface ExecuteResult {
 const READ_ONLY_CATEGORIES: ReadonlySet<SqlCategory> = new Set(['read']);
 
 export function buildBaseOptions(args: {
-  connection: Connection;
+  connection: MySqlConnection;
   password: string;
   database?: string;
 }): ConnectionOptions {
@@ -64,6 +71,21 @@ function log(msg: string): void {
 }
 
 export async function executeStatement(params: ExecuteParams): Promise<ExecuteResult> {
+  if (isSqliteConnection(params.connection)) {
+    return executeSqliteStatement({
+      connection: params.connection,
+      sql: params.sql,
+      category: params.category,
+      astType: params.astType,
+      policy: params.policy,
+      database: params.database,
+    });
+  }
+
+  if (!params.password) {
+    throw new Error(`No password supplied for MySQL/MariaDB connection "${params.connection.name}"`);
+  }
+
   let tunnel: TunnelHandle | null = null;
   let conn: mysql.Connection | null = null;
   const start = Date.now();

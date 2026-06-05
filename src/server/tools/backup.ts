@@ -2,9 +2,11 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import mysql from 'mysql2/promise';
 import { z } from 'zod';
 import { getBackup, listBackups } from '../../backup/capture.js';
-import { executeRestore, planRestore } from '../../backup/restore.js';
+import { executeRestore, executeRestoreSqlite, planRestore } from '../../backup/restore.js';
+import { isMySqlConnection } from '../../types.js';
 import { getConnection } from '../../vault/config.js';
 import { jsonResult, loadCredentials, toolError, type ToolDeps } from '../shared.js';
+import { openSqliteDatabase, type SqliteDatabase } from '../../sql/sqlite.js';
 
 export function registerBackupTools(mcp: McpServer, deps: ToolDeps): void {
   mcp.registerTool(
@@ -26,7 +28,7 @@ export function registerBackupTools(mcp: McpServer, deps: ToolDeps): void {
     {
       title: 'Restore from a pre-mutation backup',
       description:
-        'Replay backup #N into the originating connection. Generates INSERT … ON DUPLICATE KEY UPDATE for row backups, CREATE TABLE for schema backups. Subject to the same policy gate (counts as a write). Pass dryRun=true to inspect the plan first.',
+        'Replay backup #N into the originating connection. Generates dialect-specific upserts for row backups and CREATE TABLE for schema backups. Subject to the same policy gate (counts as a write). Pass dryRun=true to inspect the plan first.',
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
       inputSchema: {
         backupId: z.number().int().positive(),
@@ -42,7 +44,9 @@ export function registerBackupTools(mcp: McpServer, deps: ToolDeps): void {
 
       let plan;
       try {
-        plan = planRestore(args.backupId);
+        plan = planRestore(args.backupId, {
+          dialect: conn.driver === 'sqlite' ? 'sqlite' : 'mysql',
+        });
       } catch (e) {
         return toolError(`Cannot plan restore: ${(e as Error).message}`);
       }
@@ -65,6 +69,34 @@ export function registerBackupTools(mcp: McpServer, deps: ToolDeps): void {
         connectionName: backup.connection,
       });
       if (ok === 'decline') return toolError('Restore declined.');
+
+      if (!isMySqlConnection(conn)) {
+        let sqliteDb: SqliteDatabase | null = null;
+        try {
+          sqliteDb = openSqliteDatabase({
+            connection: conn,
+            readonly: false,
+            timeoutMs: conn.policy.stmtTimeoutMs,
+          });
+          sqliteDb.exec('BEGIN IMMEDIATE');
+          const r = executeRestoreSqlite({ db: sqliteDb, plan });
+          sqliteDb.exec('COMMIT');
+          return jsonResult({ backupId: args.backupId, ...r, warnings: plan.warnings });
+        } catch (e) {
+          try {
+            sqliteDb?.exec('ROLLBACK');
+          } catch {
+            /* ignore */
+          }
+          return toolError(`Restore failed: ${(e as Error).message}`);
+        } finally {
+          try {
+            sqliteDb?.close();
+          } catch {
+            /* ignore */
+          }
+        }
+      }
 
       const creds = await loadCredentials({ store: deps.secretStore, connection: conn });
       if (!creds) return toolError(`No password for "${backup.connection}".`);

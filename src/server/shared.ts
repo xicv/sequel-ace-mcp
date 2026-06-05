@@ -1,12 +1,12 @@
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { SessionAuthenticator, getTouchID, type TouchIDPrompt } from '../vault/touchid.js';
 import type { SecretStore } from '../vault/keyring.js';
-import type { Connection } from '../types.js';
+import type { MySqlConnection } from '../types.js';
 import type { makeConfirmFn } from '../elicit/confirm.js';
 import type { GrantStore } from '../policy/grants.js';
 
 export const PACKAGE_NAME = 'sequel-mcp';
-export const PACKAGE_VERSION = '0.7.0';
+export const PACKAGE_VERSION = '0.8.0';
 
 export function toolError(text: string): CallToolResult {
   return { isError: true, content: [{ type: 'text', text }] };
@@ -30,7 +30,7 @@ export function textResult(text: string): CallToolResult {
 
 export async function loadCredentials(args: {
   store: SecretStore;
-  connection: Connection;
+  connection: MySqlConnection;
 }): Promise<{ password: string; sshPassword?: string } | null> {
   const password = await args.store.getPassword(args.connection.name, args.connection.user);
   if (!password) return null;

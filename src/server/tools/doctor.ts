@@ -3,6 +3,7 @@ import { loadConfig } from '../../vault/config.js';
 import { getTouchID } from '../../vault/touchid.js';
 import { statSequelAceHistory } from '../../importer/sequelAceHistory.js';
 import { jsonResult, PACKAGE_VERSION, type ToolDeps } from '../shared.js';
+import { isMySqlConnection } from '../../types.js';
 
 export function registerDoctorTool(mcp: McpServer, deps: ToolDeps): void {
   mcp.registerTool(
@@ -21,14 +22,18 @@ export function registerDoctorTool(mcp: McpServer, deps: ToolDeps): void {
       const conns = await Promise.all(
         cfg.connections.map(async (c) => ({
           name: c.name,
-          host: c.host,
-          port: c.port,
-          user: c.user,
+          driver: c.driver,
+          host: isMySqlConnection(c) ? c.host : null,
+          port: isMySqlConnection(c) ? c.port : null,
+          user: isMySqlConnection(c) ? c.user : null,
+          path: isMySqlConnection(c) ? null : c.path,
           database: c.database ?? null,
-          ssl: c.ssl,
+          ssl: isMySqlConnection(c) ? c.ssl : null,
           isDefault: c.name === def,
-          hasStoredPassword: await deps.secretStore.hasPassword(c.name, c.user),
-          ssh: c.ssh
+          hasStoredPassword: isMySqlConnection(c)
+            ? await deps.secretStore.hasPassword(c.name, c.user)
+            : false,
+          ssh: isMySqlConnection(c) && c.ssh
             ? {
                 host: c.ssh.host,
                 port: c.ssh.port,
@@ -65,7 +70,7 @@ export function registerDoctorTool(mcp: McpServer, deps: ToolDeps): void {
           sizeBytes: sequelAceHistory.sizeBytes,
         },
         retention: cfg.retention,
-        note: 'no passwords or Keychain secrets included; hostnames/usernames/key paths ARE included — redact before posting publicly.',
+        note: 'no passwords or Keychain secrets included; hostnames/usernames/SQLite paths/key paths ARE included — redact before posting publicly.',
       });
     },
   );

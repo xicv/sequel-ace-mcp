@@ -1,7 +1,7 @@
 {
   "name": "sequel-mcp",
-  "version": "0.7.0",
-  "description": "MCP server that lets Claude run MySQL/MariaDB queries with policy-gated action sets (allow/confirm/deny per category) and macOS Keychain credential storage. Optional one-time import of Sequel Ace favorites.",
+  "version": "0.8.0",
+  "description": "MCP server that lets AI agents run MySQL/MariaDB and SQLite queries with policy-gated action sets (allow/confirm/deny per category), macOS Keychain credential storage for MySQL/MariaDB, and optional Sequel Ace import.",
   "type": "module",
   "bin": {
     "sequel-mcp": "./dist/index.js",
@@ -9,9 +9,20 @@
     "sequel-mcp-migrate": "./dist/migrate.js"
   },
   "main": "./dist/index.js",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "codex",
+    "claude-code",
+    "mysql",
+    "mariadb",
+    "sqlite",
+    "sequel-ace"
+  ],
   "files": [
     "dist",
     "scripts",
+    "skills",
     "README.md",
     "LICENSE"
   ],

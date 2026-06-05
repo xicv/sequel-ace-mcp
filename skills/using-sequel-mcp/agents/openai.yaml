@@ -1,0 +1,4 @@
+interface:
+  display_name: "Using sequel-mcp"
+  short_description: "Safe MySQL/MariaDB/SQLite MCP workflows"
+  default_prompt: "Use $using-sequel-mcp to inspect my database safely through sequel-mcp."

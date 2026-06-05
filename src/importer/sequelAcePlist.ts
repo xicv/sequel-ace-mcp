@@ -11,7 +11,7 @@ import {
   sequelAceLegacySshKeychainServiceName,
 } from '../vault/paths.js';
 import type { SecretStore } from '../vault/keyring.js';
-import type { Connection, SshTunnel } from '../types.js';
+import type { MySqlConnection, SshTunnel } from '../types.js';
 
 interface RawFavorite {
   id?: number | string;
@@ -31,7 +31,7 @@ interface RawFavorite {
 }
 
 export interface ImportedFavorite {
-  connection: Connection;
+  connection: MySqlConnection;
   legacyKeychainService: string;
   legacySshKeychainService: string | null;
   legacyAccount: string;
@@ -82,7 +82,8 @@ function toConnection(fav: RawFavorite): ImportedFavorite | null {
       }
     : undefined;
 
-  const connection: Connection = {
+  const connection: MySqlConnection = {
+    driver: 'mysql',
     name: fav.name,
     host: fav.host,
     port: asInt(fav.port, 3306),

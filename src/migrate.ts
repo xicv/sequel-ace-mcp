@@ -9,8 +9,9 @@ import path from 'node:path';
 import { Entry } from '@napi-rs/keyring';
 import {
   ConfigSchema,
+  isMySqlConnection,
   type Config,
-  type Connection,
+  type MySqlConnection,
 } from './types.js';
 import {
   configDir,
@@ -103,7 +104,7 @@ function deleteLegacy(name: string, account: string): boolean {
   }
 }
 
-async function migrateConnection(c: Connection, purge: boolean): Promise<{
+async function migrateConnection(c: MySqlConnection, purge: boolean): Promise<{
   password: { copied: boolean; reason?: string };
   ssh: { copied: boolean; reason?: string } | null;
 }> {
@@ -160,6 +161,7 @@ export async function migrate(opts: { force: boolean; purge: boolean }): Promise
   if (!cfg.parsed) return result;
 
   for (const c of cfg.parsed.connections) {
+    if (!isMySqlConnection(c)) continue;
     const m = await migrateConnection(c, opts.purge);
     result.passwords.push({ connection: c.name, account: c.user, ...m.password });
     if (m.ssh && c.ssh) {

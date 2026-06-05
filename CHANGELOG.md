@@ -2,6 +2,18 @@
 
 All notable changes to **sequel-mcp** are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-06-05
+
+### Added
+
+- **SQLite support** — added `driver: "sqlite"` connections, `add_sqlite_connection`, SQLite query/execute routing through `better-sqlite3`, SQLite metadata support for `list_databases`/`describe_table`, dialect-aware backup capture, and SQLite restore upsert planning.
+- **Codex CLI setup** — README now includes `codex mcp add sequel-mcp -- npx -y sequel-mcp`, equivalent `~/.codex/config.toml`, and Codex skill installation via `~/.codex/skills` or user-level `[[skills.config]]`. The repo also ships `.codex/config.toml` for trusted project-scoped MCP setup.
+- **Codex skill metadata** — `skills/using-sequel-mcp/agents/openai.yaml` adds OpenAI/Codex-facing display metadata while preserving the same `SKILL.md` used by Claude Code.
+
+### Fixed
+
+- **npm package now includes the companion Skill** — `package.json` `files` now includes `skills/`, so the shipped tarball matches the README/CHANGELOG claim that `skills/using-sequel-mcp` is bundled.
+
 ## [0.7.0] — 2026-05-20
 
 ### Added

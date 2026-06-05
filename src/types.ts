@@ -55,8 +55,14 @@ export const SshTunnelSchema = z.object({
 
 export type SshTunnel = z.infer<typeof SshTunnelSchema>;
 
-export const ConnectionSchema = z.object({
+const ConnectionCommonSchema = z.object({
   name: z.string().min(1).max(128).regex(/^[A-Za-z0-9 _\-:.]+$/),
+  policy: PolicySchema,
+  databasePolicies: z.record(z.string().min(1).max(64), PartialPolicySchema).optional(),
+});
+
+export const MySqlConnectionSchema = ConnectionCommonSchema.extend({
+  driver: z.literal('mysql'),
   host: z.string().min(1),
   port: z.number().int().positive().max(65535).default(3306),
   user: z.string().min(1),
@@ -64,11 +70,43 @@ export const ConnectionSchema = z.object({
   ssl: z.boolean().default(false),
   sslServerName: z.string().min(1).max(253).optional(),
   ssh: SshTunnelSchema.optional(),
-  policy: PolicySchema,
-  databasePolicies: z.record(z.string().min(1).max(64), PartialPolicySchema).optional(),
 });
 
+export type MySqlConnection = z.infer<typeof MySqlConnectionSchema>;
+
+export const SqliteConnectionSchema = ConnectionCommonSchema.extend({
+  driver: z.literal('sqlite'),
+  path: z.string().min(1).max(4096),
+  database: z.string().min(1).max(64).default('main'),
+});
+
+export type SqliteConnection = z.infer<typeof SqliteConnectionSchema>;
+
+const ConnectionUnionSchema = z.discriminatedUnion('driver', [
+  MySqlConnectionSchema,
+  SqliteConnectionSchema,
+]);
+
+export const ConnectionSchema = z.preprocess((raw) => {
+  if (raw && typeof raw === 'object') {
+    const r = raw as Record<string, unknown>;
+    if (r.driver === undefined) {
+      return { ...r, driver: 'mysql' };
+    }
+  }
+  return raw;
+}, ConnectionUnionSchema);
+
 export type Connection = z.infer<typeof ConnectionSchema>;
+export type ConnectionDriver = Connection['driver'];
+
+export function isMySqlConnection(connection: Connection): connection is MySqlConnection {
+  return connection.driver === 'mysql';
+}
+
+export function isSqliteConnection(connection: Connection): connection is SqliteConnection {
+  return connection.driver === 'sqlite';
+}
 
 export const DEFAULT_RETENTION_BY_CATEGORY = {
   read: 7,

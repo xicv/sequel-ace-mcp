@@ -2,6 +2,7 @@
 
 ## Contents
 - Direct connection
+- SQLite file
 - SSH tunnel
 - SSH tunnel + remote Docker container
 - TLS server name preservation (through tunnel)
@@ -17,6 +18,17 @@ sequel-mcp:add_connection
   → elicits password → stores in macOS Keychain under
     service="sequel-mcp : local-dev" account="app"
 ```
+
+## SQLite file
+
+```text
+sequel-mcp:add_sqlite_connection
+  name=local-sqlite path=~/Projects/app/dev.sqlite database=main
+  policyPreset=read-only
+  → stores only the file path in config; no password or Keychain entry
+```
+
+SQLite `database` is the schema name used for policy scope and metadata lookup. Use `main` unless the workflow relies on attached databases. `list_databases` maps to `PRAGMA database_list`; `describe_table` maps to `PRAGMA <schema>.table_info(...)`.
 
 ## SSH tunnel
 
@@ -76,6 +88,7 @@ In strict mode, an unknown or mismatched host key aborts the tunnel.
 | Item | Location | Notes |
 |------|----------|-------|
 | MySQL password | macOS Keychain, service `sequel-mcp : <name>`, account `<user>` | `WhenUnlockedThisDeviceOnly`, non-syncable |
+| SQLite file path | `~/.config/sequel-mcp/config.json` | No password; path metadata only |
 | SSH key passphrase / password | Keychain, service `sequel-mcp : <name>::ssh`, account `<sshUser>` | Same protection class |
 | Touch ID gate | `LocalAuthentication` framework via the bundled Swift helper | 15-minute idle re-use window |
 | Connection metadata | `~/.config/sequel-mcp/config.json` (`mode 0600`, parent dir `0700`) | No secrets in file |

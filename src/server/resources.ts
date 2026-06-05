@@ -1,5 +1,5 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { POLICY_PRESETS } from '../types.js';
+import { isMySqlConnection, POLICY_PRESETS } from '../types.js';
 import { loadConfig } from '../vault/config.js';
 import type { SecretStore } from '../vault/keyring.js';
 
@@ -20,11 +20,13 @@ export function registerResources(
       const items = await Promise.all(
         cfg.connections.map(async (c) => ({
           name: c.name,
-          host: c.host,
-          port: c.port,
-          user: c.user,
+          driver: c.driver,
+          host: isMySqlConnection(c) ? c.host : undefined,
+          port: isMySqlConnection(c) ? c.port : undefined,
+          user: isMySqlConnection(c) ? c.user : undefined,
+          path: isMySqlConnection(c) ? undefined : c.path,
           database: c.database,
-          ssh: c.ssh
+          ssh: isMySqlConnection(c) && c.ssh
             ? {
                 host: c.ssh.host,
                 user: c.ssh.user,
@@ -38,7 +40,9 @@ export function registerResources(
             : null,
           policy: c.policy,
           presets: Object.keys(POLICY_PRESETS),
-          hasPassword: await deps.secretStore.hasPassword(c.name, c.user),
+          hasPassword: isMySqlConnection(c)
+            ? await deps.secretStore.hasPassword(c.name, c.user)
+            : false,
         })),
       );
       return {
