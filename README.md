@@ -44,6 +44,12 @@ npx -y sequel-mcp                  # ad-hoc, no global install
 # npm install -g sequel-mcp
 ```
 
+To update an existing Claude Code or Codex setup that already runs `npx -y sequel-mcp`, restart the MCP server/client session after a new npm release is published. For global installs, refresh the package first:
+
+```bash
+npm install -g sequel-mcp@latest
+```
+
 ### From source
 
 ```bash
