@@ -4,13 +4,12 @@ import {
   isMySqlConnection,
   PolicyConfirmationDeclinedError,
   PolicyDeniedError,
-  PolicySchema,
 } from '../types.js';
 import { classifyStatement } from '../policy/classifier.js';
 import { evaluatePolicy } from '../policy/gate.js';
 import { resolveEffectivePolicy } from '../policy/resolver.js';
 import { writeAuditEntry } from '../audit/logger.js';
-import { getConnection, loadConfig, resolveConnection, upsertConnection } from '../vault/config.js';
+import { loadConfig, resolveConnection } from '../vault/config.js';
 import { executeStatement } from '../sql/executor.js';
 import { jsonResult, loadCredentials, noConnectionMessage, toolError, type ToolDeps } from './shared.js';
 
@@ -82,12 +81,6 @@ export async function runSqlTool(params: {
       elicitConfirm: confirmFn,
       grants,
       grantDatabase,
-      onAlwaysGrant: async (category) => {
-        const fresh = await getConnection(conn.name);
-        if (!fresh) return;
-        const nextPolicy = PolicySchema.parse({ ...fresh.policy, [category]: 'allow' });
-        await upsertConnection({ ...fresh, policy: nextPolicy });
-      },
     });
   } catch (e) {
     const declined = e instanceof PolicyConfirmationDeclinedError;

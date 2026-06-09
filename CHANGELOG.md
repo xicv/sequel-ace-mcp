@@ -2,6 +2,17 @@
 
 All notable changes to **sequel-mcp** are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — 2026-06-09
+
+### Changed
+
+- **Per-database confirmation prompt** — the authorization prompt now shows the target database, not just the connection (e.g. `WRITE on AVCRM PROD · rpa_staging`), so multi-database connections make clear which database a statement will hit.
+- **Session grants scoped per database in the prompt copy** — "Allow for session" now states it covers the specific database until restart, matching the existing per-`(connection, database, category)` grant key.
+
+### Removed
+
+- **"Allow always" inline choice** — the four-option prompt is now three (`Allow once` / `Allow for session` / `Decline`). Persisting a policy as `allow` is done explicitly via `set_database_policy`. This also removes a footgun where "Allow always" persisted `allow` to the connection baseline — silently widening write access to every database on the connection, including production — instead of the database actually being acted on.
+
 ## [0.8.0] — 2026-06-05
 
 ### Added

@@ -3,7 +3,7 @@ import type { SqlCategory } from '../types.js';
 
 type ServerHandle = McpServer['server'];
 
-export type GrantChoice = 'once' | 'session' | 'always' | 'decline';
+export type GrantChoice = 'once' | 'session' | 'decline';
 
 const CATEGORY_LABEL: Record<SqlCategory, string> = {
   read: 'read',
@@ -13,7 +13,7 @@ const CATEGORY_LABEL: Record<SqlCategory, string> = {
   txCtrl: 'transaction control',
 };
 
-const GRANT_CHOICES: readonly GrantChoice[] = ['once', 'session', 'always', 'decline'];
+const GRANT_CHOICES: readonly GrantChoice[] = ['once', 'session', 'decline'];
 
 function isGrantChoice(value: unknown): value is GrantChoice {
   return typeof value === 'string' && (GRANT_CHOICES as readonly string[]).includes(value);
@@ -24,6 +24,7 @@ export function makeConfirmFn(server: ServerHandle) {
     category: SqlCategory;
     statement: string;
     connectionName: string;
+    database?: string | null;
   }): Promise<GrantChoice> => {
     const snippet =
       args.statement.length > 800
@@ -32,14 +33,20 @@ export function makeConfirmFn(server: ServerHandle) {
 
     const label = CATEGORY_LABEL[args.category];
 
+    const target = args.database
+      ? `${args.connectionName} · ${args.database}`
+      : args.connectionName;
+    const sessionScope = args.database
+      ? `all ${label} statements on ${args.database} until the MCP server restarts`
+      : `all ${label} statements on this connection until the MCP server restarts`;
+
     try {
       const result = await server.elicitInput({
         message:
-          `About to run a ${label} statement on connection "${args.connectionName}".\n\n` +
+          `About to run a ${label} statement on ${target}.\n\n` +
           `--- SQL ---\n${snippet}\n--- end ---\n\n` +
-          `Pick an authorization scope. "Allow for session" skips the prompt for further ${label} ` +
-          `statements on this connection until the MCP server restarts. "Allow always" persists the ` +
-          `policy as "allow" in your saved config.`,
+          `Pick an authorization scope. "Allow for session" skips the prompt for ${sessionScope} ` +
+          `To make this permanent, use the set_database_policy tool.`,
         requestedSchema: {
           type: 'object',
           properties: {
@@ -47,11 +54,10 @@ export function makeConfirmFn(server: ServerHandle) {
               type: 'string',
               title: 'Authorization',
               description: 'How should this statement be authorized?',
-              enum: ['once', 'session', 'always', 'decline'],
+              enum: ['once', 'session', 'decline'],
               enumNames: [
                 'Allow once (this statement only)',
-                `Allow for session (all ${label} statements until restart)`,
-                'Allow always (persist policy as allow)',
+                `Allow for session (${sessionScope})`,
                 'Decline',
               ],
             },

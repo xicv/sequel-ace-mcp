@@ -95,7 +95,7 @@ describe('evaluatePolicy', () => {
   it('"session" choice registers a session grant for subsequent statements', async () => {
     const grants = createGrantStore();
     const elicit = vi
-      .fn<(p: unknown) => Promise<'once' | 'session' | 'always' | 'decline'>>()
+      .fn<(p: unknown) => Promise<'once' | 'session' | 'decline'>>()
       .mockResolvedValueOnce('session');
 
     await evaluatePolicy({
@@ -119,27 +119,6 @@ describe('evaluatePolicy', () => {
     });
 
     expect(elicit).toHaveBeenCalledOnce();
-  });
-
-  it('"always" choice invokes the persistence callback once', async () => {
-    const grants = createGrantStore();
-    const elicit = vi.fn(async () => 'always' as const);
-    const onAlwaysGrant = vi.fn(async () => undefined);
-
-    const decision = await evaluatePolicy({
-      policy,
-      category: 'write',
-      statement: 'UPDATE t SET x = 1',
-      connectionName: 'x',
-      grantDatabase: 'app',
-      elicitConfirm: elicit,
-      grants,
-      onAlwaysGrant,
-    });
-
-    expect(decision.choiceApplied).toBe('always');
-    expect(onAlwaysGrant).toHaveBeenCalledOnce();
-    expect(onAlwaysGrant).toHaveBeenCalledWith('write');
   });
 
   it('session grant is scoped to its (conn, db, category) — does not leak across databases', async () => {

@@ -13,6 +13,7 @@ export interface ElicitConfirmFn {
     category: SqlCategory;
     statement: string;
     connectionName: string;
+    database?: string | null;
   }): Promise<GrantChoice>;
 }
 
@@ -47,7 +48,6 @@ export async function evaluatePolicy(args: {
   elicitConfirm: ElicitConfirmFn;
   grants?: GrantStore;
   grantDatabase?: string | null;
-  onAlwaysGrant?: (category: SqlCategory) => Promise<void> | void;
 }): Promise<PolicyDecision> {
   const action = actionForCategory(args.policy, args.category);
   if (action === 'deny') {
@@ -77,6 +77,7 @@ export async function evaluatePolicy(args: {
     category: args.category,
     statement: args.statement,
     connectionName: args.connectionName,
+    database: args.grantDatabase ?? null,
   });
 
   if (choice === 'decline') {
@@ -84,10 +85,6 @@ export async function evaluatePolicy(args: {
   }
   if (choice === 'session') {
     args.grants?.grantSession(grantKey);
-  } else if (choice === 'always') {
-    if (args.onAlwaysGrant) {
-      await args.onAlwaysGrant(args.category);
-    }
   }
   return {
     category: args.category,

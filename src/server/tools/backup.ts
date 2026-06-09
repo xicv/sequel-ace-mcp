@@ -67,6 +67,7 @@ export function registerBackupTools(mcp: McpServer, deps: ToolDeps): void {
         category: 'write',
         statement: `RESTORE backup #${args.backupId}: ${plan.statements.length} statement(s) into ${backup.connection}.${backup.database ?? '<default>'}.${backup.table_name}`,
         connectionName: backup.connection,
+        database: backup.database ?? null,
       });
       if (ok === 'decline') return toolError('Restore declined.');
 
