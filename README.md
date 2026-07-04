@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/xicv-sequel-mcp-badge.png)](https://mseep.ai/app/xicv-sequel-mcp)
+
 # sequel-mcp
 
 [![npm](https://img.shields.io/npm/v/sequel-mcp.svg)](https://www.npmjs.com/package/sequel-mcp)
