@@ -23,7 +23,7 @@ Current release: **v0.8.0**. Full version history: [CHANGELOG.md](./CHANGELOG.md
 - **Database inside a remote Docker container** *(0.5.0)* — five access patterns documented; first-class support for the closed-container case via SSH + `docker exec` stdio bridge with allowlist-validated commands.
 - **SSH host key verification** *(0.5.0, opt-in)* — `hostKeyPolicy: 'strict'` matches against `~/.ssh/known_hosts`; SHA-256 fingerprint logged on every connect so users can opt in. `@revoked` markers honored even in lenient mode.
 - **TLS server name preservation through tunnel** *(0.5.0, opt-in)* — `sslServerName` forwards original hostname into TLS handshake so cert SAN verification works against the real DB host instead of the tunnel's `127.0.0.1`.
-- **Session-scoped confirm grants** *(0.6.0)* — `confirm` prompts now surface a four-choice radio (Allow once / Allow for session / Allow always / Decline). "Allow for session" skips further prompts for the same `(connection, database, category)` until the MCP server restarts; "Allow always" persists the policy as `allow`. Grants are RAM-only and per-(conn, db, category) — a session grant on `staging` does not cover `prod`.
+- **Session-scoped confirm grants** *(0.6.0)* — `confirm` prompts surface a three-choice radio (Allow once / Allow for session / Decline). "Allow for session" skips further prompts for the same `(connection, database, category)` until the MCP server restarts. Grants are RAM-only and per-(conn, db, category) — a session grant on `staging` does not cover `prod`. Durable allowances go through `set_database_policy`; the inline "Allow always" choice was dropped in 0.9.0.
 - **Companion Claude Code / Codex Skill** *(0.7.0)* — ships `skills/using-sequel-mcp/SKILL.md` plus references for policy, recovery, and connections. Teaches agents when to use `query` vs `execute`, how to relay the confirm grant scope, and the restore-from-backup workflow. Includes Codex-facing `agents/openai.yaml` metadata.
 - **Structured tool results** *(0.7.0)* — every JSON-returning tool now emits `structuredContent` alongside the legacy text block per the latest MCP spec. Modern clients (Claude Code, Inspector) render structured responses; older clients are unaffected.
 - **Server modularized** *(0.7.0)* — `src/server.ts` split from a 1180-line monolith into `src/server/{shared,run-sql,prompts,resources}.ts` + `src/server/tools/{sql,connections,policy,audit,backup,doctor}.ts`. Public `buildServer` API unchanged. Touch ID resolves lazily on first use (fixes a boot-window race + mutation). `restore_backup` honors the user's *Decline* choice (was previously ignored).
@@ -193,7 +193,9 @@ Each connection has a policy with five categories. Each is `allow` | `confirm` |
 | `admin`  | `GRANT`, `REVOKE`, `SET GLOBAL`, `KILL`, `FLUSH`, `LOAD` |
 | `txCtrl` | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`               |
 
-`confirm` triggers an MCP **elicitation** — the client surfaces a radio with four choices: **Allow once** (this statement), **Allow for session** (skip prompts for the same `(connection, database, category)` until the MCP server restarts), **Allow always** (persist the policy as `allow` — equivalent to `set_policy`), or **Decline**. The prompt is **server-issued per call** — no client allowlist can bypass it.
+`confirm` triggers an MCP **elicitation** — the client surfaces a radio with three choices: **Allow once** (this statement), **Allow for session** (skip prompts for the same `(connection, database, category)` until the MCP server restarts), or **Decline**. The prompt is **server-issued per call** — no client allowlist can bypass it.
+
+> **Elicitation is an optional MCP capability.** In a client that does not implement it, no prompt can be shown, so a `confirm` policy can never be satisfied and every gated statement fails closed. Since 0.9.0 that is reported as an explicit "prompt could not be delivered" error — with the reason, and audited as `outcome=error` rather than `declined` — instead of being mistaken for a refusal. Check `doctor` → `elicitation.supported`; where it is `false`, use an explicit `allow` or `deny`.
 
 ### Presets
 
@@ -286,7 +288,6 @@ When `write=confirm`:
    Pick an authorization scope.
      ( ) Allow once (this statement only)
      ( ) Allow for session (all WRITE statements until restart)
-     ( ) Allow always (persist policy as allow)
      ( ) Decline
    ```
 3. Pick a scope. **Decline** (or closing the dialog) cancels.
@@ -300,7 +301,7 @@ When `write=confirm`:
 |-------|--------|-------------------|----------|
 | **Allow once** | This statement only. Next write re-prompts. | n/a (single shot) | One-off write — you want to review every subsequent statement too. |
 | **Allow for session** | Skips the prompt for the same `(connection, database, category)` on every later statement in this MCP session. | **No** — dies when the MCP server process exits. | You're running a batch (migration, bulk update) and don't want N prompts. Each restart re-arms the gate. |
-| **Allow always** | Mutates the saved policy: `policy[category] = 'allow'`. Equivalent to calling `set_policy`. | **Yes** — written to the config JSON. | The category should genuinely no longer be gated on this connection. |
+| **`set_database_policy`** | Not a prompt choice — a separate tool call that writes `policy[category]` for one database. | **Yes** — written to the config JSON. | The category should genuinely no longer be gated there. Prefer scoping to a single database, and put it back afterwards. |
 | **Decline** | Statement does not run; audit entry recorded as `declined`. | n/a | Reject this attempt. |
 
 Session grants are scoped per `(connection, database, category)`. A session grant for `acme-prod/staging:write` does **not** cover `acme-prod/prod:write` — the strictest-wins multi-DB resolver still applies, so a cross-DB statement that touches both is gated on the prod side until you grant that too. Session grants do **not** bypass Touch ID — `requireTouchID: true` still prompts independently.

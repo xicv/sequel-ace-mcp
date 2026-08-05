@@ -27,7 +27,7 @@ Client UIs render MCP tool names differently. Claude Code commonly shows `sequel
 - `sequel-mcp:query` — single read-only statement. MySQL/MariaDB reads are wrapped in `START TRANSACTION READ ONLY`; SQLite reads open the file read-only.
 
 **Write path (policy-gated):**
-- `sequel-mcp:execute` — `INSERT/UPDATE/DELETE/DDL/admin`. The server elicits a 4-choice confirm when the category is `confirm`: *once / session / always / decline*.
+- `sequel-mcp:execute` — `INSERT/UPDATE/DELETE/DDL/admin`. The server elicits a 3-choice confirm when the category is `confirm`: *once / session / decline*.
 - `sequel-mcp:restore_backup` — replay a pre-mutation backup; `dryRun=true` by default.
 
 **Policy + setup:**
@@ -87,22 +87,43 @@ Progress:
 
 Restores go through the same policy gate as live writes (so they elicit a confirm) and are themselves audited and backed up.
 
-## Confirm grants: once / session / always
+## Confirm grants: once / session
 
-When the server elicits `confirm` for a `write` / `ddl` / `admin` statement, the user gets four choices:
+When the server elicits `confirm` for a `write` / `ddl` / `admin` statement, the user gets three choices:
 
 - **Allow once** — authorizes only this statement.
 - **Allow for session** — skips the prompt for the same `(connection, database, category)` until the MCP server restarts. RAM-only.
-- **Allow always** — persists the policy as `allow` in the saved config (durable).
 - **Decline** — abort; statement is audited as `declined`.
 
+There is no inline "always" (dropped in 0.9.0). To make an allowance durable, use `set_database_policy`.
+
 A session grant on `staging` does **not** cover `prod`. Surface the scope clearly when relaying the prompt to the user.
+
+## When the confirm prompt cannot be shown
+
+Elicitation is an **optional** MCP capability. In a client that does not implement it, a `confirm`
+policy can never be satisfied — every gated statement fails closed.
+
+Since 0.9.0 this is reported honestly rather than as a refusal: the tool result says the prompt
+could not be delivered and gives the reason, and the audit row is `outcome: error` (not `declined`)
+with the reason in `error_msg`. **Do not tell the user they declined** in that case — they were
+never asked.
+
+Check support up front with `sequel-mcp:doctor` → `elicitation.supported`:
+
+- `true` — prompts work; `confirm` is usable.
+- `false` — `confirm` is a dead end in this client. Policies must be an explicit `allow` or `deny`.
+- `null` — could not be determined.
+
+If a policy is `confirm` in a client that cannot prompt, say so and let the user choose: set an
+explicit policy for that database, or run the statement outside the tool. Never silently widen the
+policy yourself — that is the user's call, on their data.
 
 ## Common mistakes to avoid
 
 1. **Do not include passwords in `add_connection` arguments.** The server collects MySQL/MariaDB passwords through a separate elicitation channel and writes to the macOS Keychain. Tool arguments are logged; the elicitation reply is not. SQLite uses `add_sqlite_connection` and has no password.
 2. **Do not stack statements.** `SELECT 1; SELECT 2;` is rejected. Issue two calls instead.
-3. **Do not bypass policy by asking the user to lower it.** If the user wants to allow `write` permanently, walk them through the *"Allow always"* choice in the confirm prompt — that's the same outcome but with explicit consent.
+3. **Do not bypass policy by asking the user to lower it.** If the user wants `write` allowed permanently, that is a `set_database_policy` change they make knowingly — scope it to the narrowest database, prefer `confirm` over `allow`, and put it back afterwards. The one case where proposing `allow` is legitimate is a client that cannot prompt at all (see above), and even then only with an explicit yes.
 4. **Do not lose the `backup_id`.** Whenever `sequel-mcp:execute` returns a non-null `backupId`, mention it to the user in your reply — it's their rollback handle.
 5. **Do not call `audit_cleanup` without `dryRun=true` first.** It deletes rows and VACUUMs.
 

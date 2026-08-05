@@ -22,8 +22,13 @@ Every classified statement maps to exactly one category. Misclassification is fa
 ## Actions
 
 - `allow` — execute without prompting.
-- `confirm` — elicit a 4-choice prompt: once / session / always / decline.
+- `confirm` — elicit a 3-choice prompt: once / session / decline. Durable allowances go through
+  `set_database_policy`, not the prompt.
 - `deny` — reject with a `Policy denies …` error; audit row stored with `outcome=denied`.
+
+`confirm` needs a client that implements MCP elicitation. Where it does not, the statement fails
+closed and is audited as `outcome=error` (not `declined`) with the reason — check
+`sequel-mcp:doctor` → `elicitation.supported` before relying on `confirm`.
 
 ## Presets
 
