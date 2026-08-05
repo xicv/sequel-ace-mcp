@@ -5,6 +5,17 @@ type ServerHandle = McpServer['server'];
 
 export type GrantChoice = 'once' | 'session' | 'decline';
 
+/**
+ * Outcome of asking the user to authorize a statement.
+ *
+ * `unavailable` means the question was never put to them - the client does not
+ * support elicitation, or the request failed. It is deliberately not folded
+ * into `decline`, so callers can say what actually happened.
+ */
+export type ConfirmOutcome =
+  | { choice: GrantChoice }
+  | { choice: 'unavailable'; reason: string };
+
 const CATEGORY_LABEL: Record<SqlCategory, string> = {
   read: 'read',
   write: 'WRITE',
@@ -19,13 +30,20 @@ function isGrantChoice(value: unknown): value is GrantChoice {
   return typeof value === 'string' && (GRANT_CHOICES as readonly string[]).includes(value);
 }
 
+function describeError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return typeof error === 'string' ? error : 'unknown error';
+}
+
 export function makeConfirmFn(server: ServerHandle) {
   return async (args: {
     category: SqlCategory;
     statement: string;
     connectionName: string;
     database?: string | null;
-  }): Promise<GrantChoice> => {
+  }): Promise<ConfirmOutcome> => {
     const snippet =
       args.statement.length > 800
         ? `${args.statement.slice(0, 800)}…`
@@ -39,6 +57,23 @@ export function makeConfirmFn(server: ServerHandle) {
     const sessionScope = args.database
       ? `all ${label} statements on ${args.database} until the MCP server restarts`
       : `all ${label} statements on this connection until the MCP server restarts`;
+
+    // Elicitation is an optional MCP capability. Asking a client that never
+    // declared it produces a "method not found" error that is indistinguishable
+    // from a refusal, so check first and report the real reason.
+    let capabilities;
+    try {
+      capabilities = server.getClientCapabilities();
+    } catch (error) {
+      return { choice: 'unavailable', reason: describeError(error) };
+    }
+
+    if (!capabilities?.elicitation) {
+      return {
+        choice: 'unavailable',
+        reason: 'this MCP client does not support elicitation (no prompt can be shown)',
+      };
+    }
 
     try {
       const result = await server.elicitInput({
@@ -66,11 +101,13 @@ export function makeConfirmFn(server: ServerHandle) {
         },
       });
 
-      if (result.action !== 'accept') return 'decline';
+      // "decline" and "cancel" are real answers from a real prompt.
+      if (result.action !== 'accept') return { choice: 'decline' };
+
       const value = result.content?.['choice'];
-      return isGrantChoice(value) ? value : 'decline';
-    } catch {
-      return 'decline';
+      return { choice: isGrantChoice(value) ? value : 'decline' };
+    } catch (error) {
+      return { choice: 'unavailable', reason: describeError(error) };
     }
   };
 }

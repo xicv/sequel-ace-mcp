@@ -230,6 +230,24 @@ export class PolicyConfirmationDeclinedError extends Error {
   }
 }
 
+/**
+ * The confirmation prompt could not be shown at all - the client does not
+ * implement MCP elicitation, or the request failed in transport.
+ *
+ * Distinct from PolicyConfirmationDeclinedError on purpose: reporting this as a
+ * decline tells the user they rejected something they were never asked about,
+ * and hides a broken confirmation channel behind a plausible-looking refusal.
+ */
+export class PolicyConfirmationUnavailableError extends Error {
+  constructor(
+    public readonly category: SqlCategory,
+    public readonly reason: string,
+  ) {
+    super(`Confirmation required for ${category} statement, but no prompt could be shown: ${reason}`);
+    this.name = 'PolicyConfirmationUnavailableError';
+  }
+}
+
 export class ClassifierError extends Error {
   constructor(message: string) {
     super(message);

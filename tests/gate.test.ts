@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { evaluatePolicy } from '../src/policy/gate.js';
 import { createGrantStore } from '../src/policy/grants.js';
-import { PolicySchema, PolicyDeniedError, PolicyConfirmationDeclinedError } from '../src/types.js';
+import {
+  PolicySchema,
+  PolicyDeniedError,
+  PolicyConfirmationDeclinedError,
+  PolicyConfirmationUnavailableError,
+} from '../src/types.js';
 
 const policy = PolicySchema.parse({});
 
@@ -20,7 +25,7 @@ describe('evaluatePolicy', () => {
   });
 
   it('confirms write and proceeds when user picks "once"', async () => {
-    const elicit = vi.fn(async () => 'once' as const);
+    const elicit = vi.fn(async () => ({ choice: 'once' }) as const);
     const decision = await evaluatePolicy({
       policy,
       category: 'write',
@@ -35,7 +40,7 @@ describe('evaluatePolicy', () => {
   });
 
   it('rejects when user declines confirmation', async () => {
-    const elicit = vi.fn(async () => 'decline' as const);
+    const elicit = vi.fn(async () => ({ choice: 'decline' }) as const);
     await expect(
       evaluatePolicy({
         policy,
@@ -95,8 +100,8 @@ describe('evaluatePolicy', () => {
   it('"session" choice registers a session grant for subsequent statements', async () => {
     const grants = createGrantStore();
     const elicit = vi
-      .fn<(p: unknown) => Promise<'once' | 'session' | 'decline'>>()
-      .mockResolvedValueOnce('session');
+      .fn<(p: unknown) => Promise<{ choice: 'once' | 'session' | 'decline' }>>()
+      .mockResolvedValueOnce({ choice: 'session' });
 
     await evaluatePolicy({
       policy,
@@ -124,7 +129,7 @@ describe('evaluatePolicy', () => {
   it('session grant is scoped to its (conn, db, category) — does not leak across databases', async () => {
     const grants = createGrantStore();
     grants.grantSession({ connection: 'x', database: 'staging', category: 'write' });
-    const elicit = vi.fn(async () => 'decline' as const);
+    const elicit = vi.fn(async () => ({ choice: 'decline' }) as const);
 
     await expect(
       evaluatePolicy({
@@ -138,5 +143,43 @@ describe('evaluatePolicy', () => {
       }),
     ).rejects.toBeInstanceOf(PolicyConfirmationDeclinedError);
     expect(elicit).toHaveBeenCalledOnce();
+  });
+  it('reports an undeliverable prompt as unavailable, not as a user decline', async () => {
+    // Regression: a client without elicitation support used to surface as
+    // "User declined confirmation", blaming the user for a prompt they never saw.
+    const elicit = vi.fn(async () =>
+      ({ choice: 'unavailable', reason: 'this MCP client does not support elicitation' }) as const,
+    );
+
+    const promise = evaluatePolicy({
+      policy,
+      category: 'write',
+      statement: 'UPDATE t SET x = 1',
+      connectionName: 'x',
+      elicitConfirm: elicit,
+    });
+
+    await expect(promise).rejects.toBeInstanceOf(PolicyConfirmationUnavailableError);
+    await expect(promise).rejects.not.toBeInstanceOf(PolicyConfirmationDeclinedError);
+    await expect(promise).rejects.toThrow(/does not support elicitation/);
+  });
+
+  it('does not grant a session when the prompt could not be shown', async () => {
+    const grants = createGrantStore();
+    const elicit = vi.fn(async () => ({ choice: 'unavailable', reason: 'transport closed' }) as const);
+
+    await expect(
+      evaluatePolicy({
+        policy,
+        category: 'write',
+        statement: 'UPDATE t SET x = 1',
+        connectionName: 'x',
+        grantDatabase: 'app',
+        elicitConfirm: elicit,
+        grants,
+      }),
+    ).rejects.toBeInstanceOf(PolicyConfirmationUnavailableError);
+
+    expect(grants.consume({ connection: 'x', database: 'app', category: 'write' })).toBe(false);
   });
 });

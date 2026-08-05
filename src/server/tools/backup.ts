@@ -69,7 +69,14 @@ export function registerBackupTools(mcp: McpServer, deps: ToolDeps): void {
         connectionName: backup.connection,
         database: backup.database ?? null,
       });
-      if (ok === 'decline') return toolError('Restore declined.');
+      if (ok.choice === 'unavailable') {
+        return toolError(
+          `Restore needs confirmation, but no prompt could be shown: ${ok.reason}. ` +
+            `Nothing was restored. This is not a refusal - set an explicit write policy for ` +
+            `"${backup.connection}" with set_database_policy, or restore outside this tool.`,
+        );
+      }
+      if (ok.choice === 'decline') return toolError('Restore declined.');
 
       if (!isMySqlConnection(conn)) {
         let sqliteDb: SqliteDatabase | null = null;

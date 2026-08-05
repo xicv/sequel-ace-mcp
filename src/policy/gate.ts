@@ -1,7 +1,8 @@
-import type { GrantChoice } from '../elicit/confirm.js';
+import type { ConfirmOutcome, GrantChoice } from '../elicit/confirm.js';
 import type { GrantStore } from './grants.js';
 import {
   PolicyConfirmationDeclinedError,
+  PolicyConfirmationUnavailableError,
   PolicyDeniedError,
   type Policy,
   type PolicyAction,
@@ -14,7 +15,7 @@ export interface ElicitConfirmFn {
     statement: string;
     connectionName: string;
     database?: string | null;
-  }): Promise<GrantChoice>;
+  }): Promise<ConfirmOutcome>;
 }
 
 export interface PolicyDecision {
@@ -73,12 +74,19 @@ export async function evaluatePolicy(args: {
     };
   }
 
-  const choice = await args.elicitConfirm({
+  const outcome = await args.elicitConfirm({
     category: args.category,
     statement: args.statement,
     connectionName: args.connectionName,
     database: args.grantDatabase ?? null,
   });
+
+  // Never shown a prompt at all - do not pass this off as a refusal.
+  if (outcome.choice === 'unavailable') {
+    throw new PolicyConfirmationUnavailableError(args.category, outcome.reason);
+  }
+
+  const choice: GrantChoice = outcome.choice;
 
   if (choice === 'decline') {
     throw new PolicyConfirmationDeclinedError(args.category);

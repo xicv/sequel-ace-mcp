@@ -3,6 +3,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import {
   isMySqlConnection,
   PolicyConfirmationDeclinedError,
+  PolicyConfirmationUnavailableError,
   PolicyDeniedError,
 } from '../types.js';
 import { classifyStatement } from '../policy/classifier.js';
@@ -85,7 +86,8 @@ export async function runSqlTool(params: {
   } catch (e) {
     const declined = e instanceof PolicyConfirmationDeclinedError;
     const denied = e instanceof PolicyDeniedError;
-    if (declined || denied) {
+    const unavailable = e instanceof PolicyConfirmationUnavailableError;
+    if (declined || denied || unavailable) {
       writeAuditEntry(
         {
           requestId,
@@ -96,13 +98,27 @@ export async function runSqlTool(params: {
           sql: args.sql,
           decision: denied ? 'deny' : 'confirm',
           confirmed: false,
-          outcome: denied ? 'denied' : 'declined',
+          // Logging an unshown prompt as "declined" would make a broken
+          // confirmation channel look like a deliberate refusal in the audit.
+          outcome: denied ? 'denied' : unavailable ? 'error' : 'declined',
+          error: e instanceof PolicyConfirmationUnavailableError ? e.message : null,
         },
         { redactSqlInLog: retention.redactSqlInLog, tamperEvidentChain: retention.tamperEvidentChain },
       );
       if (denied) {
         const dbHint = resolved.contributingDatabase ? ` (${resolved.contributingDatabase})` : '';
         return toolError(`Denied by policy: ${classified.category} statements not allowed on "${conn.name}"${dbHint}.`);
+      }
+      if (e instanceof PolicyConfirmationUnavailableError) {
+        const target = resolved.contributingDatabase
+          ? `${conn.name}" / "${resolved.contributingDatabase}`
+          : conn.name;
+        return toolError(
+          `${e.message}. Statement not executed - nothing was changed. ` +
+            `This is not a refusal: the prompt could not be delivered. ` +
+            `Either set an explicit policy for "${target}" with set_database_policy ` +
+            `(e.g. ${classified.category}: "allow"), or run the statement outside this tool.`,
+        );
       }
       return toolError('User declined confirmation. Statement not executed.');
     }

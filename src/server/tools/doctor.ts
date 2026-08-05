@@ -52,6 +52,17 @@ export function registerDoctorTool(mcp: McpServer, deps: ToolDeps): void {
         })),
       );
       const sequelAceHistory = statSequelAceHistory();
+
+      // Without elicitation there is no way to answer a "confirm" policy, so
+      // every confirm-gated statement fails closed. Surfaced here because that
+      // is otherwise only discoverable by attempting a write and being refused.
+      let elicitationSupported: boolean | null = null;
+      try {
+        elicitationSupported = Boolean(mcp.server.getClientCapabilities()?.elicitation);
+      } catch {
+        elicitationSupported = null;
+      }
+
       return jsonResult({
         app: 'sequel-mcp',
         version: PACKAGE_VERSION,
@@ -61,6 +72,15 @@ export function registerDoctorTool(mcp: McpServer, deps: ToolDeps): void {
           arch: process.arch,
         },
         touchID: { available: tid.available },
+        elicitation: {
+          supported: elicitationSupported,
+          note:
+            elicitationSupported === false
+              ? 'This client cannot show confirmation prompts, so any policy set to "confirm" will always fail closed. Use "allow" or "deny" explicitly.'
+              : elicitationSupported === null
+                ? 'Could not determine client elicitation support.'
+                : 'Client can show confirmation prompts.',
+        },
         defaultConnection: def,
         connections: conns,
         sequelAceHistory: {
