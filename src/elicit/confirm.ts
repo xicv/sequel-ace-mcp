@@ -101,7 +101,23 @@ export function makeConfirmFn(server: ServerHandle) {
         },
       });
 
-      // "decline" and "cancel" are real answers from a real prompt.
+      // Per the MCP spec, "cancel" means the client dismissed the request
+      // *without* an explicit choice - a timeout, no UI to show it in, the
+      // user closing a dialog unanswered. That is not the same thing as
+      // "decline" (an explicit no) and must not be reported as one: a client
+      // that can never get a real answer (e.g. running in an unattended
+      // mode with no interactive surface) will legitimately resolve every
+      // elicitation this way, and folding it into "decline" fabricates a
+      // refusal nobody made.
+      if (result.action === 'cancel') {
+        return {
+          choice: 'unavailable',
+          reason:
+            'the client dismissed the prompt without an explicit choice - no UI to show it in, a timeout, or it was closed unanswered',
+        };
+      }
+
+      // Only "decline" left as a non-accept action; it is a real answer.
       if (result.action !== 'accept') return { choice: 'decline' };
 
       const value = result.content?.['choice'];

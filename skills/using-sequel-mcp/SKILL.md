@@ -101,23 +101,37 @@ A session grant on `staging` does **not** cover `prod`. Surface the scope clearl
 
 ## When the confirm prompt cannot be shown
 
-Elicitation is an **optional** MCP capability. In a client that does not implement it, a `confirm`
-policy can never be satisfied — every gated statement fails closed.
+Elicitation is an **optional** MCP capability, and even a client that supports it can fail to
+deliver a specific prompt — no interactive surface in this session, a timeout, a dialog dismissed
+unanswered. The MCP spec models this precisely: `ElicitResult.action` is `"accept" | "decline" |
+"cancel"`, where `"cancel"` means *no explicit choice was made* — distinct from `"decline"`, a real
+no. As of **sequel-mcp 0.9.1**, `confirm` honors that distinction end to end: only a genuine
+`"decline"` is ever reported as declined. Anything else — capability not negotiated, the elicitation
+call throwing, or a `"cancel"` result — surfaces as `outcome: error` with a specific `error_msg`
+explaining why no answer exists, never as a fabricated refusal. This held true across the case that
+motivated the fix: Claude Code launched with `--permission-mode bypassPermissions
+--allow-dangerously-skip-permissions` (an unattended/automated mode with no live surface to show a
+prompt in) legitimately resolves elicitation with `"cancel"` — before 0.9.1 that was misreported as
+`"declined"`; now it correctly comes back as unavailable. The fix is protocol-level, not client-
+specific, so it applies the same way in Claude Code CLI and Claude.app.
 
-Since 0.9.0 this is reported honestly rather than as a refusal: the tool result says the prompt
-could not be delivered and gives the reason, and the audit row is `outcome: error` (not `declined`)
-with the reason in `error_msg`. **Do not tell the user they declined** in that case — they were
-never asked.
+**Check `sequel-mcp:doctor` → `version` before trusting a `declined` result.** On ≥ 0.9.1, take a
+`declined` outcome at face value. Below 0.9.1, a `cancel` a client never truly answered could still
+show up as `"User declined confirmation. Statement not executed."`, indistinguishable in the tool
+result from a real decline — do not tell the user "you declined X" on that basis alone. Ask them
+directly instead: "did you actually see and decline a confirmation prompt just now?" If they say no,
+don't retry the identical call (whatever blocked delivery will likely block it the same way again) —
+get their explicit re-approval in chat, in their own words, and treat that as the authorization for
+the retry. `elicitation.supported: true` in `doctor` only means the client negotiated the capability;
+it does not by itself prove any given prompt will actually reach a human — a session-level block (like
+`bypassPermissions`) can sit underneath a `true` and fail every single confirm the same way, not as a
+one-off glitch.
 
-Check support up front with `sequel-mcp:doctor` → `elicitation.supported`:
-
-- `true` — prompts work; `confirm` is usable.
-- `false` — `confirm` is a dead end in this client. Policies must be an explicit `allow` or `deny`.
-- `null` — could not be determined.
-
-If a policy is `confirm` in a client that cannot prompt, say so and let the user choose: set an
-explicit policy for that database, or run the statement outside the tool. Never silently widen the
-policy yourself — that is the user's call, on their data.
+Either way — capability genuinely absent, or a specific prompt genuinely undeliverable — the
+resolution is the same: say so, and let the user choose explicitly (in chat, in their own words)
+between running elsewhere (an interactive session/terminal) or temporarily authorizing a scoped policy
+widen for the specific statements already agreed on. Never silently widen the policy yourself — that
+is the user's call, on their data. If they choose the temporary-widen path, set it back afterward.
 
 ## Common mistakes to avoid
 
@@ -126,6 +140,7 @@ policy yourself — that is the user's call, on their data.
 3. **Do not bypass policy by asking the user to lower it.** If the user wants `write` allowed permanently, that is a `set_database_policy` change they make knowingly — scope it to the narrowest database, prefer `confirm` over `allow`, and put it back afterwards. The one case where proposing `allow` is legitimate is a client that cannot prompt at all (see above), and even then only with an explicit yes.
 4. **Do not lose the `backup_id`.** Whenever `sequel-mcp:execute` returns a non-null `backupId`, mention it to the user in your reply — it's their rollback handle.
 5. **Do not call `audit_cleanup` without `dryRun=true` first.** It deletes rows and VACUUMs.
+6. **Do not take a `declined` result at face value on sequel-mcp < 0.9.1.** `elicitation.supported: true` does not guarantee the prompt actually reached the user — check `doctor` → `version` too, and if it's below 0.9.1, confirm with the user in chat before telling them "you declined." See [When the confirm prompt cannot be shown](#when-the-confirm-prompt-cannot-be-shown).
 
 ## Reference material
 

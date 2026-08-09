@@ -2,6 +2,12 @@
 
 All notable changes to **sequel-mcp** are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] — 2026-08-09
+
+### Fixed
+
+- **`elicit/confirm.ts` no longer reports a dismissed prompt as a decline.** Per the MCP spec, `ElicitResult.action` is `"accept" | "decline" | "cancel"`, where `"cancel"` means the client dismissed the request *without* an explicit choice (no interactive surface to show it in, a timeout, a dialog closed unanswered) — distinct from `"decline"`, an explicit no. The code folded both into `decline`, so any client/session that could never deliver a real prompt (e.g. Claude Code launched with `--permission-mode bypassPermissions`) had every `confirm`-gated statement come back `"User declined confirmation"` — a refusal nobody made, on any server version, `elicitation.supported` notwithstanding. `"cancel"` now correctly resolves to `{ choice: 'unavailable', reason }`, which was already plumbed through `PolicyConfirmationUnavailableError` and reported honestly (this is the same downstream path 0.9.0's `outcome: error` reporting added) — the gap was purely in `confirm.ts` collapsing the distinction before it ever reached that code. Fixed at the protocol level, so it should behave correctly in any spec-compliant MCP client (Claude Code CLI and Claude.app both, not one over the other).
+
 ## [0.9.0] — 2026-06-09
 
 ### Changed
