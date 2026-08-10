@@ -2,6 +2,17 @@
 
 All notable changes to **sequel-mcp** are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3] — 2026-08-10
+
+### Removed
+
+- **npm registry distribution.** This project is no longer published to npm — source-only from here on. `package.json` now sets `"private": true`, so `npm publish` refuses to run rather than accidentally shipping a stale or unauthenticated build. The last version actually on the registry is 0.9.0; it is left as-is (not unpublished) since removing a published version breaks anyone already depending on it, but no newer version will follow it there.
+- All `npx -y sequel-mcp` / `npm install -g sequel-mcp` install paths removed from `README.md`, `CLAUDE.md`, and `.codex/config.toml`. Every wiring example (Claude Code, Codex CLI, Claude Desktop, Cursor/other MCP clients) now points at a local `node dist/index.js` build instead. `.codex/config.toml` uses a repo-relative path, since it's a project-scoped config that only loads from within a built checkout of this repo.
+
+### Notes
+
+- To pick up a new version now: `git pull && npm install && npm run build`, then restart the MCP client session.
+
 ## [0.9.2] — 2026-08-10
 
 ### Fixed

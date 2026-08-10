@@ -6,7 +6,7 @@ import type { makeConfirmFn } from '../elicit/confirm.js';
 import type { GrantStore } from '../policy/grants.js';
 
 export const PACKAGE_NAME = 'sequel-mcp';
-export const PACKAGE_VERSION = '0.9.2';
+export const PACKAGE_VERSION = '0.9.3';
 
 export function toolError(text: string): CallToolResult {
   return { isError: true, content: [{ type: 'text', text }] };

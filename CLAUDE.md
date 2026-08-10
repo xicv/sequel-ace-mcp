@@ -41,7 +41,7 @@ npm run typecheck   # tsc --noEmit
 npm run doctor      # sanitized diagnostic JSON
 ```
 
-E2E with a live MCP client: `npx -y sequel-mcp` (consumes stdio).
+E2E with a live MCP client: `node dist/index.js` (consumes stdio). Not published to npm — source-only, see README.
 
 ## Conventions in this repo
 

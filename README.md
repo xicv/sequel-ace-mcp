@@ -1,6 +1,5 @@
 # sequel-mcp
 
-[![npm](https://img.shields.io/npm/v/sequel-mcp.svg)](https://www.npmjs.com/package/sequel-mcp)
 [![CI](https://github.com/xicv/sequel-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/xicv/sequel-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
@@ -8,9 +7,11 @@ A Model Context Protocol server for **MySQL/MariaDB and SQLite** with policy-gat
 
 > **Sequel Ace is OPTIONAL.** This is a fully standalone MCP. Sequel Ace integration is a *bootstrap convenience* (one-time import of saved MySQL/MariaDB favorites) and a *history augment* (read its query history alongside our audit log). If you don't have Sequel Ace installed, all core tools still work — only `import_from_sequel_ace` and `sequel_ace_history` will fail with a clear "not found" error. Use `add_connection` or `add_sqlite_connection` instead.
 
+> **Not published to npm.** This is a source-only project — clone and build it, then point your MCP client at the local `dist/index.js`. There is no `npx -y sequel-mcp` / `npm install -g sequel-mcp` path.
+
 ## Capabilities
 
-Current release: **v0.8.0**. Full version history: [CHANGELOG.md](./CHANGELOG.md).
+Current release: **v0.9.3**. Full version history: [CHANGELOG.md](./CHANGELOG.md).
 
 - **Two-layer permissions** — connection-level baseline + per-database overrides; strictest-wins for multi-DB statements (fail-closed).
 - **SQLite connections** — first-class `driver: sqlite` connections via `add_sqlite_connection`, no password required, with `PRAGMA database_list` / `PRAGMA table_info` metadata support.
@@ -36,21 +37,7 @@ Current release: **v0.8.0**. Full version history: [CHANGELOG.md](./CHANGELOG.md
 - Node.js 20+ (24 supported).
 - *Optional:* Xcode Command Line Tools — for the Touch ID helper. Install with `xcode-select --install`.
 
-### From npm (recommended)
-
-```bash
-npx -y sequel-mcp                  # ad-hoc, no global install
-# or:
-# npm install -g sequel-mcp
-```
-
-To update an existing Claude Code or Codex setup that already runs `npx -y sequel-mcp`, restart the MCP server/client session after a new npm release is published. For global installs, refresh the package first:
-
-```bash
-npm install -g sequel-mcp@latest
-```
-
-### From source
+### Build from source
 
 ```bash
 git clone https://github.com/xicv/sequel-mcp.git
@@ -60,15 +47,9 @@ npm run build
 npm run build:touchid              # optional — Swift LocalAuthentication helper
 ```
 
-The MCP entry point is at `<repo>/dist/index.js`.
+The MCP entry point is at `<repo>/dist/index.js`. To update an existing install, `git pull && npm install && npm run build`, then restart the MCP server/client session so it picks up the new `dist/`.
 
 ### Wire into Claude Code
-
-```bash
-claude mcp add --scope user sequel-mcp -- npx -y sequel-mcp
-```
-
-For a local source clone, replace the command:
 
 ```bash
 claude mcp add --scope user sequel-mcp -- node /absolute/path/to/sequel-mcp/dist/index.js
@@ -85,12 +66,6 @@ In a Claude Code session, `/mcp` lists every tool the server exposes.
 ### Wire into Codex CLI
 
 ```bash
-codex mcp add sequel-mcp -- npx -y sequel-mcp
-```
-
-For a local source clone, replace the command after building:
-
-```bash
 codex mcp add sequel-mcp -- node /absolute/path/to/sequel-mcp/dist/index.js
 ```
 
@@ -98,8 +73,8 @@ Equivalent `~/.codex/config.toml` entry:
 
 ```toml
 [mcp_servers.sequel-mcp]
-command = "npx"
-args = ["-y", "sequel-mcp"]
+command = "node"
+args = ["/absolute/path/to/sequel-mcp/dist/index.js"]
 startup_timeout_sec = 20
 tool_timeout_sec = 600
 ```
@@ -110,7 +85,7 @@ Verify:
 codex mcp list
 ```
 
-This repo also includes `.codex/config.toml` for trusted project-scoped Codex sessions. It wires the MCP server through the published `npx -y sequel-mcp` package; install the Skill separately with one of the options below. Use the local source command above when developing unpublished server changes.
+This repo also includes `.codex/config.toml` for trusted project-scoped Codex sessions — it points at the local build via a repo-relative path, so it only works when Codex loads it from within a built checkout of this repo. Install the Skill separately with one of the options below.
 
 ### Install the companion Skill (optional, v0.7.0+)
 
@@ -146,8 +121,8 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 {
   "mcpServers": {
     "sequel-mcp": {
-      "command": "npx",
-      "args": ["-y", "sequel-mcp"]
+      "command": "node",
+      "args": ["/absolute/path/to/sequel-mcp/dist/index.js"]
     }
   }
 }
@@ -157,7 +132,7 @@ Restart Claude Desktop.
 
 ### Wire into Cursor / other MCP clients
 
-Any client that speaks the MCP stdio transport works. Point its `command` at `npx -y sequel-mcp` (or `node` + absolute `dist/index.js` path).
+Any client that speaks the MCP stdio transport works. Point its `command` at `node` with the absolute `dist/index.js` path.
 
 ### First-run quickstart
 
@@ -802,7 +777,7 @@ The report includes runtime versions, every configured connection (host/user/dat
 npm install
 npm run typecheck
 npm run lint
-npm test                                  # 200 tests as of v0.8.0
+npm test                                  # 213 tests as of v0.9.3
 npm run build
 npm run build:touchid                     # macOS only — Swift LocalAuthentication helper
 npm run security:scan                     # local secret regex scan
