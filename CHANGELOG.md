@@ -2,6 +2,18 @@
 
 All notable changes to **sequel-mcp** are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] — 2026-08-10
+
+### Fixed
+
+- **`elicit/confirm.ts` no longer reports an unanswered `accept` as a decline.** 0.9.1 fixed the `"cancel"` case but missed a second path to the same failure: the MCP SDK's `elicitInput()` only runs schema validation against the response `content` when `content` is truthy, so a client that resolves an elicitation with `{ action: 'accept', content: undefined }` (or an empty object) sails through unvalidated instead of throwing. `confirm.ts`'s fallback then defaulted any content without a recognizable `choice` to `'decline'` — fabricating the exact refusal-nobody-made bug 0.9.1 was written to eliminate, just from the `accept` branch instead of `cancel`. An `accept` with no usable `choice` now resolves to `{ choice: 'unavailable', reason }`, with the reason including the actual `content` received so a broken client integration is diagnosable rather than silently misreported as "declined". A real decline (`content.choice === 'decline'`, chosen from the radio) is unaffected.
+- **`doctor`'s `elicitation.supported` and `confirm.ts`'s capability gate now check `capabilities.elicitation.form`, not just `capabilities.elicitation`.** Every confirm prompt this server sends uses the SDK's default `'form'` mode, which the SDK itself gates on `capabilities.elicitation.form` — but both call sites here only checked truthiness of the parent `elicitation` object. A client that declares `elicitation: {}` (support for some other mode, or an incomplete capability stub) passed both checks and was reported `supported: true` by `doctor`, then failed inside the SDK on the first real attempt. `confirm.ts` now fails closed to `unavailable` before ever calling `elicitInput()` in that case, and `doctor` reports the same `capabilities.elicitation.form` value it's actually gated on, so the two can no longer disagree.
+
+### Tests
+
+- New: `tests/confirm.test.ts` (12 cases) — direct coverage of `makeConfirmFn`, previously untested (`gate.test.ts` mocks `elicitConfirm` out entirely). Covers the capability gate (missing entirely, present without `.form`, throwing), `cancel` → `unavailable`, a real `decline`, all three valid `content.choice` values including an explicit `'decline'`, and the regression case (`accept` with missing/empty/invalid content → `unavailable`, not `'decline'`).
+- **Total: 213** (was 193 at 0.9.1). All previous tests still pass — zero behavioral regression for existing call paths.
+
 ## [0.9.1] — 2026-08-09
 
 ### Fixed

@@ -60,7 +60,11 @@ export function makeConfirmFn(server: ServerHandle) {
 
     // Elicitation is an optional MCP capability. Asking a client that never
     // declared it produces a "method not found" error that is indistinguishable
-    // from a refusal, so check first and report the real reason.
+    // from a refusal, so check first and report the real reason. We always call
+    // elicitInput() with the default mode ('form'), and the SDK gates that mode
+    // on capabilities.elicitation.form specifically - a bare truthy check on
+    // capabilities.elicitation (e.g. an empty `{}`) passes here but still throws
+    // inside the SDK, so check the same sub-capability it actually checks.
     let capabilities;
     try {
       capabilities = server.getClientCapabilities();
@@ -68,10 +72,10 @@ export function makeConfirmFn(server: ServerHandle) {
       return { choice: 'unavailable', reason: describeError(error) };
     }
 
-    if (!capabilities?.elicitation) {
+    if (!capabilities?.elicitation?.form) {
       return {
         choice: 'unavailable',
-        reason: 'this MCP client does not support elicitation (no prompt can be shown)',
+        reason: 'this MCP client does not support form elicitation (no prompt can be shown)',
       };
     }
 
@@ -121,7 +125,19 @@ export function makeConfirmFn(server: ServerHandle) {
       if (result.action !== 'accept') return { choice: 'decline' };
 
       const value = result.content?.['choice'];
-      return { choice: isGrantChoice(value) ? value : 'decline' };
+      if (isGrantChoice(value)) return { choice: value };
+
+      // The client said "accept" but the SDK let it through without a usable
+      // choice (schema validation only runs when content is truthy - see
+      // elicitInput in the MCP SDK). That is not the same as the user picking
+      // "Decline" from the radio: folding it into decline would fabricate a
+      // refusal nobody made, exactly the failure mode "cancel" was fixed for
+      // above. Report what actually came back so a broken client integration
+      // is diagnosable instead of silently misreported.
+      return {
+        choice: 'unavailable',
+        reason: `the client accepted but did not return a valid choice (received content: ${JSON.stringify(result.content ?? null)})`,
+      };
     } catch (error) {
       return { choice: 'unavailable', reason: describeError(error) };
     }

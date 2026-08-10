@@ -56,9 +56,13 @@ export function registerDoctorTool(mcp: McpServer, deps: ToolDeps): void {
       // Without elicitation there is no way to answer a "confirm" policy, so
       // every confirm-gated statement fails closed. Surfaced here because that
       // is otherwise only discoverable by attempting a write and being refused.
+      // Confirm prompts always use the SDK's default 'form' mode, which is
+      // gated on capabilities.elicitation.form specifically - a bare truthy
+      // check on capabilities.elicitation (e.g. an empty `{}`) would report
+      // "supported: true" for a client that still can't show a form prompt.
       let elicitationSupported: boolean | null = null;
       try {
-        elicitationSupported = Boolean(mcp.server.getClientCapabilities()?.elicitation);
+        elicitationSupported = Boolean(mcp.server.getClientCapabilities()?.elicitation?.form);
       } catch {
         elicitationSupported = null;
       }

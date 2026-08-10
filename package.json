@@ -1,6 +1,6 @@
 {
   "name": "sequel-mcp",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "description": "MCP server that lets AI agents run MySQL/MariaDB and SQLite queries with policy-gated action sets (allow/confirm/deny per category), macOS Keychain credential storage for MySQL/MariaDB, and optional Sequel Ace import.",
   "type": "module",
   "bin": {
