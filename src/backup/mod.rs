@@ -1,6 +1,7 @@
 //! Backup capture and restore planning over the audit database.
 
 pub mod extractor;
+pub mod journal;
 
 use crate::audit::AuditDb;
 use crate::policy::model::Policy;
@@ -17,6 +18,8 @@ pub enum BackupError {
     ByteOverflow { observed: u64, cap: u64 },
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
+    #[error("backup query cannot be safely bounded: {0}")]
+    Unbounded(String),
 }
 
 #[derive(Debug, Clone)]
@@ -290,7 +293,16 @@ fn fetch_rows_sqlite(
     row_cap: u64,
     _database: Option<&str>,
 ) -> Result<RowsFetch, BackupError> {
-    let capped = crate::backup::extractor::with_limit(&t.select_sql, row_cap + 1);
+    // Unrewritable backup SELECT (existing LIMIT, set op, CTE, comment,
+    // unmatched lock clause, ...): deny the mutation rather than run an
+    // unbounded pre-image query.
+    let capped =
+        crate::backup::extractor::with_limit(&t.select_sql, row_cap + 1).ok_or_else(|| {
+            BackupError::Unbounded(format!(
+                "backup query not safely limitable: {}",
+                t.select_sql.chars().take(80).collect::<String>()
+            ))
+        })?;
     let mut stmt = db.prepare(&capped)?;
     let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
     let mut rows = stmt.query([])?;

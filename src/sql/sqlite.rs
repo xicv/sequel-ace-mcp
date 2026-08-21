@@ -36,6 +36,9 @@ pub enum SqliteError {
 
 #[derive(Debug)]
 pub struct ExecuteResult {
+    /// Operation-journal row id (D3); MySQL mutations create journals,
+    /// SQLite ones currently do not (single-file local transactions).
+    pub journal_id: Option<i64>,
     pub rows: Vec<serde_json::Value>,
     pub fields: Vec<String>,
     pub affected_rows: u64,
@@ -313,6 +316,7 @@ fn execute_on_connection(
         }
 
         Ok(ExecuteResult {
+            journal_id: None,
             rows: stats.rows,
             fields: stats.fields,
             affected_rows: stats.affected_rows,

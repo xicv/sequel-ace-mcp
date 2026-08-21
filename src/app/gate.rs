@@ -440,6 +440,8 @@ pub fn run_sql(
                     crate::sql::mysql::execute_mysql_statement(
                         crate::sql::mysql::MySqlExecuteParams {
                             connection: mc,
+                            request_id: request_id.clone(),
+                            databases_for_log: databases_for_log.clone(),
                             password,
                             sql: &sql,
                             classified: &classified,
@@ -454,6 +456,7 @@ pub fn run_sql(
                 })
             });
             res.map(|r| crate::sql::sqlite::ExecuteResult {
+                journal_id: r.journal_id,
                 rows: r.rows,
                 fields: r.fields,
                 affected_rows: r.affected_rows,
@@ -484,6 +487,12 @@ pub fn run_sql(
                 None,
                 &write_opts,
             );
+            // D3: the audit row is durable, so the operation journal can
+            // close out (mutation_committed -> audit_finalized).
+            if let Some(jid) = r.journal_id {
+                let j = crate::backup::journal::Journal::from_id(&deps.audit, jid);
+                let _ = j.transition(crate::backup::journal::JournalState::AuditFinalized, None);
+            }
             Ok(RunOutcome {
                 connection: conn.name().to_string(),
                 category: classified.category,
