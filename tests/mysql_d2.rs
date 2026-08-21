@@ -120,19 +120,23 @@ async fn cancellation_kills_statement_and_preserves_state() {
         "cancellation must be prompt: {elapsed:?}"
     );
 
-    // Mutation did NOT commit.
-    let rows = exec_raw(&ctx, "SELECT value FROM d2_items WHERE id = 1").await;
-    let value = match &rows[0]["value"] {
-        serde_json::Value::Number(n) => n.as_i64().unwrap(),
+    // Mutation did NOT commit: no row moved off the seeded value.
+    let rows = exec_raw(
+        &ctx,
+        "SELECT COUNT(*) AS n FROM d2_items WHERE value <> 100",
+    )
+    .await;
+    let moved = match &rows[0]["n"] {
+        serde_json::Value::Number(v) => v.as_i64().unwrap(),
         serde_json::Value::String(s) => s.parse().unwrap(),
         other => panic!("{other}"),
     };
-    assert_eq!(value, 100, "timed-out mutation must not commit");
+    assert_eq!(moved, 0, "timed-out mutation must not commit");
 
     // No lingering statement on the server for this user.
     let procs = exec_raw(
         &ctx,
-        "SELECT COUNT(*) AS n FROM information_schema.processlist WHERE INFO LIKE '%SLEEP(5)%' AND ID <> CONNECTION_ID()",
+        "SELECT COUNT(*) AS n FROM information_schema.processlist WHERE INFO LIKE '%d2_items%' AND ID <> CONNECTION_ID()",
     )
     .await;
     let n = match &procs[0]["n"] {

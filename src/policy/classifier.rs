@@ -42,6 +42,9 @@ pub struct ClassifiedStatement {
     pub file_io: bool,
     /// `EXPLAIN ANALYZE` — executes the wrapped statement.
     pub executes_wrapped: bool,
+    /// `IF EXISTS` present on DROP/TRUNCATE DDL (absent-target handling:
+    /// preflight turns a missing target into an audited local no-op).
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -293,16 +296,7 @@ pub fn classify_statement(
     if dialect == Dialect::SQLite
         && let Some(category) = classify_sqlite_pragma(&stripped)
     {
-        return Ok(ClassifiedStatement {
-            category,
-            ast_type: "pragma",
-            target_databases: Vec::new(),
-            read_tables: Vec::new(),
-            mutated_tables: Vec::new(),
-            locking_read: false,
-            file_io: false,
-            executes_wrapped: false,
-        });
+        return Ok(empty_result(category, "pragma"));
     }
 
     if is_tx_keyword(&stripped) {
@@ -367,6 +361,7 @@ fn empty_result(category: SqlCategory, ast_type: &'static str) -> ClassifiedStat
         locking_read: false,
         file_io: false,
         executes_wrapped: false,
+        if_exists: false,
     }
 }
 
@@ -532,6 +527,7 @@ fn classify_ast(
     original_sql: &str,
 ) -> Result<ClassifiedStatement, ClassifyError> {
     let mut r = empty_result(SqlCategory::Read, "select");
+    r.if_exists = stmt_if_exists(stmt);
     let lower = strip_comments(original_sql).to_ascii_lowercase();
     r.file_io = lower.contains("into outfile")
         || lower.contains("into dumpfile")
@@ -750,6 +746,15 @@ impl ObjectGraph {
             database: db,
             table,
         });
+    }
+}
+
+/// Extract `IF EXISTS` from DROP/TRUNCATE statements.
+fn stmt_if_exists(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Drop { if_exists, .. } => *if_exists,
+        Statement::Truncate(t) => t.if_exists,
+        _ => false,
     }
 }
 
