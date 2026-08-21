@@ -1,4 +1,5 @@
 pub mod cancel;
+pub mod ddl;
 pub mod docker;
 pub mod hints;
 pub mod known_hosts;

@@ -36,6 +36,10 @@ pub enum SqliteError {
 
 #[derive(Debug)]
 pub struct ExecuteResult {
+    /// DDL no-op flag (MySQL preflight path); SQLite defaults false.
+    pub ddl_no_op: bool,
+    /// Protection-model warnings (MySQL DDL path); SQLite defaults empty.
+    pub warnings: Vec<&'static str>,
     /// Operation-journal row id (D3); MySQL mutations create journals,
     /// SQLite ones currently do not (single-file local transactions).
     pub journal_id: Option<i64>,
@@ -317,6 +321,8 @@ fn execute_on_connection(
 
         Ok(ExecuteResult {
             journal_id: None,
+            ddl_no_op: false,
+            warnings: Vec::new(),
             rows: stats.rows,
             fields: stats.fields,
             affected_rows: stats.affected_rows,

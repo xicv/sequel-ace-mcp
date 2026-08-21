@@ -125,6 +125,11 @@ pub struct RunOutcome {
     pub backup_id: Option<i64>,
     pub backup_row_count: u64,
     pub request_id: String,
+    /// DDL absent-target no-op (IF EXISTS over missing tables): nothing
+    /// was sent to the server (D4).
+    pub ddl_no_op: bool,
+    /// Protection-model warnings (nontransactional DDL snapshot).
+    pub warnings: Vec<&'static str>,
 }
 
 fn dialect_for(conn: &Connection) -> Dialect {
@@ -457,6 +462,8 @@ pub fn run_sql(
             });
             res.map(|r| crate::sql::sqlite::ExecuteResult {
                 journal_id: r.journal_id,
+                ddl_no_op: r.ddl_no_op,
+                warnings: r.warnings,
                 rows: r.rows,
                 fields: r.fields,
                 affected_rows: r.affected_rows,
@@ -505,6 +512,8 @@ pub fn run_sql(
                 duration_ms: r.duration_ms.max(started.elapsed().as_millis() as u64),
                 backup_id: r.backup_id,
                 backup_row_count: r.backup_row_count,
+                ddl_no_op: r.ddl_no_op,
+                warnings: r.warnings,
                 request_id,
             })
         }
@@ -593,6 +602,8 @@ pub fn outcome_to_json(o: &RunOutcome) -> serde_json::Value {
         "backupId": o.backup_id,
         "backupRowCount": o.backup_row_count,
         "requestId": o.request_id,
+        "ddlNoOp": o.ddl_no_op,
+        "warnings": o.warnings,
     })
 }
 

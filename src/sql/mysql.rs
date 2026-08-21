@@ -32,12 +32,20 @@ pub enum MySqlError {
     Pool(String),
     #[error("{0}")]
     Uncertain(String),
+    #[error("DDL target not found: {0}")]
+    DdlNotFound(String),
 }
 
 #[derive(Debug)]
 pub struct ExecuteResult {
     /// Operation-journal row id (D3), when a journal was created.
     pub journal_id: Option<i64>,
+    /// DDL absent-target no-op (IF EXISTS over missing tables): nothing
+    /// was sent to the server; audited locally.
+    pub ddl_no_op: bool,
+    /// Protection-model warnings that must surface in the plan and audit
+    /// (nontransactional DDL snapshot semantics, D4).
+    pub warnings: Vec<&'static str>,
     pub rows: Vec<serde_json::Value>,
     pub fields: Vec<String>,
     pub affected_rows: u64,
@@ -161,11 +169,49 @@ pub struct MySqlExecuteParams<'a> {
     pub tunnel_endpoint: Option<(String, u16)>,
 }
 
+/// Structured representation for binary column values so they can never
+/// be mistaken for ordinary text: `{"type":"binary","encoding":"base64",
+/// "data":…}` (D5).
+pub fn binary_json(bytes: &[u8]) -> serde_json::Value {
+    use base64::Engine;
+    serde_json::json!({
+        "type": "binary",
+        "encoding": "base64",
+        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+}
+
 /// Legacy numeric parity for text-protocol results: INT-family and
 /// FLOAT/DOUBLE parse to JSON numbers; BIGINT and DECIMAL stay strings
 /// (`bigNumberStrings` semantics — lossless round-trip).
-pub fn value_with_column_type(v: &Value, ct: mysql_async::consts::ColumnType) -> serde_json::Value {
+pub fn value_with_column_type(
+    v: &Value,
+    ct: mysql_async::consts::ColumnType,
+    charset: u16,
+) -> serde_json::Value {
     use mysql_async::consts::ColumnType;
+    // Binary-typed columns (BLOB family, BIT, GEOMETRY) and any column
+    // using the binary character set (63: VARBINARY/BINARY render as
+    // VAR_STRING/STRING in the text protocol) get the structured
+    // representation — including valid-UTF-8 bytes (an ASCII BLOB is
+    // still a BLOB).
+    if let Value::Bytes(b) = v
+        && (matches!(
+            ct,
+            ColumnType::MYSQL_TYPE_TINY_BLOB
+                | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
+                | ColumnType::MYSQL_TYPE_LONG_BLOB
+                | ColumnType::MYSQL_TYPE_BLOB
+                | ColumnType::MYSQL_TYPE_BIT
+                | ColumnType::MYSQL_TYPE_GEOMETRY
+        ) || (charset == 63
+            && matches!(
+                ct,
+                ColumnType::MYSQL_TYPE_STRING | ColumnType::MYSQL_TYPE_VAR_STRING
+            )))
+    {
+        return binary_json(b);
+    }
     let bytes = match v {
         Value::Bytes(b) => b,
         other => return value_to_json(other),
@@ -308,11 +354,82 @@ pub async fn execute_mysql_statement(
     };
 
     use crate::backup::journal::JournalState;
+    // D4 preflight for DDL: bound-parameter existence check on every
+    // mutated target. IF EXISTS + missing -> audited local no-op (no DDL
+    // sent); missing without IF EXISTS -> typed not-found error; present
+    // -> continue with snapshot semantics.
+    if params.classified.category == SqlCategory::Ddl {
+        match super::ddl::preflight_ddl(
+            &mut conn,
+            params.classified,
+            params.database.or(params.connection.database.as_deref()),
+        )
+        .await
+        {
+            Ok(super::ddl::DdlPreflight::Present) => {}
+            Ok(super::ddl::DdlPreflight::NotFound(e)) => {
+                if let Some(j) = &journal {
+                    let _ = j.transition(
+                        crate::backup::journal::JournalState::Failed,
+                        Some(&e.to_string()),
+                    );
+                }
+                return Err(MySqlError::DdlNotFound(e.to_string()));
+            }
+            Ok(super::ddl::DdlPreflight::MissingNoOp(missing)) => {
+                let detail = missing
+                    .iter()
+                    .map(|(s, t)| format!("{s}.{t}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if let Some(j) = &journal {
+                    let _ = j.transition(
+                        crate::backup::journal::JournalState::Failed,
+                        Some(&format!("ddl no-op: absent targets {detail}")),
+                    );
+                }
+                return Ok(ExecuteResult {
+                    journal_id: journal.as_ref().map(|j| j.id()),
+                    ddl_no_op: true,
+                    warnings: vec![],
+                    rows: Vec::new(),
+                    fields: Vec::new(),
+                    affected_rows: 0,
+                    truncated: false,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    backup_id: None,
+                    backup_row_count: 0,
+                });
+            }
+            Err(e) => {
+                if let Some(j) = &journal {
+                    let _ = j.transition(
+                        crate::backup::journal::JournalState::Failed,
+                        Some(&e.to_string()),
+                    );
+                }
+                return Err(MySqlError::DdlNotFound(e.to_string()));
+            }
+        }
+    }
+    let warnings: Vec<&'static str> =
+        super::ddl::protection_model_for(params.classified.category, params.classified.ast_type)
+            .warnings()
+            .to_vec();
+
     let timeout_ms = params.policy.stmt_timeout_ms.max(1) as u64;
     let mut conn_slot = Some(conn);
     let work = async {
         let mut conn = conn_slot.take().expect("conn returned by prior poll");
-        let result = run_in_transaction(&mut conn, &params, is_read, start, journal.as_ref()).await;
+        let result = run_in_transaction(
+            &mut conn,
+            &params,
+            is_read,
+            start,
+            journal.as_ref(),
+            warnings.clone(),
+        )
+        .await;
         match result {
             Ok(value) => {
                 if in_tx && let Err(e) = conn.query_drop("COMMIT").await {
@@ -381,9 +498,13 @@ pub async fn execute_mysql_statement(
                         }
                     }
                 }
-                (Ok(_), Ok((Ok(value), _conn))) => {
-                    // Finished during the kill race; keep the real result.
-                    Ok(value)
+                (Ok(_), Ok((Ok(_value), _conn))) => {
+                    // Completed during the kill race: the deadline has
+                    // already expired, and a KILLed statement can resolve
+                    // with a benign Ok (e.g. SLEEP() returns 1 instead of
+                    // an error). Per the deadline contract this is a
+                    // timeout, not a success.
+                    Err(MySqlError::Timeout(timeout_ms))
                 }
                 _ => {
                     // Kill failed or the future never resolved: uncertain.
@@ -405,6 +526,7 @@ async fn run_in_transaction(
     is_read: bool,
     start: Instant,
     journal: Option<&crate::backup::journal::Journal<'_>>,
+    warnings_out: Vec<&'static str>,
 ) -> Result<ExecuteResult, MySqlError> {
     use crate::backup::journal::JournalState;
     if let Some(j) = journal {
@@ -483,8 +605,10 @@ async fn run_in_transaction(
         backup_row_count = affected;
     }
 
-    Ok(ExecuteResult {
+    let mut value = ExecuteResult {
         journal_id: None,
+        ddl_no_op: false,
+        warnings: Vec::new(),
         rows,
         fields,
         affected_rows: affected,
@@ -492,7 +616,9 @@ async fn run_in_transaction(
         duration_ms: start.elapsed().as_millis() as u64,
         backup_id,
         backup_row_count,
-    })
+    };
+    value.warnings = warnings_out;
+    Ok(value)
 }
 
 /// Stream rows with an early stop at the row/byte caps — never fetch all
@@ -513,6 +639,11 @@ async fn collect_result(
         .columns()
         .as_ref()
         .map(|cols| cols.iter().map(|c| c.column_type()).collect())
+        .unwrap_or_default();
+    let column_charsets: Vec<u16> = result
+        .columns()
+        .as_ref()
+        .map(|cols| cols.iter().map(|c| c.character_set()).collect())
         .unwrap_or_default();
     let mut rows_out: Vec<serde_json::Value> = Vec::new();
     let mut bytes: u64 = 0;
@@ -539,7 +670,8 @@ async fn collect_result(
                 .get(i)
                 .copied()
                 .unwrap_or(mysql_async::consts::ColumnType::MYSQL_TYPE_VAR_STRING);
-            let j = value_with_column_type(&v, ct);
+            let cs = column_charsets.get(i).copied().unwrap_or(255);
+            let j = value_with_column_type(&v, ct, cs);
             bytes += name.len() as u64 + j.to_string().len() as u64;
             obj.insert(name.clone(), j);
         }
@@ -610,33 +742,13 @@ pub async fn capture_backup_mysql(
                     t.select_sql.chars().take(80).collect::<String>()
                 ))
             })?;
-        let mut stream = match conn.query_iter(capped.as_str()).await {
-            Ok(r) => r,
-            Err(mysql_async::Error::Server(se)) if se.code == 1146 || se.code == 1051 => {
-                // ER_NO_SUCH_TABLE / ER_BAD_TABLE_ERROR: the pre-image of a
-                // table that does not exist is empty — record it and let
-                // the DROP proceed (other failures still deny).
-                let id = crate::backup::insert_rows_backup_row(
-                    &audit,
-                    &time_iso(),
-                    connection_name,
-                    database.or(t.db.as_deref()),
-                    &t.table,
-                    "combined",
-                    None,
-                    None,
-                    0,
-                    false,
-                    0,
-                )
-                .map_err(|e| MySqlError::BackupFailed(e.to_string()))?;
-                if first_id.is_none() {
-                    first_id = Some(id);
-                }
-                continue;
-            }
-            Err(e) => return Err(MySqlError::BackupFailed(e.to_string())),
-        };
+        // Absent targets are resolved by preflight (ddl.rs) BEFORE backup
+        // capture; ER_NO_SUCH_TABLE here is a genuine mid-operation race
+        // or error and denies the mutation (fail closed).
+        let mut stream = conn
+            .query_iter(capped.as_str())
+            .await
+            .map_err(|e| MySqlError::BackupFailed(e.to_string()))?;
         let mut rows: Vec<serde_json::Value> = Vec::new();
         let cols: Vec<String> = stream
             .columns()

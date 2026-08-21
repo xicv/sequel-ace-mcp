@@ -192,10 +192,12 @@ async fn error_paths_and_types() {
             .unwrap_or("")
             .starts_with("2026-08-21 12:34:56")
     );
-    // Binary is base64 (lossless), never mangled text.
-    let bin = row["c_bin"].as_str().unwrap_or_default();
+    // Binary is structured base64 (lossless), never mangled text (D5).
+    let bin = &row["c_bin"];
+    assert_eq!(bin["type"], "binary", "structured binary: {bin}");
+    assert_eq!(bin["encoding"], "base64");
     assert!(
-        !bin.is_empty() && !bin.contains("\u{fffd}"),
+        !bin["data"].as_str().unwrap_or_default().is_empty(),
         "binary b64: {bin}"
     );
     // NULLs are JSON null.

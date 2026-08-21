@@ -1,10 +1,109 @@
-# Verification record — Rust rewrite, sessions 1-5 (2026-08-21)
+# Verification record — Rust rewrite, sessions 1-6 (2026-08-22)
 
 Status vocabulary per the handoff: **verified automatically** (tests/smoke
 executed), **verified manually**, **prepared but not executed**, **not
 verified**, **blocked**.
 
-## Session 5 (hardening phases 2-6/8)
+## Session 6 (D4, D5, D7, D8 — the Phase-D safety envelope)
+
+Audit-note status for checkpoint #2 (`a2fce08`), carried verbatim:
+`MIMOSA_GATE=explicitly waived by local user`;
+`REASON=cross-worktree false positive on legacy OpenSSH
+hashed-known-host compatibility`;
+`COMMIT_METHOD=manual commit object construction + atomic ref update`;
+`NORMAL_HOOKS_EXECUTED=false`; `COMMIT_SIGNATURE=unsigned-or-unverified`
+(git verify-commit failed; recorded as fact, history not rewritten);
+reconstructed `git diff 44a0606 a2fce08` byte-identical to the preserved
+patch (sha256 `15cd102d…`); bundle three-way match; remote
+`ls-remote` empty (PUSHED=false).
+
+- **D4 (DDL semantics) verified automatically on both engines**
+  (`tests/mysql_d4.rs` + `src/sql/ddl.rs`):
+  - `ProtectionModel` splits `TransactionalDmlProtection` vs
+    `NonTransactionalDdlSnapshot` vs `UnprotectedDenied`; DDL plan/audit
+    carry the four mandated warnings ("pre-operation snapshot only",
+    "implicit commit may occur", "snapshot and DDL are not one atomic
+    transaction", "automatic rollback is not guaranteed") — surfaced
+    through ExecuteResult → gate → `outcome_to_json` (`warnings`).
+  - Preflight before any DDL: bound-parameter
+    `information_schema.tables` existence check per mutated target
+    (RENAME checks only old identities; CREATE skips existence gating).
+    `IF EXISTS` + missing → audited local no-op (`ddlNoOp: true`, journal
+    `failed`/"ddl no-op", nothing sent to the server); missing without
+    IF EXISTS → typed `DdlNotFound` error; present → snapshot then DDL.
+  - The generic `ER_NO_SUCH_TABLE/1051 → empty backup row, proceed`
+    special-case was REMOVED from backup capture: a missing table at
+    backup time now denies the mutation (preflight owns absent targets;
+    mid-operation races fail closed).
+  - Live matrix per engine: DROP TABLE, DROP IF EXISTS (missing +
+    existing), TRUNCATE (+ IF EXISTS missing), ALTER, RENAME, CREATE,
+    CREATE … AS SELECT, CREATE TEMPORARY TABLE; journal states verified
+    (no-op + not-found recorded as failed-with-detail; successes
+    finalized with backup linkage).
+  - D2 fix carried in this session: MySQL 8.4 does not interrupt
+    `SLEEP()` mid-sleep via KILL QUERY (MariaDB does), so the mutating
+    timeout test now uses a 100k-row full-scan UPDATE — genuinely
+    interruptible between rows — and re-verifies no-commit via a
+    `value <> 100` count plus a process-list check. Also made the
+    deadline contract strict: any completion arriving after the deadline
+    (including a benign Ok from a killed SLEEP) reports `Timeout`.
+- **D5 (boundary types) verified automatically on both engines**
+  (`tests/mysql_d5.rs`): BIGINT UNSIGNED max / signed min (lossless
+  strings), DECIMAL(65,30) max precision + zero scale + negative,
+  FLOAT/DOUBLE maxima as numbers, BIT(1)/BIT(64), DATE 1000-01-01,
+  DATETIME(6) 9999-12-31 23:59:59.999999, NULL TIMESTAMP, negative TIME
+  and >24h TIME (-838:59:59 / 838:59:59), empty VARBINARY + non-UTF-8
+  BLOB, valid-UTF-8 BLOB, 3 MiB LONGBLOB bounded by the byte cap, nested
+  JSON, empty ENUM, multi-value SET, NULL families, TIMESTAMP with
+  explicit `+00:00` session zone, and the documented literal-typing
+  difference (SELECT 1 → LONGLONG/string on MySQL, LONG/number on
+  MariaDB). **Breaking-but-correct representation change**: binary
+  columns now return structured `{"type":"binary","encoding":"base64",
+  "data":…}` (detected by BLOB-family column types or charset 63 on
+  string types — NOT charset 63 alone, which would misclassify DECIMAL),
+  never a bare base64 string indistinguishable from text.
+- **D7 (deterministic MCP lifecycle) verified automatically**
+  (`tests/mcp_lifecycle.rs`, real built binary, channel-based reader with
+  true deadlines — no fixed sleeps as pass criteria): legacy initialize
+  (2025-06-18), tools/list = 21 tools, gated SQLite execute denied by
+  policy (isError), SQLite query round trip (`42` via structuredContent),
+  malformed-line survival (rmcp drops unparseable lines without a
+  parse-error frame — documented; the contract asserted is that the next
+  valid request is answered correctly), 2 MiB oversized request (answer
+  or clean close), prompt exit after stdin EOF, and EOF during an
+  in-flight slow query (bounded exit, no hang, no orphan process).
+- **D8 (benchmarks) verified automatically**
+  (`scripts/bench-mcp.sh` + `tests/bench_live.rs`, n=30 warm samples):
+  - MCP process: `RUST_COLD_INIT median=4.99ms p95=5.49ms`,
+    `RUST_COLD_TO_TOOLS_LIST median=7.28ms p95=7.77ms`,
+    `RUST_WARM_TOOLS_LIST median=1.24ms p95=1.84ms max=2.27ms`.
+  - MariaDB 11 (fresh container): `FIRST_QUERY=17.21ms` (pool init +
+    handshake + health + query), `WARM_SELECT median=0.94ms
+    p95=2.06ms`, `POOL_COUNT=1` (one pool, physical reuse),
+    `CANCEL_LATENCY median=1.23ms` beyond the 400 ms deadline.
+  - Legacy Node baseline (session 1, same Mac): cold init median
+    194.9 ms / p95 625.0 ms — the Rust server initializes ~39× faster
+    at median and ~80× at p95.
+- Gates after D4-D8: 113 lib tests; clippy `-D warnings` 0; fmt clean;
+  both-engine matrix (16 live test results incl. D4+D5) exit 0; zero
+  orphan debug processes (the user's live npm sequel-mcp instances were
+  never touched — cleanup was scoped to `target/debug/sequel-mcp`).
+
+## Session 5 record — unchanged summary
+
+Pool identity (CredentialGeneration, publish-after-healthy, coalescing,
+CONNECT_TIMEOUT — mysql_async has no built-in TCP deadline); D1
+TLS/timeout/physical-reuse matrix (found and fixed inactive-TTL=0
+default defeating reuse); D2 KILL QUERY cancellation (Timeout vs
+Uncertain-discard); D3 operation journal + same-connection proof; D6
+total with_limit (deny unrewritable).
+
+## Sessions 1-4 — unchanged summary
+
+Baseline (213 legacy tests), ADRs, core engine, 21-tool MCP server,
+MariaDB runtime + smoke, custom crypto removal, deterministic
+containers, checkpoint #1 `44a0606`, provenance + deny/audit, MANUAL
+commit protocol.
 
 - **Phase 2 (pool identity) verified automatically**: hand-written
   registry replaced by `PoolManager` (`src/sql/pool.rs`): credential
