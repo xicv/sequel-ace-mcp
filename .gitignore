@@ -73,3 +73,6 @@ fixtures/
 
 # Local user runtime data — never inside repo, but defensive
 .config/
+
+# Rust
+/target
