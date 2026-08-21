@@ -43,6 +43,8 @@ async fn run(
     let audit =
         Arc::new(sequel_mcp::audit::AuditDb::at_path(&dir.path().join("a.sqlite")).unwrap());
     execute_mysql_statement(MySqlExecuteParams {
+        request_id: format!("req-{}", line!()),
+        databases_for_log: vec![],
         connection: conn,
         password: Zeroizing::new(password.to_string()),
         sql,
@@ -86,14 +88,14 @@ async fn error_paths_and_types() {
     );
 
     // D1: pool reuse — several sequential executions share one pool entry.
-    sequel_mcp::sql::mysql::pool_registry().invalidate_all();
+    sequel_mcp::sql::mysql::pool_manager().invalidate_all();
     for i in 0..3 {
         let r = run(&conn, &password, &format!("SELECT {i} AS n"))
             .await
             .unwrap();
         assert_eq!(r.rows.len(), 1);
     }
-    assert_eq!(sequel_mcp::sql::mysql::pool_registry().pool_count(), 1);
+    assert_eq!(sequel_mcp::sql::mysql::pool_manager().pool_count(), 1);
 
     // D1: config-revision invalidation swaps pools.
     let dir = tempfile::TempDir::new().unwrap();
@@ -104,6 +106,8 @@ async fn error_paths_and_types() {
     let classified = classify_statement(sql, Dialect::MySql).unwrap();
     for revision in [7u64, 8] {
         execute_mysql_statement(MySqlExecuteParams {
+            request_id: format!("req-{}", line!()),
+            databases_for_log: vec![],
             connection: &conn,
             password: Zeroizing::new(password.clone()),
             sql,
@@ -118,7 +122,7 @@ async fn error_paths_and_types() {
         .unwrap();
     }
     // 1 pool from the reuse loop + 2 from the distinct revisions.
-    assert_eq!(sequel_mcp::sql::mysql::pool_registry().pool_count(), 3);
+    assert_eq!(sequel_mcp::sql::mysql::pool_manager().pool_count(), 3);
 
     // D5: full type matrix.
     run(&conn, &password, "DROP TABLE IF EXISTS type_matrix")
@@ -217,6 +221,8 @@ async fn error_paths_and_types() {
     let sleep_sql = "SELECT SLEEP(5) AS z";
     let classified = classify_statement(sleep_sql, Dialect::MySql).unwrap();
     let outcome = execute_mysql_statement(MySqlExecuteParams {
+        request_id: format!("req-{}", line!()),
+        databases_for_log: vec![],
         connection: &conn,
         password: Zeroizing::new(password.clone()),
         sql: sleep_sql,
@@ -230,7 +236,12 @@ async fn error_paths_and_types() {
     .await;
     match outcome {
         Err(sequel_mcp::sql::mysql::MySqlError::Timeout(ms)) => assert_eq!(ms, 400),
-        Err(e) => panic!("expected Timeout, got {e:?}"),
+        // Interrupting a SELECT mid-result-stream desyncs the wire; the
+        // connection is discarded and the honest outcome is Uncertain.
+        Err(sequel_mcp::sql::mysql::MySqlError::Uncertain(msg)) => {
+            assert!(msg.contains("discarded"), "{msg}");
+        }
+        Err(e) => panic!("expected Timeout/Uncertain, got {e:?}"),
         Ok(_) => panic!("SLEEP(5) under a 400 ms timeout must not succeed"),
     }
 

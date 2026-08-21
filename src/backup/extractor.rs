@@ -102,15 +102,54 @@ pub fn is_backup_required(ast_type: &str) -> bool {
     )
 }
 
-/// Append a LIMIT to a backup SELECT, keeping any trailing `FOR UPDATE`
-/// after it (the legacy implementation appended LIMIT last, producing
-/// invalid MySQL — `… FOR UPDATE LIMIT n`).
-pub fn with_limit(select_sql: &str, n: u64) -> String {
-    if let Some(base) = select_sql.strip_suffix(" FOR UPDATE") {
-        format!("{base} LIMIT {n} FOR UPDATE")
-    } else {
-        format!("{select_sql} LIMIT {n}")
+/// Lock suffixes recognised after stripping; each must move *after* the
+/// appended LIMIT to stay valid MySQL.
+const TRAILING_LOCK_SUFFIXES: [&str; 5] = [
+    " FOR UPDATE NOWAIT",
+    " FOR UPDATE SKIP LOCKED",
+    " FOR UPDATE",
+    " FOR SHARE",
+    " LOCK IN SHARE MODE",
+];
+
+/// Append `LIMIT n` to a backup SELECT, preserving any trailing lock
+/// clause. Returns `None` when the query cannot be safely rewritten
+/// (existing LIMIT/OFFSET, set operations, CTE, trailing semicolon or
+/// comment, parenthesized tail, or an unmatched lock clause) — callers
+/// must DENY in that case rather than execute the unbounded original.
+pub fn with_limit(select_sql: &str, n: u64) -> Option<String> {
+    if select_sql.contains(';') {
+        return None; // trailing semicolon or statement separator: refuse
     }
+    let lower = select_sql.to_ascii_lowercase();
+    if lower.contains(" limit ") || lower.ends_with(" limit") {
+        return None; // existing LIMIT: composing another is invalid
+    }
+    if lower.contains(" offset ") {
+        return None;
+    }
+    if lower.starts_with("with ") || lower.contains(" union ") {
+        return None; // set operations/CTEs: not safely suffix-rewritable
+    }
+    if select_sql.contains("--") || select_sql.contains("/*") {
+        return None; // comments could hide a tail we fail to see
+    }
+    if select_sql.ends_with(')') {
+        return None; // parenthesized query expression: refuse
+    }
+    for suffix in TRAILING_LOCK_SUFFIXES {
+        if let Some(base) = select_sql.strip_suffix(suffix) {
+            return Some(format!("{base} LIMIT {n}{suffix}"));
+        }
+    }
+    if lower.contains(" for update")
+        || lower.contains(" for share")
+        || lower.contains(" for key share")
+        || lower.contains(" lock in share mode")
+    {
+        return None; // a lock clause we failed to match exactly: refuse
+    }
+    Some(format!("{select_sql} LIMIT {n}"))
 }
 
 const PK_GUESS_NAMES: [&str; 3] = ["id", "uuid", "pk"];
@@ -678,6 +717,70 @@ mod tests {
             spec("ALTER TABLE users ADD COLUMN email TEXT", "alter"),
             BackupSpec::Schema { .. }
         ));
+    }
+
+    #[test]
+    fn d6_limit_forms() {
+        use super::with_limit as wl;
+        // Rewritable forms.
+        assert_eq!(
+            wl("SELECT * FROM t WHERE id = 1 FOR UPDATE", 11).unwrap(),
+            "SELECT * FROM t WHERE id = 1 LIMIT 11 FOR UPDATE"
+        );
+        assert_eq!(
+            wl("SELECT * FROM t FOR UPDATE NOWAIT", 11).unwrap(),
+            "SELECT * FROM t LIMIT 11 FOR UPDATE NOWAIT"
+        );
+        assert_eq!(
+            wl("SELECT * FROM t FOR UPDATE SKIP LOCKED", 11).unwrap(),
+            "SELECT * FROM t LIMIT 11 FOR UPDATE SKIP LOCKED"
+        );
+        assert_eq!(
+            wl("SELECT * FROM t FOR SHARE", 11).unwrap(),
+            "SELECT * FROM t LIMIT 11 FOR SHARE"
+        );
+        assert_eq!(
+            wl("SELECT * FROM t LOCK IN SHARE MODE", 11).unwrap(),
+            "SELECT * FROM t LIMIT 11 LOCK IN SHARE MODE"
+        );
+        // Optimizer hints are comment-delimited; a suffix rewriter cannot
+        // distinguish them from tail-hiding comments, so they are denied.
+        assert!(
+            wl("SELECT /*+ hint */ * FROM t", 11).is_none(),
+            "optimizer hints denied (comment-shaped)"
+        );
+        assert_eq!(
+            wl("SELECT * FROM t", 11).unwrap(),
+            "SELECT * FROM t LIMIT 11"
+        );
+        // Unrewritable forms must return None (deny), never a bad rewrite.
+        assert!(
+            wl("SELECT * FROM t LIMIT 5", 11).is_none(),
+            "existing LIMIT"
+        );
+        assert!(
+            wl("SELECT * FROM t LIMIT 5 OFFSET 2", 11).is_none(),
+            "offset"
+        );
+        assert!(
+            wl("SELECT * FROM a UNION SELECT * FROM b", 11).is_none(),
+            "union"
+        );
+        assert!(
+            wl("WITH x AS (SELECT 1) SELECT * FROM x", 11).is_none(),
+            "cte"
+        );
+        assert!(wl("SELECT * FROM t;", 11).is_none(), "semicolon");
+        assert!(
+            wl("SELECT * FROM t -- comment", 11).is_none(),
+            "line comment"
+        );
+        assert!(wl("SELECT * FROM /* c */ t", 11).is_none(), "block comment");
+        assert!(wl("(SELECT * FROM t)", 11).is_none(), "parenthesized");
+        assert!(
+            wl("SELECT * FROM t FOR KEY SHARE", 11).is_none(),
+            "unknown lock"
+        );
     }
 
     #[test]

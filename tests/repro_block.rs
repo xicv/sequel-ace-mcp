@@ -34,6 +34,8 @@ async fn mysql_via_blocking_gate_like_server() {
         let res = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 execute_mysql_statement(MySqlExecuteParams {
+                    request_id: format!("req-{}", line!()),
+                    databases_for_log: vec![],
                     connection: &conn,
                     password: Zeroizing::new(password),
                     sql: "SELECT COUNT(*) AS n FROM jobs",

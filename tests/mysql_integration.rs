@@ -41,6 +41,8 @@ async fn run(
 ) -> Result<sequel_mcp::sql::mysql::ExecuteResult, String> {
     let classified = classify_statement(sql, Dialect::MySql).map_err(|e| e.message())?;
     execute_mysql_statement(MySqlExecuteParams {
+        request_id: format!("req-{}", line!()),
+        databases_for_log: vec![],
         connection: conn,
         password: Zeroizing::new(password.to_string()),
         sql,
@@ -176,7 +178,7 @@ async fn mysql_end_to_end() {
     .unwrap();
     // COUNT(*) is BIGINT — a lossless string under bigNumberStrings.
     assert_eq!(r2.rows[0]["n"], serde_json::json!("3"));
-    assert!(sequel_mcp::sql::mysql::pool_registry().pool_count() >= 1);
+    assert!(sequel_mcp::sql::mysql::pool_manager().pool_count() >= 1);
 
     // Backups were persisted.
     let backups = sequel_mcp::backup::list_backups(&audit, Some("it-mysql"), 10).unwrap();

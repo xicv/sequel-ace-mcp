@@ -79,7 +79,7 @@ run_matrix() {
   SEQUEL_MCP_TEST_MYSQL="127.0.0.1:$port:$user:$DB_PASSWORD" \
     cargo test --test mysql_integration --test repro_block -- --test-threads=1
   SEQUEL_MCP_TEST_MYSQL="127.0.0.1:$port:$user:$DB_PASSWORD" \
-    cargo test --test mysql_matrix -- --test-threads=1
+    cargo test --test mysql_matrix --test mysql_d1 --test mysql_d2 --test mysql_d3 -- --test-threads=1
   docker rm -f "$container" >/dev/null
 }
 

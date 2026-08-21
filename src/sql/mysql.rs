@@ -8,10 +8,8 @@ use crate::policy::classifier::ClassifiedStatement;
 use crate::policy::model::{Policy, SqlCategory};
 use futures_util::StreamExt;
 use mysql_async::prelude::Queryable;
-use mysql_async::{OptsBuilder, Pool, PoolConstraints, PoolOpts, Row, SslOpts, Value};
-use sha2::Sha256;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use mysql_async::{OptsBuilder, PoolConstraints, PoolOpts, Row, SslOpts, Value};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -32,10 +30,14 @@ pub enum MySqlError {
     BackupFailed(String),
     #[error("pool error: {0}")]
     Pool(String),
+    #[error("{0}")]
+    Uncertain(String),
 }
 
 #[derive(Debug)]
 pub struct ExecuteResult {
+    /// Operation-journal row id (D3), when a journal was created.
+    pub journal_id: Option<i64>,
     pub rows: Vec<serde_json::Value>,
     pub fields: Vec<String>,
     pub affected_rows: u64,
@@ -48,6 +50,10 @@ pub struct ExecuteResult {
 /// Legacy `buildBaseOptions` parity, including the TLS server-name override
 /// and the injection guardrails (multi-statements off, no LOCAL INFILE
 /// handler, keepalive, 15 s connect timeout).
+/// Deadline for establishing (handshake + health probe) a pooled
+/// connection; blackhole endpoints fail with a typed error at this bound.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub fn build_opts(
     conn: &MySqlConnection,
     password: &str,
@@ -84,7 +90,14 @@ pub fn build_opts(
         .ssl_opts(ssl)
         .conn_ttl(Duration::from_secs(600))
         .tcp_keepalive(Some(Duration::from_secs(30)))
-        .pool_opts(PoolOpts::default().with_constraints(PoolConstraints::new(1, 4).expect("1<=4")))
+        .pool_opts(
+            PoolOpts::default()
+                .with_constraints(PoolConstraints::new(1, 4).expect("1<=4"))
+                // The default inactive TTL is 0 (immediate recycle), which
+                // defeats physical connection reuse; keep idle pooled
+                // connections alive so warm queries reuse them.
+                .with_inactive_connection_ttl(Duration::from_secs(300)),
+        )
 }
 
 /// Lossless value mapping: text-protocol DECIMAL/BIGINT arrive as raw
@@ -125,76 +138,18 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
     }
 }
 
-/// Per-connection pool registry. Pools are keyed by the connection's
-/// transport-relevant identity plus the config revision, so policy or
-/// endpoint changes invalidate old pools. Bounds: min 1, max 4.
-pub struct PoolRegistry {
-    pools: Mutex<HashMap<String, Pool>>,
-}
+static MANAGER: std::sync::OnceLock<super::pool::PoolManager> = std::sync::OnceLock::new();
 
-static REGISTRY: OnceLock<PoolRegistry> = OnceLock::new();
-
-pub fn pool_registry() -> &'static PoolRegistry {
-    REGISTRY.get_or_init(|| PoolRegistry {
-        pools: Mutex::new(HashMap::new()),
-    })
-}
-
-impl PoolRegistry {
-    pub fn pool_for(
-        &self,
-        conn: &MySqlConnection,
-        password: &str,
-        database: Option<&str>,
-        revision: u64,
-        host_override: Option<&str>,
-        port_override: Option<u16>,
-    ) -> Pool {
-        // The pool bakes the password into its connect options, so the key
-        // must change with the credential. A SHA-256 fingerprint is used —
-        // the password itself never enters the key (or any log surface).
-        let pw_fp = {
-            use sha2::Digest as _;
-            let d = Sha256::digest(password.as_bytes());
-            d[..8]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        };
-        let key = format!(
-            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
-            conn.name,
-            host_override.unwrap_or(&conn.host),
-            port_override.unwrap_or(conn.port),
-            conn.user,
-            database.or(conn.database.as_deref()).unwrap_or(""),
-            conn.ssl,
-            conn.ssl_server_name.as_deref().unwrap_or(""),
-            revision,
-            pw_fp,
-        );
-        let mut pools = self.pools.lock().unwrap();
-        pools
-            .entry(key)
-            .or_insert_with(|| {
-                let opts: mysql_async::Opts =
-                    build_opts(conn, password, database, host_override, port_override).into();
-                Pool::new(opts)
-            })
-            .clone()
-    }
-
-    pub fn invalidate_all(&self) {
-        self.pools.lock().unwrap().clear();
-    }
-
-    pub fn pool_count(&self) -> usize {
-        self.pools.lock().unwrap().len()
-    }
+pub fn pool_manager() -> &'static super::pool::PoolManager {
+    MANAGER.get_or_init(super::pool::PoolManager::new)
 }
 
 pub struct MySqlExecuteParams<'a> {
     pub connection: &'a MySqlConnection,
+    /// Request id for the D3 operation journal.
+    pub request_id: String,
+    /// Databases considered for the operation (journal metadata).
+    pub databases_for_log: Vec<String>,
     pub password: Zeroizing<String>,
     pub sql: &'a str,
     pub classified: &'a ClassifiedStatement,
@@ -262,15 +217,26 @@ pub async fn execute_mysql_statement(
         Some((h, p)) => (h.clone(), *p),
         None => (params.connection.host.clone(), params.connection.port),
     };
-    let pool = pool_registry().pool_for(
-        params.connection,
-        &params.password,
-        params.database,
-        params.revision,
-        Some(&host),
-        Some(port),
-    );
+    let pool = pool_manager()
+        .verified_pool(
+            params.connection,
+            &params.password,
+            params.database,
+            params.revision,
+            Some(&host),
+            Some(port),
+        )
+        .await
+        .map_err(|e| MySqlError::Pool(e.to_string()))?;
     let mut conn = pool.get_conn().await?;
+
+    // Record the physical connection id for active cancellation (D2).
+    let executing_id: Option<u64> = conn
+        .exec_first::<(u64,), _, _>("SELECT CONNECTION_ID()", ())
+        .await
+        .ok()
+        .flatten()
+        .map(|(id,)| id);
 
     let (major, minor, _patch) = conn.server_version();
     let server_version = format!("{major}.{minor}");
@@ -313,22 +279,124 @@ pub async fn execute_mysql_statement(
         }
     }
 
-    let result = run_in_transaction(&mut conn, &params, is_read, start).await;
+    // Statement work + finalization under an active-cancellation deadline.
+    // The timeout applies to the whole in-transaction phase (statement +
+    // commit) so a stalled COMMIT also triggers cancellation. The work
+    // future owns the connection and hands it back, so the cancellation
+    // path can roll back / verify / sever it.
+    // D3 operation journal: mutations (write/ddl categories) get a
+    // durable lifecycle record; reads do not need one.
+    let journal = if matches!(
+        params.classified.category,
+        SqlCategory::Write | SqlCategory::Ddl | SqlCategory::Admin
+    ) && params.audit.is_some()
+    {
+        let Some(audit) = params.audit.as_ref() else {
+            unreachable!("guarded by is_some above")
+        };
+        let _ = crate::backup::journal::ensure_table(audit);
+        crate::backup::journal::Journal::create(
+            audit,
+            &params.request_id,
+            &params.connection.name,
+            &params.databases_for_log,
+            params.classified.category.as_str(),
+        )
+        .ok()
+    } else {
+        None
+    };
 
-    match &result {
-        Ok(_) => {
-            if in_tx && let Err(e) = conn.query_drop("COMMIT").await {
-                let _ = conn.query_drop("ROLLBACK").await;
-                return Err(MySqlError::Driver(e));
+    use crate::backup::journal::JournalState;
+    let timeout_ms = params.policy.stmt_timeout_ms.max(1) as u64;
+    let mut conn_slot = Some(conn);
+    let work = async {
+        let mut conn = conn_slot.take().expect("conn returned by prior poll");
+        let result = run_in_transaction(&mut conn, &params, is_read, start, journal.as_ref()).await;
+        match result {
+            Ok(value) => {
+                if in_tx && let Err(e) = conn.query_drop("COMMIT").await {
+                    let _ = conn.query_drop("ROLLBACK").await;
+                    if let Some(j) = journal {
+                        let _ = j.transition(JournalState::Uncertain, Some("COMMIT failed"));
+                    }
+                    (Err(MySqlError::Driver(e)), Some(conn))
+                } else {
+                    if let Some(j) = journal {
+                        let _ = j.transition(JournalState::MutationCommitted, None);
+                        // Direct-executor callers (tests/CLI) have no gate
+                        // audit write; the journal itself is durable here,
+                        // so close it out. Gate callers re-transition
+                        // harmlessly (idempotence guarded by the state
+                        // machine: committed -> finalized is legal).
+                        let _ = j.transition(JournalState::AuditFinalized, None);
+                    }
+                    (Ok(value), Some(conn))
+                }
+            }
+            Err(e) => {
+                if in_tx {
+                    let _ = conn.query_drop("ROLLBACK").await;
+                }
+                if let Some(j) = journal {
+                    let _ = j.transition(JournalState::Failed, Some(&e.to_string()));
+                }
+                (Err(e), Some(conn))
             }
         }
-        Err(_) => {
-            if in_tx {
-                let _ = conn.query_drop("ROLLBACK").await;
+    };
+    tokio::pin!(work);
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), &mut work).await {
+        Ok((result, _conn)) => result,
+        Err(_elapsed) => {
+            // Deadline fired with the statement still running server-side.
+            // Interrupt it via KILL QUERY from a same-pool control
+            // connection, then let the work future resolve within a
+            // bounded grace period.
+            let kill_result = match executing_id {
+                Some(id) => super::cancel::kill_query(&pool, id).await,
+                None => Err("no executing connection id recorded".into()),
+            };
+            let grace = tokio::time::timeout(Duration::from_secs(5), &mut work).await;
+            match (kill_result, grace) {
+                (Ok(()), Ok((Err(_interrupted), Some(mut conn)))) => {
+                    if in_tx {
+                        let _ = conn.query_drop("ROLLBACK").await;
+                    }
+                    let clean = super::cancel::verify_connection_clean(&mut conn).await;
+                    match &clean {
+                        Ok(true) => Err(MySqlError::Timeout(timeout_ms)),
+                        Ok(false) => {
+                            conn.disconnect().await.ok();
+                            Err(MySqlError::Uncertain(
+                                "deadline exceeded; transaction still open after rollback - connection discarded"
+                                    .to_string(),
+                            ))
+                        }
+                        Err(detail) => {
+                            conn.disconnect().await.ok();
+                            Err(MySqlError::Uncertain(format!(
+                                "deadline exceeded; verification failed ({detail}) - connection discarded"
+                            )))
+                        }
+                    }
+                }
+                (Ok(_), Ok((Ok(value), _conn))) => {
+                    // Finished during the kill race; keep the real result.
+                    Ok(value)
+                }
+                _ => {
+                    // Kill failed or the future never resolved: uncertain.
+                    // The still-armed work future is dropped, severing its
+                    // connection without a clean pool return.
+                    Err(MySqlError::Uncertain(
+                        "deadline exceeded; cancellation inconclusive - connection discarded"
+                            .to_string(),
+                    ))
+                }
             }
         }
     }
-    result
 }
 
 async fn run_in_transaction(
@@ -336,7 +404,12 @@ async fn run_in_transaction(
     params: &MySqlExecuteParams<'_>,
     is_read: bool,
     start: Instant,
+    journal: Option<&crate::backup::journal::Journal<'_>>,
 ) -> Result<ExecuteResult, MySqlError> {
+    use crate::backup::journal::JournalState;
+    if let Some(j) = journal {
+        let _ = j.transition(JournalState::BackupCapturing, None);
+    }
     // Pre-mutation backup (fail-closed: capture errors deny the mutation).
     let mut backup_id: Option<i64> = None;
     let mut backup_row_count: u64 = 0;
@@ -364,9 +437,17 @@ async fn run_in_transaction(
                 {
                     backup_id = Some(c.backup_id);
                     backup_row_count = c.total_rows;
+                    if let Some(j) = journal {
+                        let _ = j.link_backup(c.backup_id);
+                        let _ = j.transition(JournalState::BackupDurable, None);
+                    }
                 }
             }
         }
+    }
+
+    if let Some(j) = journal {
+        let _ = j.transition(JournalState::MutationExecuting, None);
     }
 
     // Reads carry the optimizer timeout hint.
@@ -403,6 +484,7 @@ async fn run_in_transaction(
     }
 
     Ok(ExecuteResult {
+        journal_id: None,
         rows,
         fields,
         affected_rows: affected,
@@ -521,7 +603,13 @@ pub async fn capture_backup_mysql(
     let mut truncated_any = false;
 
     for t in tables {
-        let capped = crate::backup::extractor::with_limit(&t.select_sql, (row_cap + 1) as u64);
+        let capped = crate::backup::extractor::with_limit(&t.select_sql, (row_cap + 1) as u64)
+            .ok_or_else(|| {
+                MySqlError::BackupOverflow(format!(
+                    "backup query not safely limitable: {}",
+                    t.select_sql.chars().take(80).collect::<String>()
+                ))
+            })?;
         let mut stream = match conn.query_iter(capped.as_str()).await {
             Ok(r) => r,
             Err(mysql_async::Error::Server(se)) if se.code == 1146 || se.code == 1051 => {
@@ -709,17 +797,21 @@ mod tests {
         assert_eq!(value_to_json(&Value::NULL), serde_json::Value::Null);
     }
 
-    #[test]
-    fn pools_keyed_and_invalidated() {
-        let reg = pool_registry();
-        let before = reg.pool_count();
+    #[tokio::test]
+    async fn pool_init_failure_is_not_cached() {
+        // Port 1 on localhost: refused. Initialization must fail and the
+        // manager must stay empty (no failed pool retained).
+        use zeroize::Zeroizing;
+        let mgr = pool_manager();
+        mgr.invalidate_all();
         let c = conn();
-        let p1 = reg.pool_for(&c, "pw", None, 1, None, None);
-        let p2 = reg.pool_for(&c, "pw", None, 1, None, None);
-        let p3 = reg.pool_for(&c, "pw", None, 2, None, None);
-        assert_eq!(reg.pool_count(), before + 2, "revision changes the key");
-        let _ = (p1, p2, p3);
-        reg.invalidate_all();
-        assert_eq!(reg.pool_count(), 0);
+        let pw = Zeroizing::new("pw".to_string());
+        assert!(
+            mgr.verified_pool(&c, &pw, None, 1, None, Some(1))
+                .await
+                .is_err()
+        );
+        assert_eq!(mgr.pool_count(), 0);
+        mgr.invalidate_all();
     }
 }
