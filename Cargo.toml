@@ -1,0 +1,65 @@
+[package]
+name = "sequel-mcp"
+version = "0.10.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Local-first, policy-gated MySQL/MariaDB and SQLite access for AI agents: native Rust MCP server, CLI and GUI"
+license = "MIT"
+repository = "https://github.com/xicv/sequel-mcp"
+readme = "README.md"
+keywords = ["mcp", "model-context-protocol", "mysql", "sqlite", "database"]
+categories = ["database-tools", "development-tools"]
+exclude = ["docs/rust-rewrite", "tests/fixtures/legacy", ".github", ".codex", "skills"]
+
+[[bin]]
+name = "sequel-mcp"
+path = "src/bin/sequel_mcp.rs"
+
+[lib]
+name = "sequel_mcp"
+path = "src/lib.rs"
+
+[dependencies]
+rmcp = { version = "=3.1.4", features = ["server", "macros", "schemars", "transport-io", "elicitation"] }
+schemars = "1"
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "fs", "process", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+sqlparser = "=0.62.0"
+mysql_async = { version = "0.37", default-features = false, features = ["default-rustls", "minimal"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+russh = { version = "0.62", default-features = false, features = ["ring"] }
+plist = "1"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+thiserror = "2"
+rand = "0.9"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+zeroize = "1"
+libc = "0.2"
+egui = "0.36"
+eframe = { version = "0.36", default-features = true }
+egui_extras = { version = "0.36", features = ["default"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+objc2 = "0.6"
+block2 = "0.6"
+objc2-local-authentication = { version = "0.3", features = ["block2"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSString", "NSError", "NSObjCRuntime"] }
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
