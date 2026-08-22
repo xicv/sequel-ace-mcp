@@ -660,6 +660,38 @@ lifecycle/isolation binary tests now asserting the 27-tool surface
 matrix 27/27, workspace tests green, clippy `-D warnings` 0, fmt
 clean, gitleaks clean, zero docker leftovers.
 
+## Session 9 (checkpoint #7: prompts + resource)
+
+Legacy prompt/resource parity on the real binary:
+
+- **`prompts/list`** returns both legacy prompts with their argument
+  schemas: `setup-connection` (optional `suggestedName`) and
+  `analyze-table` (required `connection` + `table`, optional
+  `database`).
+- **`prompts/get`** renders each with argument substitution and the
+  legacy instruction text verbatim (setup: ask MySQL-vs-SQLite first,
+  never include passwords in tool arguments; analyze: read-only tools
+  only, the four-step investigation). Missing REQUIRED arguments are a
+  typed invalid-params error naming the argument; unknown prompts are
+  a typed error.
+- **`resources/list`** exposes `sequel-mcp://connections` (title,
+  description, `application/json`).
+- **`resources/read`** returns the legacy no-secrets JSON: every
+  connection with driver/host/port/user/path/database, SSH summary
+  (incl. docker bridge container+tool), policy, the preset list, and
+  `hasPassword` (secret-store probe). Unknown URIs are a typed error.
+
+Verified automatically (`tests/mcp_lifecycle.rs::
+prompts_and_resources_lifecycle`): list shapes, argument schemas,
+substitution for both prompts (with/without optional database),
+typed required-arg and unknown-URI errors, JSON parse of the resource
+payload, hasPassword=false for the sqlite demo, presets present, and
+a no-secrets scan of the payload text.
+
+Gates: 145 lib tests, 16 lifecycle/isolation binary tests, workspace
+tests green, both-engine docker matrix and SSH matrix green, clippy
+`-D warnings` 0, fmt clean, gitleaks clean.
+
 ## Session 5 record — unchanged summary
 
 Pool identity (CredentialGeneration, publish-after-healthy, coalescing,

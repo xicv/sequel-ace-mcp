@@ -1623,3 +1623,162 @@ fn d7_concurrent_response_id_integrity() {
         }
     }
 }
+
+/// Prompts and resources (legacy parity): prompts/list returns the two
+/// prompts with their argument schemas; prompts/get renders each with
+/// argument substitution (required-arg validation typed); resources/list
+/// exposes sequel-mcp://connections; resources/read returns the no-secrets
+/// JSON with policy presets and hasPassword.
+#[test]
+fn prompts_and_resources_lifecycle() {
+    let (server, mut stdin, mut out) = Server::spawn();
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "pr", "version": "0"}}
+        }),
+    );
+    let _ = read_response(&mut out, 1, Duration::from_secs(10));
+    send(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
+
+    // --- prompts/list ---
+    send(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "prompts/list"}),
+    );
+    let msg = read_response(&mut out, 2, Duration::from_secs(10));
+    let prompts = msg["result"]["prompts"].as_array().expect("prompts");
+    assert_eq!(prompts.len(), 2, "{msg}");
+    assert!(prompts.iter().any(|p| p["name"] == "setup-connection"));
+    assert!(prompts.iter().any(|p| p["name"] == "analyze-table"));
+    let analyze = prompts
+        .iter()
+        .find(|p| p["name"] == "analyze-table")
+        .unwrap();
+    let args = analyze["arguments"].as_array().expect("args");
+    assert!(
+        args.iter()
+            .any(|a| a["name"] == "connection" && a["required"] == true)
+    );
+    assert!(
+        args.iter()
+            .any(|a| a["name"] == "table" && a["required"] == true)
+    );
+
+    // --- prompts/get: setup-connection with an optional name ---
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "prompts/get",
+            "params": {"name": "setup-connection", "arguments": {"suggestedName": "warehouse"}}
+        }),
+    );
+    let msg = read_response(&mut out, 3, Duration::from_secs(10));
+    let text = msg["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("called \"warehouse\""), "{text}");
+    assert!(text.contains("add_sqlite_connection"), "{text}");
+    assert_eq!(msg["result"]["messages"][0]["role"], "user");
+
+    // --- prompts/get: analyze-table without database ---
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 4, "method": "prompts/get",
+            "params": {"name": "analyze-table",
+                       "arguments": {"connection": "demo", "table": "users"}}
+        }),
+    );
+    let msg = read_response(&mut out, 4, Duration::from_secs(10));
+    let text = msg["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("`users`"), "{text}");
+    assert!(text.contains("\"demo\""), "{text}");
+    assert!(!text.contains("in database"), "{text}");
+    assert!(text.contains("SELECT COUNT(*)"), "{text}");
+
+    // --- prompts/get: missing required argument is a typed error ---
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 5, "method": "prompts/get",
+            "params": {"name": "analyze-table", "arguments": {"connection": "demo"}}
+        }),
+    );
+    let msg = read_response(&mut out, 5, Duration::from_secs(10));
+    assert!(
+        msg["error"]["message"].as_str().unwrap().contains("table"),
+        "{msg}"
+    );
+
+    // --- resources/list ---
+    send(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "id": 6, "method": "resources/list"}),
+    );
+    let msg = read_response(&mut out, 6, Duration::from_secs(10));
+    let resources = msg["result"]["resources"].as_array().expect("resources");
+    assert_eq!(resources.len(), 1, "{msg}");
+    assert_eq!(resources[0]["uri"], "sequel-mcp://connections");
+    assert_eq!(resources[0]["mimeType"], "application/json");
+
+    // --- resources/read: no-secrets connection JSON ---
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": "resources/read",
+            "params": {"uri": "sequel-mcp://connections"}
+        }),
+    );
+    let msg = read_response(&mut out, 7, Duration::from_secs(10));
+    let contents = msg["result"]["contents"].as_array().expect("contents");
+    assert_eq!(contents[0]["uri"], "sequel-mcp://connections");
+    assert_eq!(contents[0]["mimeType"], "application/json");
+    let text = contents[0]["text"].as_str().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    let conns = parsed["connections"].as_array().unwrap();
+    assert_eq!(conns.len(), 1, "demo connection listed");
+    assert_eq!(conns[0]["name"], "demo");
+    assert_eq!(conns[0]["driver"], "sqlite");
+    assert_eq!(conns[0]["hasPassword"], false);
+    assert!(conns[0]["presets"].as_array().unwrap().len() >= 3);
+    // No secret material in the payload.
+    assert!(!text.contains("\"password\": \""));
+
+    // --- resources/read: unknown URI is a typed error ---
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 8, "method": "resources/read",
+            "params": {"uri": "sequel-mcp://nope"}
+        }),
+    );
+    let msg = read_response(&mut out, 8, Duration::from_secs(10));
+    assert!(
+        msg["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown resource"),
+        "{msg}"
+    );
+
+    drop(stdin);
+    let mut server = server;
+    let started = Instant::now();
+    loop {
+        match server.child.try_wait().unwrap() {
+            Some(_) => break,
+            None => {
+                assert!(started.elapsed() < Duration::from_secs(10));
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+}
