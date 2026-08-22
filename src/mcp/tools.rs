@@ -2228,13 +2228,26 @@ Use only read-only tools: describe_table, list_databases, and query (SELECT/SHOW
             let handle =
                 tokio::task::spawn_blocking(move || gate::run_sql(&deps, &args, expect_read_only));
             let peer = context.peer.clone();
+            let ipc_hub = self.ctx.approval_ipc.clone();
             let pump = tokio::task::spawn_blocking(move || {
                 while let Ok(ask) = ask_rx.recv() {
                     match ask {
                         super::confirm::ElicitAsk::Request { message, reply } => {
-                            let outcome = tokio::runtime::Handle::current().block_on(async {
-                                super::confirm::run_elicitation(&peer, message).await
+                            let mut outcome = tokio::runtime::Handle::current().block_on(async {
+                                super::confirm::run_elicitation(&peer, message.clone()).await
                             });
+                            // Elicitation unavailable (client cannot
+                            // prompt): fall back to the authenticated
+                            // companion IPC and fail closed there too.
+                            if matches!(
+                                outcome,
+                                crate::approval::ConfirmOutcome::Unavailable { .. }
+                            ) && let Some(hub) = &ipc_hub
+                            {
+                                let request = gate::ApprovalRequest::from_message(&message);
+                                outcome =
+                                    tokio::runtime::Handle::current().block_on(hub.ask(request));
+                            }
                             let _ = reply.send(outcome);
                         }
                     }

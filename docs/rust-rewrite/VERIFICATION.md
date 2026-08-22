@@ -692,6 +692,65 @@ Gates: 145 lib tests, 16 lifecycle/isolation binary tests, workspace
 tests green, both-engine docker matrix and SSH matrix green, clippy
 `-D warnings` 0, fmt clean, gitleaks clean.
 
+## Session 10 (checkpoint #8: authenticated approval IPC)
+
+The companion approval channel (`src/approval/ipc.rs`) — the
+authenticated IPC the architecture mandated for CLI/GUI approvals when
+the MCP client cannot elicit:
+
+- **Transport + registry**: a Unix socket at `runtime/approval.sock`
+  (0600, 0700 directory under the XDG runtime registry) plus a
+  per-process session file `runtime/sessions/<pid>.json` (pid, socket
+  path, start time) for companion discovery. Both are removed on drop.
+- **Authentication**: every accepted connection must carry the SAME
+  effective uid — LOCAL_PEERCRED on macOS (probed this kernel: it
+  reports cr_version=0 on success, so the uid is the only reliable
+  field; the version check was dropped after the probe), SO_PEERCRED
+  on Linux, refuse-by-default elsewhere. Anything else is dropped
+  before a single protocol byte.
+- **Protocol** (newline-delimited JSON): the companion sends
+  `{"op":"wait"}`; the server holds the connection until a gate
+  confirmation lands, then sends
+  `{"op":"request","request":{id,category,connection,database,tables,snippet}}`
+  (NO secrets — snippet only) and expects
+  `{"op":"reply","id":…,"choice":"once|session|decline"}`. Replies are
+  single-use and id-bound (a forged id gets `{"op":"stale"}` and never
+  answers the pending ask); malformed choices get `bad-choice`.
+- **Fail-closed ask side**: one pending confirmation at a time (a
+  concurrent second ask returns Unavailable instead of queueing
+  unboundedly); the ask waits at most 60 s (`APPROVAL_IPC_TIMEOUT`)
+  then reports Unavailable with a typed reason — the gate audits it
+  exactly like any other unavailable prompt; nothing is ever
+  auto-approved.
+- **Wiring**: `serve` builds the server via `with_approval_ipc()` —
+  binds the hub (binding failure degrades to elicitation-only with a
+  logged reason) AND runs the boot-time retention auto-cleanup when
+  due (the previously-pending `maybe_auto_cleanup` hookup). In the
+  legacy-era tools path, elicitation is tried first; an Unavailable
+  elicitation falls back to the hub (still fail-closed). Modern-era
+  MRTR approvals are unchanged (they are client-side by design).
+- **CLI**: `sequel-mcp approve [--socket PATH] [--choice once|session|
+  decline]` — connects, prints the pending request (category,
+  connection, tables, snippet), prompts [once/session/decline]
+  interactively (EOF ⇒ decline), sends the id-bound reply, and
+  confirms the server acknowledgement. Exit codes distinguish
+  no-server/no-pending/bad-choice/rejected.
+
+**Verified automatically**: 4 IPC unit tests — once round trip
+(request shown, id-bound reply, ack, socket + session file removed on
+drop), decline and session choices, second-concurrent-ask fail-closed,
+and the forged-id stale rejection (the real ask stays pending).
+Integration surface: `serve` now hosts the hub in every lifecycle test
+(16/16 still green — the socket binds under each isolated root and is
+cleaned up with the process).
+
+Gates: 149 lib tests (4 new), 16 lifecycle/isolation, workspace tests
+green, both-engine docker matrix PASSED on isolated reruns after one
+resource-contention flake in the D2 cancellation test (the documented
+docker-parallel flake; mariadb-only, mysql-only, and both confirm runs
+all green), SSH matrix 27/27 green, clippy `-D warnings` 0, fmt clean,
+gitleaks clean, zero docker leftovers.
+
 ## Session 5 record — unchanged summary
 
 Pool identity (CredentialGeneration, publish-after-healthy, coalescing,

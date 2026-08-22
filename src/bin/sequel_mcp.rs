@@ -24,6 +24,16 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Answer a pending approval request from a running server
+    /// (authenticated same-user IPC over the runtime socket).
+    Approve {
+        /// Socket path override (default: the runtime registry socket).
+        #[arg(long)]
+        socket: Option<String>,
+        /// Non-interactive choice: once | session | decline.
+        #[arg(long)]
+        choice: Option<String>,
+    },
 }
 
 fn main() {
@@ -31,6 +41,7 @@ fn main() {
     let code = match cli.command {
         Command::Serve => serve(),
         Command::Doctor { json } => doctor(json),
+        Command::Approve { socket, choice } => approve(socket, choice),
     };
     std::process::exit(code);
 }
@@ -72,7 +83,7 @@ fn serve() -> i32 {
 
     rt.block_on(async {
         use rmcp::ServiceExt;
-        let server = sequel_mcp::mcp::SequelServer::with_defaults();
+        let server = sequel_mcp::mcp::SequelServer::with_approval_ipc();
         // Bounded stdio: stdin passes through the line-limit adapter so an
         // oversized JSON-RPC line is discarded before it is ever buffered.
         match server.serve(sequel_mcp::mcp::limits::limited_stdio()).await {
@@ -131,4 +142,119 @@ fn doctor(json: bool) -> i32 {
         );
     }
     0
+}
+
+fn approve(socket: Option<String>, choice: Option<String>) -> i32 {
+    use std::io::BufRead;
+    let path = socket
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(sequel_mcp::approval::ipc::ApprovalIpc::default_socket_path);
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path) else {
+        eprintln!(
+            "sequel-mcp approve: no server at {} (is a server running?)",
+            path.display()
+        );
+        return 1;
+    };
+    fn say(stream: &mut std::os::unix::net::UnixStream, v: &serde_json::Value) {
+        use std::io::Write;
+        let _ = stream.write_all(serde_json::to_string(v).unwrap_or_default().as_bytes());
+        let _ = stream.write_all(b"\n");
+        let _ = stream.flush();
+    }
+    fn read(stream: &std::os::unix::net::UnixStream) -> Option<String> {
+        let mut reader = std::io::BufReader::new(stream.try_clone().ok()?);
+        let mut line = String::new();
+        reader.read_line(&mut line).ok()?;
+        let line = line.trim().to_string();
+        if line.is_empty() { None } else { Some(line) }
+    }
+    say(
+        &mut stream,
+        &serde_json::json!({"op": "wait", "timeoutMs": 30000}),
+    );
+    let Some(line) = read(&stream) else {
+        eprintln!("sequel-mcp approve: connection closed before a request arrived");
+        return 1;
+    };
+    let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
+        eprintln!("sequel-mcp approve: malformed reply from server");
+        return 1;
+    };
+    if msg["op"] == "empty" {
+        eprintln!("sequel-mcp approve: no pending approval (timed out waiting)");
+        return 1;
+    }
+    if msg["op"] != "request" {
+        eprintln!("sequel-mcp approve: unexpected reply: {msg}");
+        return 1;
+    }
+    let req = &msg["request"];
+    println!("pending approval");
+    println!("  category  : {}", req["category"].as_str().unwrap_or("?"));
+    println!(
+        "  connection: {}",
+        req["connection"].as_str().unwrap_or("?")
+    );
+    if let Some(db) = req["database"].as_str() {
+        println!("  database  : {db}");
+    }
+    let tables: Vec<&str> = req["tables"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|t| t.as_str()).collect())
+        .unwrap_or_default();
+    if !tables.is_empty() {
+        println!("  tables    : {}", tables.join(", "));
+    }
+    println!("  statement :");
+    for line_text in req["snippet"].as_str().unwrap_or("").lines() {
+        println!("    {line_text}");
+    }
+    let choice = match choice.as_deref() {
+        Some(c @ ("once" | "session" | "decline")) => c.to_string(),
+        Some(other) => {
+            eprintln!("sequel-mcp approve: invalid --choice {other:?} (once|session|decline)");
+            return 2;
+        }
+        None => loop {
+            println!("authorize? [once/session/decline]");
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_err() {
+                return 1;
+            }
+            match input.trim() {
+                "once" | "session" | "decline" => break input.trim().to_string(),
+                "" => {
+                    eprintln!("sequel-mcp approve: EOF — treating as decline");
+                    break "decline".to_string();
+                }
+                _ => continue,
+            }
+        },
+    };
+    say(
+        &mut stream,
+        &serde_json::json!({
+            "op": "reply",
+            "id": req["id"],
+            "choice": choice,
+        }),
+    );
+    match read(&stream)
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+    {
+        Some(Ok(ack)) if ack["op"] == "ok" => {
+            println!("recorded: {choice}");
+            0
+        }
+        Some(Ok(ack)) => {
+            eprintln!("sequel-mcp approve: server rejected the reply: {ack}");
+            1
+        }
+        _ => {
+            eprintln!("sequel-mcp approve: no acknowledgement from server");
+            1
+        }
+    }
 }

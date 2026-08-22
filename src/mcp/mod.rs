@@ -25,6 +25,10 @@ pub struct AppCtx {
     pub approvals: Arc<ApprovalEngine>,
     pub auth: Arc<SessionAuthenticator>,
     pub secrets: Arc<dyn SecretStore>,
+    /// Approval IPC hub (companion approvals). `None` when the runtime
+    /// socket could not be bound — approvals then rely on elicitation
+    /// alone and fail closed without a client prompt.
+    pub approval_ipc: Option<Arc<crate::approval::ipc::ApprovalIpc>>,
 }
 
 pub fn build_server_info() -> ServerInfo {
@@ -64,8 +68,39 @@ impl SequelServer {
                     crate::vault::touchid::system_touch_id(),
                 )),
                 secrets: crate::vault::keychain::default_store(),
+                approval_ipc: None,
             },
         }
+    }
+
+    /// `with_defaults` plus the approval IPC hub: binds the runtime
+    /// socket for companion approvals (the `approve` CLI now, the GUI
+    /// later) and runs the boot-time retention auto-cleanup when due.
+    pub fn with_approval_ipc() -> Self {
+        let mut server = Self::with_defaults();
+        match crate::approval::ipc::ApprovalIpc::start() {
+            Ok(hub) => {
+                server.ctx.approval_ipc = Some(hub);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[sequel-mcp] approval IPC unavailable ({}); elicitation-only approvals",
+                    e
+                );
+            }
+        }
+        // Boot retention: runs only when the configured interval elapsed
+        // since the last recorded cleanup.
+        if let Ok(cfg) = server.ctx.config.load()
+            && let Some(report) =
+                crate::audit::retention::maybe_auto_cleanup(&server.ctx.audit, &cfg.retention)
+        {
+            eprintln!(
+                "[sequel-mcp] auto-cleanup: pruned {} audit row(s), {} backup(s), reclaimed {} byte(s)",
+                report.audit_deleted, report.backup_deleted, report.bytes_reclaimed
+            );
+        }
+        server
     }
 }
 

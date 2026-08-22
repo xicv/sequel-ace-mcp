@@ -2,6 +2,7 @@
 //! session grants, and the audit outcome vocabulary.
 
 pub mod digest;
+pub mod ipc;
 pub mod outcomes;
 
 use crate::policy::model::{PolicyAction, SqlCategory, TableId};
