@@ -6,3 +6,4 @@ pub mod known_hosts;
 pub mod mysql;
 pub mod pool;
 pub mod sqlite;
+pub mod ssh;
