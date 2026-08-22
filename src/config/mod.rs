@@ -142,6 +142,9 @@ pub struct MySqlConnection {
     pub database: Option<String>,
     pub ssl: bool,
     pub ssl_server_name: Option<String>,
+    /// Optional PEM/DER file of a private CA the server certificate is
+    /// verified against (merged with the system roots).
+    pub ssl_ca_path: Option<String>,
     pub ssh: Option<SshTunnel>,
     pub policy: Policy,
     /// v2 layer-2 rules (exact or wildcard). Migrated v1 `databasePolicies`
@@ -159,6 +162,7 @@ impl Default for MySqlConnection {
             database: None,
             ssl: false,
             ssl_server_name: None,
+            ssl_ca_path: None,
             ssh: None,
             policy: Policy::default(),
             table_policies: TablePolicies::default(),
@@ -190,6 +194,9 @@ impl Default for SqliteConnection {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "driver", rename_all = "lowercase")]
+// Boxing the MySQL variant would ripple through every match site for a
+// type that is constructed rarely and cloned per request anyway.
+#[allow(clippy::large_enum_variant)]
 pub enum Connection {
     Mysql(MySqlConnection),
     Sqlite(SqliteConnection),
@@ -257,6 +264,13 @@ impl Connection {
             {
                 return Err(ConfigError::Validation(
                     "sslServerName must be 1..=253 chars".into(),
+                ));
+            }
+            if let Some(ca) = &c.ssl_ca_path
+                && (ca.is_empty() || ca.len() > 4096)
+            {
+                return Err(ConfigError::Validation(
+                    "sslCaPath must be 1..=4096 chars".into(),
                 ));
             }
             if let Some(ssh) = &c.ssh {

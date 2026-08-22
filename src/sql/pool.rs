@@ -62,6 +62,13 @@ impl CredentialGeneration {
         }
         diff == 0
     }
+
+    /// Hex fragment for cache KEYING (e.g. the SSH tunnel key binds the
+    /// credential generation so rotation invalidates cached sessions).
+    /// The digest is process-keyed and useless outside this process.
+    pub fn key_fragment(&self) -> String {
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
 }
 
 fn process_key() -> &'static [u8; 32] {
@@ -85,6 +92,10 @@ pub enum PoolManagerError {
 struct PoolEntry {
     pool: Pool,
     generation: CredentialGeneration,
+    /// Tunnel transport generation when this pool rides an SSH tunnel;
+    /// retiring a tunnel evicts its pools by this id (ABA protection:
+    /// a reused loopback port is always a NEW generation).
+    tunnel_generation: Option<u64>,
 }
 
 /// Shared pool cache with verified publication. A pool becomes visible
@@ -109,9 +120,10 @@ impl PoolManager {
         revision: u64,
         host_override: Option<&str>,
         port_override: Option<u16>,
+        tunnel_generation: Option<u64>,
     ) -> String {
         format!(
-            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
             conn.name,
             host_override.unwrap_or(&conn.host),
             port_override.unwrap_or(conn.port),
@@ -120,6 +132,7 @@ impl PoolManager {
             conn.ssl,
             conn.ssl_server_name.as_deref().unwrap_or(""),
             revision,
+            tunnel_generation.map(|g| g.to_string()).unwrap_or_default(),
         )
     }
 
@@ -127,6 +140,7 @@ impl PoolManager {
     /// initializing (handshake + health query) at most one pool per key
     /// even under concurrent first access. Superseded pools are closed and
     /// evicted. Auth/DNS/TLS/handshake failures never populate the cache.
+    #[allow(clippy::too_many_arguments)]
     pub async fn verified_pool(
         &self,
         conn: &MySqlConnection,
@@ -135,6 +149,7 @@ impl PoolManager {
         revision: u64,
         host_override: Option<&str>,
         port_override: Option<u16>,
+        tunnel_generation: Option<u64>,
     ) -> Result<Pool, PoolManagerError> {
         // Fail-closed test-mode endpoint gate at the single pool creation
         // choke point: non-loopback endpoints are refused BEFORE any
@@ -146,7 +161,14 @@ impl PoolManager {
         )
         .map_err(PoolManagerError::Init)?;
         let generation = CredentialGeneration::derive(password);
-        let key = Self::config_key(conn, database, revision, host_override, port_override);
+        let key = Self::config_key(
+            conn,
+            database,
+            revision,
+            host_override,
+            port_override,
+            tunnel_generation,
+        );
 
         // Fast path: a matching live pool already exists.
         {
@@ -208,6 +230,7 @@ impl PoolManager {
             PoolEntry {
                 pool: candidate.clone(),
                 generation,
+                tunnel_generation,
             },
         );
         Ok(candidate)
@@ -223,6 +246,25 @@ impl PoolManager {
             let _close = tokio::task::spawn(entry.pool.disconnect());
         }
     }
+}
+
+/// Close and remove every pool riding the given tunnel generation
+/// (tunnel retirement). Returns how many pools were evicted.
+pub fn evict_by_generation(generation: u64) -> usize {
+    let mgr = super::mysql::pool_manager();
+    let mut pools = mgr.pools.lock().unwrap();
+    let victims: Vec<String> = pools
+        .iter()
+        .filter(|(_, e)| e.tunnel_generation == Some(generation))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let n = victims.len();
+    for k in victims {
+        if let Some(entry) = pools.remove(&k) {
+            let _close = tokio::task::spawn(entry.pool.disconnect());
+        }
+    }
+    n
 }
 
 impl Default for PoolManager {
@@ -270,7 +312,7 @@ mod tests {
         let c = conn("127.0.0.1");
         let pw = Zeroizing::new("x".to_string());
         let err = mgr
-            .verified_pool(&c, &pw, None, 1, None, Some(1))
+            .verified_pool(&c, &pw, None, 1, None, Some(1), None)
             .await
             .unwrap_err();
         assert!(matches!(err, PoolManagerError::Init(_)), "{err:?}");
@@ -292,7 +334,7 @@ mod tests {
             let cc = c.clone();
             let p = pw.clone();
             handles.push(tokio::task::spawn(async move {
-                m.verified_pool(&cc, &p, None, 1, None, Some(2)).await
+                m.verified_pool(&cc, &p, None, 1, None, Some(2), None).await
             }));
         }
         for h in handles {
@@ -306,10 +348,17 @@ mod tests {
         let c1 = conn("db1.example.invalid");
         let mut c2 = conn("db2.example.invalid");
         c2.ssl = true;
-        let k1 = PoolManager::config_key(&c1, None, 1, None, None);
-        let k2 = PoolManager::config_key(&c2, None, 1, None, None);
-        let k3 = PoolManager::config_key(&c1, None, 2, None, None);
+        let k1 = PoolManager::config_key(&c1, None, 1, None, None, None);
+        let k2 = PoolManager::config_key(&c2, None, 1, None, None, None);
+        let k3 = PoolManager::config_key(&c1, None, 2, None, None, None);
         assert_ne!(k1, k2);
         assert_ne!(k1, k3);
+        // Tunnel generations split pool identities even for identical
+        // transport endpoints (loopback-port reuse can never splice an
+        // old pool onto a new transport).
+        let k4 = PoolManager::config_key(&c1, None, 1, None, None, Some(7));
+        let k5 = PoolManager::config_key(&c1, None, 1, None, None, Some(8));
+        assert_ne!(k1, k4);
+        assert_ne!(k4, k5);
     }
 }

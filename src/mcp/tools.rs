@@ -973,14 +973,38 @@ impl SequelServer {
                 }
             };
             let preflight = async {
+                // Tunnel connections plan through the SAME tunnel runtime
+                // as the gate (a tunnel-only database must be plannable,
+                // and the plan's pool must carry the tunnel generation).
+                let (host, port, tunnel_generation) = if let Some(ssh) = &mysql_conn.ssh {
+                    let ssh_pw = self
+                        .ctx
+                        .secrets
+                        .get_password(&format!("{}::ssh", mysql_conn.name), &ssh.user)
+                        .ok();
+                    let lease = crate::sql::ssh::tunnel_endpoint(
+                        &mysql_conn.name,
+                        ssh,
+                        ssh_pw.as_ref().map(|p| p.as_str()),
+                        &mysql_conn.host,
+                        mysql_conn.port,
+                        cfg.revision,
+                    )
+                    .await
+                    .map_err(|e| format!("ssh tunnel: {e}"))?;
+                    (lease.host, lease.port, Some(lease.generation))
+                } else {
+                    (mysql_conn.host.clone(), mysql_conn.port, None)
+                };
                 let pool = crate::sql::mysql::pool_manager()
                     .verified_pool(
                         mysql_conn,
                         &pw,
                         fallback.as_deref(),
                         cfg.revision,
-                        None,
-                        None,
+                        Some(&host),
+                        Some(port),
+                        tunnel_generation,
                     )
                     .await
                     .map_err(|e| format!("pool initialization failed: {e}"))?;
