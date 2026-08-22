@@ -4,12 +4,20 @@
 # full cleanup via trap. Credentials live only in a 0600 env-file passed
 # to docker and in the test process environment — never in the repo or logs.
 #
+# ISOLATION: cargo test runs and every spawned test binary operate under
+# the shared fail-closed isolation root (scripts/lib/isolated-test-env.sh)
+# with SEQUEL_MCP_TEST_MODE=1 — no real config, audit DB, or Keychain is
+# reachable, and MySQL endpoints are loopback docker ports.
+#
 # Usage:
 #   scripts/test-db.sh mariadb            # run integration tests vs MariaDB 11
 #   scripts/test-db.sh mysql              # run integration tests vs MySQL 8.4
 #   scripts/test-db.sh both               # both matrices
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# shellcheck source=scripts/lib/isolated-test-env.sh
+source scripts/lib/isolated-test-env.sh
+iso_init >/dev/null   # ISO_ROOT echoed by run_matrix via iso_export_for_cargo
 
 WHAT="${1:-mariadb}"
 STAMP="$(date +%s)-$$"
@@ -27,6 +35,7 @@ cleanup() {
   docker rm -f "$MARIADB_CONTAINER" "$MYSQL_CONTAINER" >/dev/null 2>&1 || true
   docker network rm "$NETWORK" >/dev/null 2>&1 || true
   rm -f "$SECRET_FILE"
+  rm -rf "${ISO_ROOT:-}"
   exit "$rc"
 }
 trap cleanup EXIT INT TERM
@@ -76,6 +85,12 @@ run_matrix() {
   wait_healthy "$container" "$user"
   rm -f "$SECRET_FILE"
   echo "==> $flavor ready on 127.0.0.1:$port (container $container)"
+  iso_export_for_cargo
+  # TEST-NET blackhole address is explicitly allow-listed for the D1
+  # connect-timeout probe (unroutable by design; exercises the allow-list
+  # path of the test-mode endpoint gate). Everything else stays
+  # loopback-only.
+  export SEQUEL_MCP_TEST_ALLOWED_ENDPOINTS="192.0.2.1"
   SEQUEL_MCP_TEST_MYSQL="127.0.0.1:$port:$user:$DB_PASSWORD" \
     cargo test --test mysql_integration --test repro_block -- --test-threads=1
   SEQUEL_MCP_TEST_MYSQL="127.0.0.1:$port:$user:$DB_PASSWORD" \

@@ -136,6 +136,15 @@ impl PoolManager {
         host_override: Option<&str>,
         port_override: Option<u16>,
     ) -> Result<Pool, PoolManagerError> {
+        // Fail-closed test-mode endpoint gate at the single pool creation
+        // choke point: non-loopback endpoints are refused BEFORE any
+        // socket is opened (covers direct execution, MRTR plan-time
+        // preflight, and future transports alike).
+        crate::app::test_mode::check_mysql_endpoint(
+            host_override.unwrap_or(&conn.host),
+            port_override.unwrap_or(conn.port),
+        )
+        .map_err(PoolManagerError::Init)?;
         let generation = CredentialGeneration::derive(password);
         let key = Self::config_key(conn, database, revision, host_override, port_override);
 

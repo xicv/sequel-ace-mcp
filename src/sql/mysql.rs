@@ -34,12 +34,22 @@ pub enum MySqlError {
     Uncertain(String),
     #[error("DDL target not found: {0}")]
     DdlNotFound(String),
+    #[error("[ddl_precondition_changed] {0}")]
+    DdlPreconditionChanged(String),
 }
 
 #[derive(Debug)]
 pub struct ExecuteResult {
     /// Operation-journal row id (D3), when a journal was created.
     pub journal_id: Option<i64>,
+    /// Targets that were absent under IF EXISTS in a Mixed set (D4A):
+    /// only the preflight-approved existing subset was executed; the
+    /// absent list is surfaced in the result and audit.
+    pub ddl_absent_targets: Vec<String>,
+    /// The subset actually named by the rewritten Mixed statement
+    /// (equals the plan-approved existing set intersected with what still
+    /// exists at execution). Empty unless a Mixed rewrite occurred.
+    pub ddl_executed_targets: Vec<String>,
     /// DDL absent-target no-op (IF EXISTS over missing tables): nothing
     /// was sent to the server; audited locally.
     pub ddl_no_op: bool,
@@ -167,6 +177,11 @@ pub struct MySqlExecuteParams<'a> {
     pub revision: u64,
     /// Local endpoint when an SSH tunnel is in front of the server.
     pub tunnel_endpoint: Option<(String, u16)>,
+    /// Plan-time approved DDL target set (MRTR plan→retry gap): every
+    /// DROP target that exists at execution time must have existed at
+    /// plan time, otherwise nothing executes (DdlPreconditionChanged).
+    /// `None` for single-shot execution (no plan gap).
+    pub expected_ddl_targets: Option<Vec<(String, String)>>,
 }
 
 /// Structured representation for binary column values so they can never
@@ -263,6 +278,9 @@ pub async fn execute_mysql_statement(
         Some((h, p)) => (h.clone(), *p),
         None => (params.connection.host.clone(), params.connection.port),
     };
+    // Fail-closed test-mode endpoint gate: refused BEFORE any connect
+    // attempt (a violation must never open a socket).
+    crate::app::test_mode::check_mysql_endpoint(&host, port).map_err(MySqlError::Pool)?;
     let pool = pool_manager()
         .verified_pool(
             params.connection,
@@ -354,10 +372,22 @@ pub async fn execute_mysql_statement(
     };
 
     use crate::backup::journal::JournalState;
+    // D4A: absent targets of a Mixed IF EXISTS set (audited, never
+    // suppressed), the rewritten statement naming only the
+    // preflight-approved existing subset, and an optional journal detail.
+    let mut ddl_absent: Vec<(String, String)> = Vec::new();
+    let mut ddl_executed: Vec<String> = Vec::new();
+    let mut ddl_effective_sql: Option<String> = None;
+    let mut ddl_detail: Option<String> = None;
+
     // D4 preflight for DDL: bound-parameter existence check on every
     // mutated target. IF EXISTS + missing -> audited local no-op (no DDL
-    // sent); missing without IF EXISTS -> typed not-found error; present
-    // -> continue with snapshot semantics.
+    // sent); missing without IF EXISTS -> typed not-found error; mixed
+    // -> REWRITTEN statement over the approved existing subset only (the
+    // original multi-target statement is never re-sent: a target created
+    // after the preflight would otherwise be dropped without ever being
+    // approved or snapshotted); present -> continue with snapshot
+    // semantics.
     if params.classified.category == SqlCategory::Ddl {
         match super::ddl::preflight_ddl(
             &mut conn,
@@ -366,15 +396,85 @@ pub async fn execute_mysql_statement(
         )
         .await
         {
-            Ok(super::ddl::DdlPreflight::Present) => {}
-            Ok(super::ddl::DdlPreflight::NotFound(e)) => {
-                if let Some(j) = &journal {
-                    let _ = j.transition(
-                        crate::backup::journal::JournalState::Failed,
-                        Some(&e.to_string()),
-                    );
+            Ok(super::ddl::DdlPreflight::Present) => {
+                // Plan-gap enforcement (MRTR retry): if a plan-time target
+                // set exists, every currently-present DROP target must
+                // have been in it — a table created after the approved
+                // plan fails closed with nothing executed.
+                if let (Some(expected), "drop") = (
+                    params.expected_ddl_targets.as_ref(),
+                    params.classified.ast_type,
+                ) {
+                    let fallback = params.database.or(params.connection.database.as_deref());
+                    for target in &params.classified.mutated_tables {
+                        let Some(schema) = target
+                            .database
+                            .clone()
+                            .or_else(|| fallback.map(str::to_string))
+                        else {
+                            continue;
+                        };
+                        if !expected.contains(&(schema.clone(), target.table.clone())) {
+                            let detail = format!(
+                                "table {}.{} changed existence after the approved plan; nothing executed; re-run for a fresh plan",
+                                schema, target.table
+                            );
+                            if let Some(j) = &journal {
+                                let _ = j.transition(JournalState::Failed, Some(&detail));
+                            }
+                            return Err(MySqlError::DdlPreconditionChanged(detail));
+                        }
+                    }
                 }
-                return Err(MySqlError::DdlNotFound(e.to_string()));
+            }
+            Ok(super::ddl::DdlPreflight::Mixed { existing, missing }) => {
+                // Plan-gap enforcement: the current existing set must be a
+                // subset of the plan-approved set.
+                if let Some(expected) = params.expected_ddl_targets.as_ref() {
+                    for (schema, table) in &existing {
+                        if !expected.contains(&(schema.clone(), table.clone())) {
+                            let detail = format!(
+                                "table {schema}.{table} changed existence after the approved plan; nothing executed; re-run for a fresh plan"
+                            );
+                            if let Some(j) = &journal {
+                                let _ = j.transition(JournalState::Failed, Some(&detail));
+                            }
+                            return Err(MySqlError::DdlPreconditionChanged(detail));
+                        }
+                    }
+                }
+                let absent = missing
+                    .iter()
+                    .map(|(s, t)| format!("{s}.{t}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let kept = existing
+                    .iter()
+                    .map(|(s, t)| format!("{s}.{t}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match super::ddl::rewrite_drop_subset(
+                    params.classified.drop_object_type.unwrap_or("other"),
+                    &existing,
+                ) {
+                    Some(rewritten) => {
+                        ddl_effective_sql = Some(rewritten);
+                        ddl_executed = existing.iter().map(|(s, t)| format!("{s}.{t}")).collect();
+                        ddl_absent = missing.clone();
+                        ddl_detail = Some(format!(
+                            "IF EXISTS: executing approved subset [{kept}]; absent targets: [{absent}]"
+                        ));
+                    }
+                    None => {
+                        let detail = format!(
+                            "mixed multi-target drop of this object type cannot be safely rewritten; nothing executed (targets: [{kept}], absent: [{absent}])"
+                        );
+                        if let Some(j) = &journal {
+                            let _ = j.transition(JournalState::Failed, Some(&detail));
+                        }
+                        return Err(MySqlError::DdlPreconditionChanged(detail));
+                    }
+                }
             }
             Ok(super::ddl::DdlPreflight::MissingNoOp(missing)) => {
                 let detail = missing
@@ -388,9 +488,15 @@ pub async fn execute_mysql_statement(
                         Some(&format!("ddl no-op: absent targets {detail}")),
                     );
                 }
+                ddl_absent = missing.clone();
                 return Ok(ExecuteResult {
                     journal_id: journal.as_ref().map(|j| j.id()),
                     ddl_no_op: true,
+                    ddl_absent_targets: ddl_absent
+                        .iter()
+                        .map(|(s, t)| format!("{s}.{t}"))
+                        .collect(),
+                    ddl_executed_targets: Vec::new(),
                     warnings: vec![],
                     rows: Vec::new(),
                     fields: Vec::new(),
@@ -410,6 +516,8 @@ pub async fn execute_mysql_statement(
                 }
                 return Err(MySqlError::DdlNotFound(e.to_string()));
             }
+            #[allow(unreachable_patterns)]
+            Ok(_) => {}
         }
     }
     let warnings: Vec<&'static str> =
@@ -428,6 +536,10 @@ pub async fn execute_mysql_statement(
             start,
             journal.as_ref(),
             warnings.clone(),
+            ddl_absent.clone(),
+            ddl_executed.clone(),
+            ddl_effective_sql.clone(),
+            ddl_detail.clone(),
         )
         .await;
         match result {
@@ -520,6 +632,7 @@ pub async fn execute_mysql_statement(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_in_transaction(
     conn: &mut mysql_async::Conn,
     params: &MySqlExecuteParams<'_>,
@@ -527,18 +640,25 @@ async fn run_in_transaction(
     start: Instant,
     journal: Option<&crate::backup::journal::Journal<'_>>,
     warnings_out: Vec<&'static str>,
+    ddl_absent: Vec<(String, String)>,
+    ddl_executed: Vec<String>,
+    ddl_effective_sql: Option<String>,
+    ddl_detail: Option<String>,
 ) -> Result<ExecuteResult, MySqlError> {
     use crate::backup::journal::JournalState;
     if let Some(j) = journal {
-        let _ = j.transition(JournalState::BackupCapturing, None);
+        let _ = j.transition(JournalState::BackupCapturing, ddl_detail.as_deref());
     }
+    // The statement actually sent: the Mixed-IF-EXISTS rewrite names only
+    // the approved existing subset; every other statement runs verbatim.
+    let effective_sql: &str = ddl_effective_sql.as_deref().unwrap_or(params.sql);
     // Pre-mutation backup (fail-closed: capture errors deny the mutation).
     let mut backup_id: Option<i64> = None;
     let mut backup_row_count: u64 = 0;
     let mut pending_insert: Option<BackupSpec> = None;
     if crate::backup::extractor::is_backup_required(params.classified.ast_type) {
         let spec = extract_backup_spec(
-            params.sql,
+            effective_sql,
             params.classified.ast_type,
             crate::policy::classifier::Dialect::MySql,
         )
@@ -575,11 +695,13 @@ async fn run_in_transaction(
     // Reads carry the optimizer timeout hint.
     let sql_owned;
     let sql: &str = if is_read && params.policy.stmt_timeout_ms > 0 {
-        sql_owned =
-            crate::sql::hints::inject_max_execution_time(params.sql, params.policy.stmt_timeout_ms);
+        sql_owned = crate::sql::hints::inject_max_execution_time(
+            effective_sql,
+            params.policy.stmt_timeout_ms,
+        );
         &sql_owned
     } else {
-        params.sql
+        effective_sql
     };
 
     let cap = params.policy.row_cap;
@@ -608,6 +730,8 @@ async fn run_in_transaction(
     let mut value = ExecuteResult {
         journal_id: None,
         ddl_no_op: false,
+        ddl_absent_targets: ddl_absent.iter().map(|(s, t)| format!("{s}.{t}")).collect(),
+        ddl_executed_targets: ddl_executed,
         warnings: Vec::new(),
         rows,
         fields,

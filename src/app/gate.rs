@@ -109,6 +109,9 @@ pub struct RunSqlArgs {
     pub connection: Option<String>,
     pub sql: String,
     pub database: Option<String>,
+    /// Plan-time approved DDL target set carried from an MRTR approval
+    /// (plan→retry gap enforcement); `None` for single-shot execution.
+    pub expected_ddl_targets: Option<Vec<(String, String)>>,
 }
 
 #[derive(Debug)]
@@ -128,6 +131,12 @@ pub struct RunOutcome {
     /// DDL absent-target no-op (IF EXISTS over missing tables): nothing
     /// was sent to the server (D4).
     pub ddl_no_op: bool,
+    /// Targets absent under IF EXISTS in a Mixed set (recorded, never
+    /// suppressed); empty unless a Mixed DROP occurred.
+    pub ddl_absent_targets: Vec<String>,
+    /// Targets actually named by the rewritten Mixed DROP statement
+    /// (the preflight-approved existing subset); empty otherwise.
+    pub ddl_executed_targets: Vec<String>,
     /// Protection-model warnings (nontransactional DDL snapshot).
     pub warnings: Vec<&'static str>,
 }
@@ -439,6 +448,7 @@ pub fn run_sql(
             let audit = deps.audit.clone();
             let revision = cfg.revision;
             let sql = args.sql.clone();
+            let expected_ddl = args.expected_ddl_targets.clone();
             let tunnel_endpoint: Option<(String, u16)> = None; // SSH runtime pending
             let res = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
@@ -455,6 +465,7 @@ pub fn run_sql(
                             audit: Some(audit),
                             revision,
                             tunnel_endpoint,
+                            expected_ddl_targets: expected_ddl,
                         },
                     )
                     .await
@@ -463,6 +474,8 @@ pub fn run_sql(
             res.map(|r| crate::sql::sqlite::ExecuteResult {
                 journal_id: r.journal_id,
                 ddl_no_op: r.ddl_no_op,
+                ddl_absent_targets: r.ddl_absent_targets,
+                ddl_executed_targets: r.ddl_executed_targets,
                 warnings: r.warnings,
                 rows: r.rows,
                 fields: r.fields,
@@ -513,6 +526,8 @@ pub fn run_sql(
                 backup_id: r.backup_id,
                 backup_row_count: r.backup_row_count,
                 ddl_no_op: r.ddl_no_op,
+                ddl_absent_targets: r.ddl_absent_targets,
+                ddl_executed_targets: r.ddl_executed_targets,
                 warnings: r.warnings,
                 request_id,
             })
@@ -603,6 +618,8 @@ pub fn outcome_to_json(o: &RunOutcome) -> serde_json::Value {
         "backupRowCount": o.backup_row_count,
         "requestId": o.request_id,
         "ddlNoOp": o.ddl_no_op,
+        "ddlAbsentTargets": o.ddl_absent_targets,
+        "ddlExecutedTargets": o.ddl_executed_targets,
         "warnings": o.warnings,
     })
 }
@@ -672,6 +689,7 @@ mod tests {
             connection: None,
             sql: sql.into(),
             database: None,
+            expected_ddl_targets: None,
         }
     }
 

@@ -26,6 +26,8 @@ pub enum SqliteError {
     NotFound(String),
     #[error("read-only connection: path {0} is a symlink — refusing")]
     Symlink(String),
+    #[error("test mode: {0}")]
+    TestModeRefused(String),
     #[error("statement timed out after {0}ms")]
     Timeout(u64),
     #[error("backup overflow: {0}")]
@@ -38,6 +40,11 @@ pub enum SqliteError {
 pub struct ExecuteResult {
     /// DDL no-op flag (MySQL preflight path); SQLite defaults false.
     pub ddl_no_op: bool,
+    /// Absent targets of a MySQL Mixed DROP (D4A); SQLite defaults empty.
+    pub ddl_absent_targets: Vec<String>,
+    /// Targets named by the rewritten MySQL Mixed DROP; SQLite defaults
+    /// empty.
+    pub ddl_executed_targets: Vec<String>,
     /// Protection-model warnings (MySQL DDL path); SQLite defaults empty.
     pub warnings: Vec<&'static str>,
     /// Operation-journal row id (D3); MySQL mutations create journals,
@@ -62,6 +69,8 @@ pub fn open_sqlite_database(
     timeout_ms: u32,
 ) -> Result<Connection, SqliteError> {
     let filename = crate::app::paths::expand_tilde(&conn.path);
+    // Fail-closed test-mode path gate (before any file is touched).
+    crate::app::test_mode::check_sqlite_path(&filename).map_err(SqliteError::TestModeRefused)?;
     if readonly {
         let canonical = std::fs::canonicalize(&filename)
             .map_err(|_| SqliteError::NotFound(filename.display().to_string()))?;
@@ -322,6 +331,8 @@ fn execute_on_connection(
         Ok(ExecuteResult {
             journal_id: None,
             ddl_no_op: false,
+            ddl_absent_targets: Vec::new(),
+            ddl_executed_targets: Vec::new(),
             warnings: Vec::new(),
             rows: stats.rows,
             fields: stats.fields,

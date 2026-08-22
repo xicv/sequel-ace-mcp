@@ -76,6 +76,7 @@ async fn d8_live_benchmarks() {
             audit: Some(audit.clone()),
             revision: 1,
             tunnel_endpoint: None,
+            expected_ddl_targets: None,
         })
         .await
     }
@@ -121,9 +122,40 @@ async fn d8_live_benchmarks() {
             audit: Some(audit.clone()),
             revision: 1,
             tunnel_endpoint: None,
+            expected_ddl_targets: None,
         })
         .await;
         cancel.push(t.elapsed().as_secs_f64() * 1000.0);
     }
     stats("CANCEL_LATENCY", &cancel);
+
+    // --- Audit-only cost: write_audit_entry latency (temp audit db).
+    let mut audit_samples = Vec::new();
+    for i in 0..50 {
+        let t = Instant::now();
+        let _ = sequel_mcp::audit::write_audit_entry(
+            &audit,
+            &sequel_mcp::audit::AuditEntry {
+                request_id: format!("bench-{i}"),
+                connection: "d8".into(),
+                databases: vec!["app".into()],
+                category: sequel_mcp::policy::model::SqlCategory::Read,
+                ast_type: Some("select".into()),
+                sql: "SELECT 1".into(),
+                decision: sequel_mcp::policy::model::PolicyAction::Allow,
+                confirmed: false,
+                outcome: sequel_mcp::approval::outcomes::ApprovalOutcome::Approved,
+                affected_rows: None,
+                duration_ms: None,
+                error: None,
+                backup_id: None,
+                approval_scope: None,
+                approval_digest: None,
+                policy_revision: None,
+            },
+            &sequel_mcp::audit::WriteOptions::default(),
+        );
+        audit_samples.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    stats("AUDIT_WRITE", &audit_samples);
 }

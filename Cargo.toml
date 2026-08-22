@@ -59,6 +59,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["NSS
 tempfile = "3"
 proptest = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [profile.release]
 lto = "thin"

@@ -54,6 +54,7 @@ async fn run(
         audit: Some(audit),
         revision: 1,
         tunnel_endpoint: None,
+        expected_ddl_targets: None,
     })
     .await
     .map_err(|e| e.to_string())
@@ -117,6 +118,7 @@ async fn error_paths_and_types() {
             audit: Some(audit.clone()),
             revision,
             tunnel_endpoint: None,
+            expected_ddl_targets: None,
         })
         .await
         .unwrap();
@@ -234,6 +236,7 @@ async fn error_paths_and_types() {
         audit: Some(audit2),
         revision: 1,
         tunnel_endpoint: None,
+        expected_ddl_targets: None,
     })
     .await;
     match outcome {

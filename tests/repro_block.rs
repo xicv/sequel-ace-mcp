@@ -45,6 +45,7 @@ async fn mysql_via_blocking_gate_like_server() {
                     audit: None,
                     revision: 1,
                     tunnel_endpoint: None,
+                    expected_ddl_targets: None,
                 })
                 .await
             })

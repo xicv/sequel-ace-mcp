@@ -6,16 +6,28 @@ verified**, **blocked**.
 
 ## Session 6 (D4, D5, D7, D8 — the Phase-D safety envelope)
 
-Audit-note status for checkpoint #2 (`a2fce08`), carried verbatim:
-`MIMOSA_GATE=explicitly waived by local user`;
-`REASON=cross-worktree false positive on legacy OpenSSH
-hashed-known-host compatibility`;
-`COMMIT_METHOD=manual commit object construction + atomic ref update`;
-`NORMAL_HOOKS_EXECUTED=false`; `COMMIT_SIGNATURE=unsigned-or-unverified`
-(git verify-commit failed; recorded as fact, history not rewritten);
-reconstructed `git diff 44a0606 a2fce08` byte-identical to the preserved
-patch (sha256 `15cd102d…`); bundle three-way match; remote
-`ls-remote` empty (PUSHED=false).
+Permanent audit record for checkpoints #2 (`a2fce08`) and #3 (`ec9a64c`),
+both landed by disclosed `hash-object` + `update-ref` under explicit
+per-commit user approval (there is NO standing approval — every future
+commit must use a normal Terminal `git commit`):
+
+```text
+NORMAL_COMMIT_HOOKS_EXECUTED=false
+MIMOSA_GATE_PASSED=false
+MIMOSA_GATE_WAIVED_FOR_THIS_COMMIT=true
+COMMIT_SIGNATURE=unsigned-or-unverified
+TREE_INTEGRITY=verified
+```
+
+Provenance precision (per review): the method is tree-equivalent to the
+verified index (correct parent, approved message, configured author and
+committer identity, atomic branch-ref advancement, no history rewrite) —
+not byte-identical to what a normal `git commit` would have produced
+(a normal commit could differ in timestamps/timezone/signature/encoding
+headers). Reconstructed `git diff` between checkpoints matches the
+preserved staged patches byte-for-byte (#2: sha256 15cd102d…; #3:
+fa59bbc4…); bundles verified three-way; remote `ls-remote` empty
+(PUSHED=false).
 
 - **D4 (DDL semantics) verified automatically on both engines**
   (`tests/mysql_d4.rs` + `src/sql/ddl.rs`):
@@ -40,13 +52,18 @@ patch (sha256 `15cd102d…`); bundle three-way match; remote
     CREATE … AS SELECT, CREATE TEMPORARY TABLE; journal states verified
     (no-op + not-found recorded as failed-with-detail; successes
     finalized with backup linkage).
-  - D2 fix carried in this session: MySQL 8.4 does not interrupt
-    `SLEEP()` mid-sleep via KILL QUERY (MariaDB does), so the mutating
-    timeout test now uses a 100k-row full-scan UPDATE — genuinely
+  - D2 fix carried in this session: KILL QUERY **does** interrupt
+    `SLEEP()` on MySQL 8.4 — when SLEEP() is the sole expression,
+    interruption returns the documented sentinel value `1` (Ok(1)) rather
+    than a query error (error only when SLEEP is part of a larger
+    statement); MariaDB interrupts with an error. The mutating-timeout
+    test therefore uses a 100k-row full-scan UPDATE — genuinely
     interruptible between rows — and re-verifies no-commit via a
-    `value <> 100` count plus a process-list check. Also made the
-    deadline contract strict: any completion arriving after the deadline
-    (including a benign Ok from a killed SLEEP) reports `Timeout`.
+    `value <> 100` count plus a process-list check. The deadline contract
+    is strict and this is the correct reading of the observed Ok(1):
+    the server-side cancellation worked (sentinel received), the client
+    result arrived after the application deadline, and the application
+    therefore returned `Timeout`.
 - **D5 (boundary types) verified automatically on both engines**
   (`tests/mysql_d5.rs`): BIGINT UNSIGNED max / signed min (lossless
   strings), DECIMAL(65,30) max precision + zero scale + negative,
@@ -88,6 +105,238 @@ patch (sha256 `15cd102d…`); bundle three-way match; remote
   both-engine matrix (16 live test results incl. D4+D5) exit 0; zero
   orphan debug processes (the user's live npm sequel-mcp instances were
   never touched — cleanup was scoped to `target/debug/sequel-mcp`).
+
+## Session 6A (checkpoint #3 residual corrections: D4A, D7A, D8A)
+
+Checkpoint #3 was re-verified independently at session start (HEAD ==
+`ec9a64c…`, parent == `a2fce08…`, tree+index clean, `fsck --strict`,
+reconstructed patch byte-identical to the preserved artifact, bundle
+three-way match, `ls-remote` empty). Reviewer-named copies created:
+`rust-rewrite-checkpoint-3-staged.patch`, `rust-rewrite-checkpoint-3.bundle`.
+
+- **D4A (DDL edge semantics) verified automatically on both engines**
+  (`tests/mysql_d4.rs::d4a_multi_target_and_rename_matrix` + `ddl.rs`):
+  - Literal `TRUNCATE … IF EXISTS` is **rejected at classification**
+    (sqlparser accepts it; neither MySQL 8.4 nor MariaDB supports the
+    grammar — executing would be a server syntax error).
+  - Multi-target DROP normalization across engines: `DROP a, missing`
+    (no IF EXISTS) → typed `DdlNotFound`, **nothing executed on either
+    engine** (stricter than MariaDB's native partial drop); `DROP IF
+    EXISTS existing, missing` → new `DdlPreflight::Mixed` — snapshot and
+    execute the complete approved existing set, surface the absent list
+    as `ddlAbsentTargets` in the result and journal the detail line;
+    `DROP IF EXISTS missing1, missing2` → audited local no-op with the
+    full absent list.
+  - RENAME chains model left-to-right: source must exist, destination
+    must be absent, both **chain-aware** (swap chains `a→tmp, b→a,
+    tmp→b` pass); destination-exists → typed Conflict error;
+    missing-source → typed NotFound; qualified cross-schema rename
+    resolved and tested. (Authorization already covers both old and new
+    identities via the classifier's mutated-table set.)
+  - Journal fix found by the new tests: backup-less operations (CREATE,
+    insert-hint) were stuck in `backup_capturing` because the state
+    machine only allowed `backup_capturing → backup_durable`. The
+    transition `backup_capturing → mutation_executing` is now legal for
+    backup-less paths (with unit tests updated).
+- **D7A (modern MCP lifecycle) verified automatically**
+  (`tests/mcp_lifecycle.rs`, real binary):
+  - `server/discover` with modern `_meta`: `supportedVersions` includes
+    2026-07-28; server identity in the response `_meta`.
+  - Modern per-request `_meta` tools/list and tools/call succeed with
+    **no initialize**; results carry `resultType`/`ttlMs`/`cacheScope`.
+  - Unsupported protocol version → typed `-32022` with
+    `data.requested`/`data.supported`.
+  - **Full MRTR approval lifecycle** (implemented in `mcp::mrtr` +
+    `tools.rs::call_sql_modern`): rmcp's stdio server does not
+    propagate modern `_meta` capabilities into its legacy elicit path,
+    so modern-era approvals use MRTR directly — first call returns
+    `resultType: input_required` with an `elicitation/create` input
+    request (redacted SQL + affected tables) and a one-shot
+    `requestState`; the retry echoes the state plus `inputResponses`
+    and executes through the normal gate with the pre-decided outcome.
+    (The 6A token format was a base64 JSON envelope; Session 6B
+    replaced it with server-side opaque handles — see the 6B record for
+    the design and the full negative matrix.)
+  - Oversized request (~2 MiB): the deterministic contract is now
+    asserted as "the follow-up valid request MUST be answered" (rmcp
+    treats the giant line as a parsable request and answers or errors
+    it; stream integrity is what matters).
+  - **rmcp documented/current malformed-line behavior** (rust-sdk issue
+    #938, `receive_ignores_parse_error` pins it): invalid stdio lines are
+    ignored — no JSON-RPC `-32700` parse-error frame is sent — because
+    responding to unparseable input can loop with broken clients; this is
+    the majority-SDK behavior, not a sequel-mcp or rmcp defect. Our
+    contract asserts the security-relevant properties: a malformed line
+    does not crash the server, produces no stdout contamination, and the
+    next valid request is processed normally. No local `-32700` layer is
+    added on top of rmcp.
+- **D8A (benchmarks, isolated) verified automatically** — every spawned
+  process now runs against a **temporary XDG config/data tree** under
+  the shared fail-closed isolation entry; the real user config
+  (production connections) and real audit DB are never read or written
+  by benchmarks. **Result classification: development/debug-profile,
+  same-machine directional comparison only — not a release performance
+  claim; a release/LTO rerun with identical methodology is required
+  before the packaging gate.** Methodology recorded: `PROFILE=debug`,
+  `MAC=Mac15,6`, `ARCH=arm64`, `MACOS=26.5.2`, `SAMPLES=30` (warm-cache
+  priming ×3 before sampling; medians/p95/max over n; identical
+  readiness definition and isolation for the Node baseline —
+  `scripts/bench-node.mjs`, same rules):
+  - Process: `RUST_COLD_INIT median=5.40ms p95=6.14ms`,
+    `RUST_COLD_TO_TOOLS_LIST median=7.81ms p95=9.86ms`,
+    `RUST_WARM_TOOLS_LIST median=1.22ms p95=1.98ms max=2.17ms`,
+    `RUST_MCP_SQLITE_QUERY_FIRST3 median=2.23ms`,
+    `RUST_MCP_SQLITE_QUERY_WARM median=1.84ms p95=2.05ms`.
+  - Node baseline (same harness): `NODE_COLD_INIT median=190.89ms
+    p95=204.23ms`, `NODE_COLD_TO_TOOLS_LIST median=195.11ms
+    p95=207.77ms` — Rust initializes ~35× faster at median.
+  - Live (docker only): MariaDB 11 `FIRST_QUERY=28.27ms`,
+    `WARM_SELECT median=1.33ms p95=4.16ms`, `POOL_COUNT=1`,
+    `CANCEL_LATENCY median=1.84ms past deadline`, `AUDIT_WRITE
+    median=0.06ms p95=0.10ms`; MySQL 8.4 `FIRST_QUERY=29.96ms`,
+    `WARM_SELECT median=1.08ms p95=1.38ms`, `POOL_COUNT=1`,
+    `CANCEL_LATENCY median=1.01ms`, `AUDIT_WRITE median=0.06ms`.
+    Pool metrics: 1 pool per engine (physical reuse proven via
+    CONNECTION_ID in D1); pool initialization cost = FIRST_QUERY minus
+    warm (~27-29 ms). **`AUDIT_WRITE` semantics**: the audit DB uses
+    SQLite `journal_mode=WAL` + `synchronous=NORMAL`
+    (`src/audit/db.rs::apply_pragmas`), so 0.06 ms measures API +
+    transaction completion (WAL append), **not a durable fsync**.
+- **Production-config contamination incident (disclosed; isolation
+  failure near miss)**: before the isolation fix, `scripts/bench-mcp.sh`
+  spawned the binary with an unmodified environment, so a benchmark
+  process inherited and read the developer's real configuration. A
+  cancelled benchmark phase attempted a synthetic read against the
+  production default connection. Verified read-only afterwards: exactly
+  **one** audit row was written (2026-08-22, outcome `execution_error` —
+  "pool initialization failed: connect timeout after 15s"). Accurate
+  incident classification:
+  `INCIDENT_CLASS=test/benchmark environment isolation failure`;
+  `LOCAL_REAL_CONFIG_READ=confirmed`; `LOCAL_REAL_AUDIT_WRITE=confirmed`;
+  `SERVER_CONNECTION=not observed`; `SQL_EXECUTION_ON_SERVER=not
+  observed`; `DATABASE_DATA_READ_OR_WRITE=not observed`. **No evidence of
+  a production server connection or data access was observed; the
+  confirmed effects are the local real-config read and the single local
+  audit-row write** (the 15 s connect deadline rejected the attempt
+  before a connection was observed). The audit row is preserved (deleting
+  it would break the audit chain); no credentials were observed leaked,
+  so password rotation is not indicated by this event alone. Incident
+  note (redacted) carried in the audit-adjacent record:
+  "A benchmark process inherited the developer's normal configuration.
+  The attempted synthetic read failed during pool initialization before
+  a database connection was observed. No production query execution or
+  database data access was observed. Test and benchmark processes now
+  run under a fail-closed isolated environment." The durable fix is
+  executable, not procedural: the shared isolation entry
+  (`scripts/lib/isolated-test-env.sh`), clean-env spawns in every test
+  harness, and binary-side `SEQUEL_MCP_TEST_MODE=1` fail-closed
+  enforcement (see Session 6B) — with regression tests proving a child
+  cannot load the parent config and cannot reach a non-loopback
+  endpoint.
+
+## Session 6B (checkpoint #3A gate items: MRTR sealing, DDL TOCTOU, isolation as code)
+
+Response to the checkpoint-#3A review. The three commit-gate conditions
+are each closed with executable evidence:
+
+- **MRTR `requestState` is now a server-side opaque handle** (review
+  option A; `src/mcp/mrtr.rs`): the wire token is only base64url of a
+  256-bit random value. Every binding — tool, connection, operation
+  digest, policy revision, DDL plan targets, absolute expiry — lives in
+  an in-process bounded pending store (capacity 32, oldest evicted;
+  consumed-token tombstones capped at 256; `Debug` redacted; process
+  exit invalidates everything; atomic single-use consumption under one
+  lock — a token found is consumed even when validation then fails, so
+  one echo = one attempt). Nothing on the wire is trusted, so nothing
+  needs to be unforgeable offline; a crafted state is simply unknown.
+  All retry failures are TYPED with machine-readable codes —
+  `[mrtr_invalid_state]` (malformed/truncated/oversized/foreign/
+  cross-tool/cross-connection/operation-changed), `[mrtr_expired]`,
+  `[mrtr_policy_changed]`, `[mrtr_already_consumed]` — never a plain SQL
+  error. Binary-level negative matrix (real process, modern era):
+  single-char corruption, truncation, 64 KiB oversized state, state
+  issued for `execute` replayed through `query`, state issued on one
+  connection replayed on another, policy revision change between plan
+  and retry (an UNRELATED rule changes so the statement itself stays
+  confirm-gated — proving the typed `policy_changed` path), process
+  restart invalidating all state, and two pipelined retries racing to
+  consume one state (exactly one executes, exactly one reports
+  `already_consumed`; responses may legitimately arrive out of order,
+  which the harness now buffers instead of discarding).
+- **Mixed `DROP IF EXISTS` executes only the preflight-approved subset**
+  (D4A TOCTOU closure; `src/sql/ddl.rs::rewrite_drop_subset` +
+  `mysql.rs`): the executor never re-sends the original multi-target
+  statement — it executes a REWRITTEN `DROP TABLE/VIEW IF EXISTS` naming
+  exactly the confirmed-existing targets (fully qualified,
+  backtick-escaped; unsupported object types fail closed). Results and
+  the operation journal record both `ddlExecutedTargets` and
+  `ddlAbsentTargets`. For the MRTR plan→retry gap the plan-time
+  preflight fixes the approved target set BEFORE the approval is issued
+  (the input_required message shows the confirmed/absent split), and the
+  retry fails closed with typed `[ddl_precondition_changed] … nothing
+  executed; re-run for a fresh plan` if any target changed existence in
+  between — including the Present branch (a table created after the
+  plan cannot be dropped by the approved statement). Race tests: at
+  library level (plan → `CREATE TABLE` of the absent target → approved
+  execute → typed failure, both tables survive; fresh plan then drops
+  both) and end-to-end over the real binary + docker MySQL (modern-era
+  `input_required` with the plan split → create the absent target →
+  approved retry → `[ddl_precondition_changed]`, both survive → fresh
+  plan drops both) — verified on MariaDB 11 and MySQL 8.4.
+- **Isolation is an executable code gate, not a memory note**
+  (`scripts/lib/isolated-test-env.sh` + `src/app/test_mode.rs`): one
+  shared entry (fresh 0700 root; `env -i`/explicit-env-map spawns —
+  nothing inherited, which by construction scrubs
+  SEQUEL_MCP_CONFIG_PATH/AUDIT_PATH, DATABASE_URL, MYSQL_*, NODE_OPTIONS,
+  npm_config_*; SSH_AUTH_SOCK only via future explicit opt-in) used by
+  bench-mcp.sh, test-db.sh, test-mcp-lifecycle.sh and bench-node.mjs.
+  Binary-side fail-closed `SEQUEL_MCP_TEST_MODE=1` (inactive and
+  ineffective in production runs): requires `SEQUEL_MCP_TEST_ROOT` and
+  terminates BEFORE MCP startup (exit 78, zero stdout) unless HOME,
+  config, data, audit and runtime paths all resolve under it; MySQL
+  endpoints must be loopback or explicitly allow-listed
+  (`SEQUEL_MCP_TEST_ALLOWED_ENDPOINTS`), refused at the pool choke
+  point BEFORE any socket is opened; SQLite paths must be under the
+  root; the production Keychain is unavailable (in-memory store,
+  optionally seeded from `SEQUEL_MCP_TEST_SECRETS` synthetic values).
+  Regression tests (real binary): a parent-style "real" config with a
+  non-loopback default connection is never loaded (doctor reports an
+  empty connection list; the real tree is byte-identical afterwards); a
+  non-loopback endpoint fails with the typed refusal in milliseconds —
+  faster than any possible connect attempt (the D1 15 s blackhole probe
+  still passes via the explicit allow-list, exercising that path); an
+  outside-root SQLite path is refused without creating the file; a data
+  root escaping the test root exits 78 pre-startup with no protocol
+  bytes. Every test/bench child prints its isolated root
+  (`ISO_ROOT=…`), and the binary itself announces
+  `test mode active, isolated root …` on stderr.
+- **Deterministic input bounds** (`src/mcp/limits.rs`):
+  `MAX_MCP_LINE_BYTES` (1 MiB), `MAX_TOOL_ARGUMENT_BYTES` (256 KiB),
+  `MAX_REQUEST_STATE_BYTES` (1 KiB), `MAX_INPUT_RESPONSES_BYTES`
+  (64 KiB). stdin passes through a streaming line-limit adapter
+  (`LineLimited`) that buffers at most limit+1 bytes per line BEFORE any
+  byte is emitted, so an oversized line is discarded WHOLE — including
+  its in-limit prefix, which must never reach the codec (a parseable
+  prefix would execute) — while memory stays bounded by the fixed
+  limit-sized buffer no matter how long the incoming line is. A line of
+  exactly the limit passes with its terminator. Boundary tests: limit−1
+  and limit answered; limit+1 dropped with no response and the next
+  request answered; a no-newline over-long line followed by its
+  newline dropped whole; a slow chunk-by-chunk oversized sender
+  discarded incrementally; EOF mid-oversized-line exits promptly.
+  Response-ID integrity (the rmcp #941 concern): 50 pipelined
+  `tools/call` mixing small queries with ~600 KB responses — every
+  request id answered exactly once, none duplicated, none missing,
+  server usable afterwards, clean EOF exit. Two adapter bugs were found
+  and fixed by these tests (an in-limit prefix leak that corrupted
+  framing, and a carried-over complete line stalling until the next
+  input — both now unit-regression-tested).
+- Gates after 6B: 132 lib unit tests; 15 lifecycle/isolation binary
+  tests; both-engine docker matrix 16/16 groups green (D1 blackhole via
+  the allow-list; D4 suite now 4 tests incl. both race tests);
+  `scripts/test-mcp-lifecycle.sh` green under the isolation wrapper.
+  Remaining gates (fmt/clippy/gitleaks/patch SHA) recorded in the
+  checkpoint-#3A preservation artifacts.
 
 ## Session 5 record — unchanged summary
 
