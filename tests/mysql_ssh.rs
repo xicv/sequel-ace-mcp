@@ -953,6 +953,257 @@ async fn ssh_bench_cold_warm() {
     eprintln!("BENCH_CLASS=development/directional (debug profile, docker topology)");
 }
 
+// ---- Docker bridge (exec-channel forwarding). Phase F of the script
+// disables AllowTcpForwarding entirely, so every test below proves the
+// `docker exec -i <container> nc|socat …` exec path — direct-tcpip
+// cannot work in this phase. ----
+
+fn bridge_enabled() -> Option<String> {
+    if std::env::var("SEQUEL_MCP_TEST_SSH_BRIDGE").ok().as_deref() != Some("1") {
+        return None;
+    }
+    std::env::var("SEQUEL_MCP_TEST_SSH_BRIDGE_CONTAINER").ok()
+}
+
+fn bridge_tunnel(
+    fx: &Fixture,
+    known_hosts: &std::path::Path,
+    auth: SshAuthMethod,
+    container: &str,
+    tool: sequel_mcp::config::BridgeTool,
+) -> SshTunnel {
+    SshTunnel {
+        docker: Some(sequel_mcp::config::SshDocker {
+            container: container.to_string(),
+            bridge_tool: tool,
+        }),
+        ..ssh_tunnel_policy(fx, known_hosts, auth, SshHostKeyPolicy::Strict)
+    }
+}
+
+/// In bridge mode the MySQL "host" is what the bridge tool connects to
+/// FROM INSIDE the database container — the in-container view.
+fn bridge_mysql_conn(ssh: Option<SshTunnel>, mysql_user: &str) -> MySqlConnection {
+    MySqlConnection {
+        host: "127.0.0.1".into(),
+        port: 3306,
+        ..mysql_conn(ssh, mysql_user)
+    }
+}
+
+async fn run_over_bridge(
+    fx: &Fixture,
+    conn: &MySqlConnection,
+    tunnel: &SshTunnel,
+    sql: &str,
+) -> Result<sequel_mcp::sql::mysql::ExecuteResult, SshError> {
+    let lease = ssh::tunnel_endpoint(
+        &conn.name,
+        tunnel,
+        Some(fx.ssh_password.as_str()),
+        &conn.host,
+        conn.port,
+        1,
+    )
+    .await?;
+    let policy = policy_from_preset(PolicyPresetName::Administration);
+    let classified = classify_statement(sql, Dialect::MySql).unwrap();
+    let dir = tempfile::TempDir::new().unwrap();
+    let audit =
+        Arc::new(sequel_mcp::audit::AuditDb::at_path(&dir.path().join("a.sqlite")).unwrap());
+    std::mem::forget(dir);
+    execute_mysql_statement(MySqlExecuteParams {
+        connection: conn,
+        request_id: format!("req-{}", uuid::Uuid::new_v4()),
+        databases_for_log: vec![],
+        password: Zeroizing::new(fx.mysql_password.clone()),
+        sql,
+        classified: &classified,
+        policy: &policy,
+        database: None,
+        audit: Some(audit),
+        revision: 1,
+        tunnel_endpoint: Some(lease),
+        expected_ddl_targets: None,
+    })
+    .await
+    .map_err(|e| SshError::Transport(e.to_string()))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_nc_roundtrip_password() {
+    let Some(fx) = fixture() else {
+        eprintln!("skipping: SEQUEL_MCP_TEST_SSH_* not set");
+        return;
+    };
+    let Some(container) = bridge_enabled() else {
+        eprintln!("skipping: bridge phase not active");
+        return;
+    };
+    ssh::invalidate_all();
+    pool_manager().invalidate_all();
+    let tunnel = bridge_tunnel(
+        &fx,
+        &fx.known_good,
+        SshAuthMethod::Password,
+        &container,
+        sequel_mcp::config::BridgeTool::Nc,
+    );
+    let conn = bridge_mysql_conn(Some(tunnel.clone()), &fx.mysql_user);
+    let r = run_over_bridge(&fx, &conn, &tunnel, "SELECT 21 AS v")
+        .await
+        .unwrap();
+    assert_eq!(int_cell(&r.rows[0]["v"]), 21, "through the nc bridge");
+
+    // Reuse: a second query rides the SAME multiplexed session.
+    let r = run_over_bridge(&fx, &conn, &tunnel, "SELECT 22 AS v")
+        .await
+        .unwrap();
+    assert_eq!(int_cell(&r.rows[0]["v"]), 22);
+    assert_eq!(ssh::tunnel_count(), 1, "one bridged session");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_socat_roundtrip_key() {
+    let Some(fx) = fixture() else {
+        eprintln!("skipping: SEQUEL_MCP_TEST_SSH_* not set");
+        return;
+    };
+    let Some(container) = bridge_enabled() else {
+        eprintln!("skipping: bridge phase not active");
+        return;
+    };
+    ssh::invalidate_all();
+    pool_manager().invalidate_all();
+    let mut tunnel = bridge_tunnel(
+        &fx,
+        &fx.known_good,
+        SshAuthMethod::Key,
+        &container,
+        sequel_mcp::config::BridgeTool::Socat,
+    );
+    tunnel.private_key_path = Some(fx.key_path.display().to_string());
+    let conn = bridge_mysql_conn(Some(tunnel.clone()), &fx.mysql_user);
+    let r = run_over_bridge(&fx, &conn, &tunnel, "SELECT 23 AS v")
+        .await
+        .unwrap();
+    assert_eq!(int_cell(&r.rows[0]["v"]), 23, "through the socat bridge");
+}
+
+/// A nonexistent container: the exec fails, the channel closes, the
+/// MySQL handshake fails — typed, bounded, nothing cached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_wrong_container_bounded_failure() {
+    let Some(fx) = fixture() else {
+        eprintln!("skipping: SEQUEL_MCP_TEST_SSH_* not set");
+        return;
+    };
+    if bridge_enabled().is_none() {
+        eprintln!("skipping: bridge phase not active");
+        return;
+    }
+    ssh::invalidate_all();
+    pool_manager().invalidate_all();
+    let tunnel = bridge_tunnel(
+        &fx,
+        &fx.known_good,
+        SshAuthMethod::Password,
+        "no-such-container",
+        sequel_mcp::config::BridgeTool::Nc,
+    );
+    let conn = bridge_mysql_conn(Some(tunnel.clone()), &fx.mysql_user);
+    let started = std::time::Instant::now();
+    let err = run_over_bridge(&fx, &conn, &tunnel, "SELECT 1 AS v")
+        .await
+        .unwrap_err();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(25),
+        "bounded failure (took {:?})",
+        started.elapsed()
+    );
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("error") || msg.contains("no such") || msg.contains("timed out"),
+        "typed failure: {msg}"
+    );
+}
+
+/// Host-key verification is transport-independent: a bridged connection
+/// with a mismatched known_hosts entry is refused before anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_strict_host_key_still_enforced() {
+    let Some(fx) = fixture() else {
+        eprintln!("skipping: SEQUEL_MCP_TEST_SSH_* not set");
+        return;
+    };
+    let Some(container) = bridge_enabled() else {
+        eprintln!("skipping: bridge phase not active");
+        return;
+    };
+    ssh::invalidate_all();
+    let tunnel = bridge_tunnel(
+        &fx,
+        &fx.known_mismatch,
+        SshAuthMethod::Password,
+        &container,
+        sequel_mcp::config::BridgeTool::Nc,
+    );
+    let err = ssh::tunnel_endpoint(
+        "bridge-mismatch",
+        &tunnel,
+        Some(fx.ssh_password.as_str()),
+        "127.0.0.1",
+        3306,
+        1,
+    )
+    .await
+    .unwrap_err();
+    let msg = match &err {
+        SshError::Transport(m) => m.clone(),
+        SshError::HostKey { reason, .. } => reason.clone(),
+        other => panic!("expected host-key rejection, got {other:?}"),
+    };
+    assert!(
+        msg.contains("connect to bastion") || msg.contains("key"),
+        "strict host key enforced on the bridge path: {msg}"
+    );
+    assert_eq!(ssh::tunnel_count(), 0);
+}
+
+/// Control: with AllowTcpForwarding disabled (this phase), the DIRECT
+/// (non-bridge) path must FAIL — proving the bridge tests above really
+/// exercise the exec channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_control_direct_tcpip_refused_when_forwarding_off() {
+    let Some(fx) = fixture() else {
+        eprintln!("skipping: SEQUEL_MCP_TEST_SSH_* not set");
+        return;
+    };
+    if bridge_enabled().is_none() {
+        eprintln!("skipping: bridge phase not active");
+        return;
+    }
+    ssh::invalidate_all();
+    pool_manager().invalidate_all();
+    let tunnel = ssh_tunnel(&fx, &fx.known_good, SshAuthMethod::Password);
+    let conn = mysql_conn(Some(tunnel.clone()), &fx.mysql_user);
+    let started = std::time::Instant::now();
+    let err = run_through_tunnel(&fx, &conn, &tunnel, "SELECT 1 AS v")
+        .await
+        .unwrap_err();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(25),
+        "bounded refusal"
+    );
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("administratively prohibited")
+            || msg.contains("error")
+            || msg.contains("timed out"),
+        "direct-tcpip refused while forwarding is off: {msg}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssh_gate_end_to_end_with_secrets() {
     let Some(fx) = fixture() else {

@@ -91,6 +91,14 @@ case "$WHAT" in
   *)
     DB_IMAGE="mariadb:11"
     DB_TLS=0
+    # Derived image with the bridge tools INSIDE the DB container (the
+    # bridge execs `docker exec -i <db> nc|socat …` from the bastion).
+    DB_BUILD="$(mktemp -d)"
+    printf 'FROM mariadb:11\nRUN apt-get update -qq && apt-get install -qq -y netcat-openbsd socat >/dev/null && rm -rf /var/lib/apt/lists/*\n' \
+      >"$DB_BUILD/Dockerfile"
+    docker build -q -t "sqm-db-bridge:$STAMP" "$DB_BUILD" >/dev/null
+    rm -rf "$DB_BUILD"
+    DB_IMAGE="sqm-db-bridge:$STAMP"
     ;;
 esac
 
@@ -125,7 +133,7 @@ cat >"$SSHD_BUILD/Dockerfile" <<'DOCKER'
 # base image is byte-stable across runs; the running sshd version is
 # printed below.
 FROM alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
-RUN apk add --no-cache openssh-server openssh-client iptables
+RUN apk add --no-cache openssh-server openssh-client iptables docker-cli
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
@@ -143,6 +151,11 @@ printf '%s\n' "$PUBLIC_KEY" > "/home/$USER_NAME/.ssh/authorized_keys"
 chown -R "$USER_NAME" "/home/$USER_NAME/.ssh"
 chmod 700 "/home/$USER_NAME/.ssh"
 chmod 600 "/home/$USER_NAME/.ssh/authorized_keys"
+# The bridge execs `docker exec` as the session user; the TEST bastion
+# opens the mounted socket to all (production bastions instead grant
+# the SSH user docker-group access — an ops prerequisite for the
+# bridge, recorded in VERIFICATION.md).
+chmod 666 /var/run/docker.sock 2>/dev/null || true
 cat >/etc/ssh/sshd_config <<'SSHD'
 Port 2222
 ListenAddress 0.0.0.0
@@ -176,6 +189,7 @@ rm -rf "$SSHD_BUILD"
 
 docker run -d --name "$SSHD_CONTAINER" --network "$NETWORK" \
   --cap-add NET_ADMIN \
+  -v /var/run/docker.sock:/var/run/docker.sock \
   -p "127.0.0.1:$SSH_PORT:2222" \
   -e USER_NAME="$SSH_USER" -e USER_PASSWORD="$SSH_PASSWORD" \
   -e PUBLIC_KEY="$PUB_KEY" \
@@ -388,6 +402,26 @@ fi
 # Recovery after the blackhole clears.
 cargo test --test mysql_ssh ssh_blackhole_recovery -- \
   --exact --test-threads=1
+
+# ---- Phase F: Docker bridge (exec-channel forwarding) — runs with
+# AllowTcpForwarding DISABLED so the tests prove traffic flows through
+# `docker exec -i <container> nc|socat …` exec channels on the bastion,
+# not direct-tcpip. Mariadb variant only: the bridge tools live inside
+# the derived DB image; the mysql84+TLS variant exercises the direct
+# path (the bridge sits below the MySQL protocol and is engine-agnostic).
+if [ "$DB_TLS" != "1" ]; then
+export SEQUEL_MCP_TEST_SSH_BRIDGE=1
+export SEQUEL_MCP_TEST_SSH_BRIDGE_CONTAINER="$DB_CONTAINER"
+docker exec "$SSHD_CONTAINER" sed -i 's/^AllowTcpForwarding local/AllowTcpForwarding no/' /etc/ssh/sshd_config
+docker exec "$SSHD_CONTAINER" pkill -HUP sshd || true
+sleep 1
+echo "==> bridge phase: $(docker exec "$SSHD_CONTAINER" grep -i '^AllowTcpForwarding' /etc/ssh/sshd_config)"
+cargo test --test mysql_ssh bridge_ -- --test-threads=1
+docker exec "$SSHD_CONTAINER" sed -i 's/^AllowTcpForwarding no/AllowTcpForwarding local/' /etc/ssh/sshd_config
+docker exec "$SSHD_CONTAINER" pkill -HUP sshd || true
+sleep 1
+unset SEQUEL_MCP_TEST_SSH_BRIDGE SEQUEL_MCP_TEST_SSH_BRIDGE_CONTAINER
+fi
 
 # ---- Optional bench phase (SSH cold/warm) ----
 if [ "${SEQUEL_MCP_TEST_SSH_BENCH:-0}" = "1" ]; then
