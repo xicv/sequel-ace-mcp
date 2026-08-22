@@ -1957,6 +1957,204 @@ impl ServerHandler for SequelServer {
         super::build_server_info()
     }
 
+    // ---- Prompts (legacy `server/prompts.ts` parity) ----
+
+    fn list_prompts(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl Future<Output = Result<rmcp::model::ListPromptsResult, rmcp::ErrorData>> + '_ {
+        use rmcp::model::{Prompt, PromptArgument};
+        let setup = Prompt::new(
+            "setup-connection",
+            Some("Walks through adding either a MySQL/MariaDB connection with Keychain password capture or a SQLite file connection with no password."),
+            Some(vec![PromptArgument::new("suggestedName")
+                .with_title("Suggested name")
+                .with_description("Optional name to prefill")]),
+        )
+        .with_title("Set up a new database connection");
+        let analyze = Prompt::new(
+            "analyze-table",
+            Some("Read-only investigation: schema, row count, indexes, sample rows."),
+            Some(vec![
+                PromptArgument::new("connection")
+                    .with_title("Connection")
+                    .with_required(true),
+                PromptArgument::new("database").with_title("Database"),
+                PromptArgument::new("table")
+                    .with_title("Table")
+                    .with_required(true),
+            ]),
+        )
+        .with_title("Analyze a table");
+        std::future::ready(Ok(rmcp::model::ListPromptsResult::with_all_items(vec![
+            setup, analyze,
+        ])))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: rmcp::model::GetPromptRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::GetPromptResponse, rmcp::ErrorData> {
+        use rmcp::model::{GetPromptResult, PromptMessage, Role};
+        let arg = |k: &str| -> Option<String> {
+            request
+                .arguments
+                .as_ref()
+                .and_then(|a| a.get(k))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        let (text, description): (String, Option<&str>) = match request.name.as_str() {
+            "setup-connection" => {
+                let name = arg("suggestedName");
+                let named = match &name {
+                    Some(n) => format!(" called \"{n}\""),
+                    None => String::new(),
+                };
+                (
+                    format!(
+                        "I want to add a new database connection{named}.\n\n\
+First ask whether it is MySQL/MariaDB or SQLite. For MySQL/MariaDB, use \"add_connection\" and ask for: name, host, port (default 3306), user, database (optional), ssl (default false), policy preset (read-only | dev | admin), and optional SSH tunnel (host/port/user/keyPath). The tool will then prompt me for the password via elicitation. Do NOT include the password in the tool arguments. For SQLite, use \"add_sqlite_connection\" and ask for name, path, database/schema (usually main), and policy preset; no password is used."
+                    ),
+                    Some("Set up a new database connection"),
+                )
+            }
+            "analyze-table" => {
+                let Some(connection) = arg("connection") else {
+                    return Err(rmcp::ErrorData::invalid_params(
+                        "missing required argument \"connection\"",
+                        None,
+                    ));
+                };
+                let Some(table) = arg("table") else {
+                    return Err(rmcp::ErrorData::invalid_params(
+                        "missing required argument \"table\"",
+                        None,
+                    ));
+                };
+                let database = arg("database");
+                let in_db = match &database {
+                    Some(d) => format!(" in database `{d}`"),
+                    None => String::new(),
+                };
+                (
+                    format!(
+                        "Analyze table `{table}`{in_db} on connection \"{connection}\". \
+Use only read-only tools: describe_table, list_databases, and query (SELECT/SHOW or read-only SQLite PRAGMA only). Specifically: \
+1) describe schema, 2) inspect indexes (SHOW INDEX for MySQL/MariaDB; PRAGMA index_list/index_info for SQLite), 3) SELECT COUNT(*), 4) SELECT * LIMIT 5. Summarize findings."
+                    ),
+                    Some("Analyze a table"),
+                )
+            }
+            other => {
+                return Err(rmcp::ErrorData::invalid_params(
+                    format!("unknown prompt: {other:?}"),
+                    None,
+                ));
+            }
+        };
+        Ok(rmcp::model::GetPromptResponse::from(
+            GetPromptResult::new(vec![PromptMessage::new_text(Role::User, text)])
+                .with_description(description.unwrap_or_default()),
+        ))
+    }
+
+    // ---- Resources (legacy `server/resources.ts` parity) ----
+
+    fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> impl Future<Output = Result<rmcp::model::ListResourcesResult, rmcp::ErrorData>> + '_ {
+        let resource = rmcp::model::Resource::new("sequel-mcp://connections", "connections")
+            .with_title("Configured connections")
+            .with_description("JSON listing of saved connections (no secrets).")
+            .with_mime_type("application/json");
+        std::future::ready(Ok(rmcp::model::ListResourcesResult::with_all_items(vec![
+            resource,
+        ])))
+    }
+
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResponse, rmcp::ErrorData> {
+        use rmcp::model::{ReadResourceResult, ResourceContents};
+        if request.uri != *"sequel-mcp://connections" {
+            return Err(rmcp::ErrorData::invalid_params(
+                format!("unknown resource: {:?}", request.uri),
+                None,
+            ));
+        }
+        let cfg = self
+            .ctx
+            .config
+            .load()
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        let presets: Vec<&str> = crate::policy::model::POLICY_PRESET_NAMES.to_vec();
+        let items: Vec<serde_json::Value> = cfg
+            .connections
+            .iter()
+            .map(|c| {
+                let (host, port, user, ssh_json) = match c {
+                    crate::config::Connection::Mysql(m) => {
+                        let ssh_json = m.ssh.as_ref().map(|ssh| {
+                            json!({
+                                "host": ssh.host,
+                                "user": ssh.user,
+                                "docker": ssh.docker.as_ref().map(|d| json!({
+                                    "container": d.container,
+                                    "bridgeTool": d.bridge_tool.as_str(),
+                                })),
+                            })
+                        });
+                        (json!(m.host), json!(m.port), json!(m.user), ssh_json)
+                    }
+                    crate::config::Connection::Sqlite(_) => (
+                        serde_json::Value::Null,
+                        serde_json::Value::Null,
+                        serde_json::Value::Null,
+                        None,
+                    ),
+                };
+                let has_password = c.is_mysql()
+                    && self
+                        .ctx
+                        .secrets
+                        .has_password(c.name(), mysql_user(c).as_deref().unwrap_or(""));
+                json!({
+                    "name": c.name(),
+                    "driver": if c.is_mysql() { "mysql" } else { "sqlite" },
+                    "host": host,
+                    "port": port,
+                    "user": user,
+                    "path": if c.is_mysql() { serde_json::Value::Null } else {
+                        match c {
+                            crate::config::Connection::Sqlite(s) => json!(s.path),
+                            _ => serde_json::Value::Null,
+                        }
+                    },
+                    "database": c.database(),
+                    "ssh": ssh_json,
+                    "policy": c.policy(),
+                    "presets": presets,
+                    "hasPassword": has_password,
+                })
+            })
+            .collect();
+        let text = serde_json::to_string_pretty(&json!({ "connections": items }))
+            .unwrap_or_else(|_| "{\n  \"connections\": []\n}".into());
+        Ok(rmcp::model::ReadResourceResponse::from(
+            ReadResourceResult::new(vec![
+                ResourceContents::text(text, "sequel-mcp://connections")
+                    .with_mime_type("application/json"),
+            ]),
+        ))
+    }
+
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
