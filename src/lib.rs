@@ -9,6 +9,7 @@ pub mod approval;
 pub mod audit;
 pub mod backup;
 pub mod config;
+pub mod importer;
 pub mod mcp;
 pub mod policy;
 pub mod sql;

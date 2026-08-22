@@ -332,7 +332,7 @@ fn d7_lifecycle_legacy_and_tools() {
     );
     let msg = read_response(&mut out, 2, Duration::from_secs(10));
     let tools = msg["result"]["tools"].as_array().expect("tools");
-    assert_eq!(tools.len(), 21, "tool count");
+    assert_eq!(tools.len(), 27, "tool count");
     assert!(tools.iter().all(|t| t["name"].is_string()));
     assert!(tools.iter().any(|t| t["name"] == "query"));
 
@@ -382,7 +382,7 @@ fn d7_lifecycle_legacy_and_tools() {
     assert!(
         msg["result"]["tools"]
             .as_array()
-            .map(|t| t.len() == 21)
+            .map(|t| t.len() == 27)
             .unwrap_or(false),
         "server must keep answering after malformed input: {msg}"
     );
@@ -405,7 +405,7 @@ fn d7_lifecycle_legacy_and_tools() {
     let msg = read_response(&mut out, 6, Duration::from_secs(20));
     assert_eq!(
         msg["result"]["tools"].as_array().unwrap().len(),
-        21,
+        27,
         "follow-up after oversized input: {msg}"
     );
 
@@ -533,7 +533,7 @@ fn d7_modern_discover_meta_and_version_error() {
     );
     let msg = read_response(&mut out, 2, Duration::from_secs(10));
     assert_eq!(msg["result"]["resultType"], "complete");
-    assert_eq!(msg["result"]["tools"].as_array().unwrap().len(), 21);
+    assert_eq!(msg["result"]["tools"].as_array().unwrap().len(), 27);
 
     // Modern tools/call (read) succeeds without initialize.
     send(
@@ -1370,7 +1370,7 @@ fn d7_line_limit_boundaries() {
     let msg = read_response(&mut out, 10, Duration::from_secs(20));
     assert_eq!(
         msg["result"]["tools"].as_array().unwrap().len(),
-        21,
+        27,
         "{msg}"
     );
 
@@ -1381,7 +1381,7 @@ fn d7_line_limit_boundaries() {
     let msg = read_response(&mut out, 11, Duration::from_secs(20));
     assert_eq!(
         msg["result"]["tools"].as_array().unwrap().len(),
-        21,
+        27,
         "{msg}"
     );
 
@@ -1413,7 +1413,7 @@ fn d7_line_limit_boundaries() {
     let msg = read_response(&mut sink, 13, Duration::from_secs(20));
     assert_eq!(
         msg["result"]["tools"].as_array().unwrap().len(),
-        21,
+        27,
         "{msg}"
     );
 
@@ -1433,7 +1433,7 @@ fn d7_line_limit_boundaries() {
     let msg = read_response(&mut sink, 15, Duration::from_secs(20));
     assert_eq!(
         msg["result"]["tools"].as_array().unwrap().len(),
-        21,
+        27,
         "{msg}"
     );
 
@@ -1457,7 +1457,7 @@ fn d7_line_limit_boundaries() {
     let msg = read_response(&mut sink, 16, Duration::from_secs(30));
     assert_eq!(
         msg["result"]["tools"].as_array().unwrap().len(),
-        21,
+        27,
         "{msg}"
     );
     let _ = &mut stdin;
@@ -1609,7 +1609,7 @@ fn d7_concurrent_response_id_integrity() {
         &serde_json::json!({"jsonrpc": "2.0", "id": 999, "method": "tools/list"}),
     );
     let msg = read_response(&mut out, 999, Duration::from_secs(10));
-    assert_eq!(msg["result"]["tools"].as_array().unwrap().len(), 21);
+    assert_eq!(msg["result"]["tools"].as_array().unwrap().len(), 27);
 
     drop(stdin);
     let started = Instant::now();

@@ -2,6 +2,7 @@
 
 pub mod db;
 pub mod redactor;
+pub mod retention;
 
 use crate::approval::outcomes::ApprovalOutcome;
 use crate::policy::model::{PolicyAction, SqlCategory};

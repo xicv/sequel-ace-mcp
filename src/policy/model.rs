@@ -313,6 +313,18 @@ pub struct RetentionByCategory {
     pub tx_ctrl: u32,
 }
 
+impl RetentionByCategory {
+    pub fn get(&self, category: SqlCategory) -> u32 {
+        match category {
+            SqlCategory::Read => self.read,
+            SqlCategory::Write => self.write,
+            SqlCategory::Ddl => self.ddl,
+            SqlCategory::Admin => self.admin,
+            SqlCategory::TxCtrl => self.tx_ctrl,
+        }
+    }
+}
+
 impl Default for RetentionByCategory {
     fn default() -> Self {
         Self {
