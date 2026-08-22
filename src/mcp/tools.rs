@@ -159,6 +159,90 @@ pub struct BackupListParams {
     pub limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RestoreParams {
+    /// Backup id from list_backups.
+    pub backup_id: i64,
+    /// Default true: inspect the plan without executing anything.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AuditCleanupParams {
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RetentionParams {
+    #[serde(default)]
+    pub retention_days_by_category: Option<RetentionPartial>,
+    #[serde(default)]
+    pub backup_days: Option<u32>,
+    #[serde(default)]
+    pub audit_max_mb: Option<u32>,
+    #[serde(default)]
+    pub backup_max_mb: Option<u32>,
+    #[serde(default)]
+    pub auto_cleanup_hours: Option<u32>,
+    #[serde(default)]
+    pub redact_sql_in_log: Option<bool>,
+    #[serde(default)]
+    pub tamper_evident_chain: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct RetentionPartial {
+    #[serde(default)]
+    pub read: Option<u32>,
+    #[serde(default)]
+    pub write: Option<u32>,
+    #[serde(default)]
+    pub ddl: Option<u32>,
+    #[serde(default)]
+    pub admin: Option<u32>,
+    #[serde(default)]
+    pub tx_ctrl: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HistorySearchParams {
+    #[serde(default)]
+    pub since_iso: Option<String>,
+    #[serde(default)]
+    pub until_iso: Option<String>,
+    #[serde(default)]
+    pub search: Option<String>,
+    #[serde(default)]
+    pub connection: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SequelAceHistoryParams {
+    #[serde(default)]
+    pub since_iso: Option<String>,
+    #[serde(default)]
+    pub search: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ImportParams {
+    /// Copy passwords from the Sequel Ace Keychain (macOS may prompt).
+    #[serde(default = "default_true")]
+    pub copy_passwords: bool,
+}
+
 fn parse_preset(s: &Option<String>) -> Result<PolicyPresetName, String> {
     match s.as_deref() {
         None => Ok(PolicyPresetName::ReadOnly),
@@ -811,6 +895,261 @@ impl SequelServer {
     }
 
     #[tool(
+        name = "restore_backup",
+        title = "Restore from a pre-mutation backup",
+        description = "Replay backup #N into the originating connection. Generates dialect-specific upserts for row backups and CREATE TABLE for schema backups. Subject to the same policy gate (counts as a write). Pass dryRun=true to inspect the plan first.",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    fn restore_backup(&self, _p: Parameters<RestoreParams>) -> CallToolResult {
+        // Hand-routed in call_tool for confirm-gated execution; this
+        // entry exists for discovery and dry-run dispatch without
+        // interactive approvals.
+        error_tool_result(
+            "restore_backup is hand-routed for confirmation; pass dryRun=true for the plan",
+        )
+    }
+
+    #[tool(
+        name = "audit_cleanup",
+        title = "Clean up audit log + old backups",
+        description = "Prune audit entries older than retention.auditDays and backups older than retention.backupDays. Hard size caps trigger an additional 20% trim. VACUUMs the file. Pass dryRun=true to preview.",
+        annotations(
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    fn audit_cleanup(&self, Parameters(p): Parameters<AuditCleanupParams>) -> CallToolResult {
+        let cfg = match self.ctx.config.load() {
+            Ok(c) => c,
+            Err(e) => return error_tool_result(format!("config load failed: {e}")),
+        };
+        let r = crate::audit::retention::cleanup_audit(&self.ctx.audit, &cfg.retention, p.dry_run);
+        json_tool_result(json!({
+            "auditDeleted": r.audit_deleted,
+            "auditDeletedByCategory": serde_json::Map::from_iter(
+                r.audit_deleted_by_category
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), serde_json::json!(v))),
+            ),
+            "backupDeleted": r.backup_deleted,
+            "bytesReclaimed": r.bytes_reclaimed,
+            "ranAt": r.ran_at,
+            "dryRun": p.dry_run,
+        }))
+    }
+
+    #[tool(
+        name = "set_retention",
+        title = "Update retention / cleanup config",
+        description = "Configure per-category retention (read=7, write=30, ddl=90, admin=180, txCtrl=7 by default), backup retention, hard size caps, and how often auto-cleanup runs on server boot. Pass any subset; missing fields keep current values.",
+        annotations(idempotent_hint = true, open_world_hint = false)
+    )]
+    fn set_retention(&self, Parameters(p): Parameters<RetentionParams>) -> CallToolResult {
+        let cfg = match self.ctx.config.load() {
+            Ok(c) => c,
+            Err(e) => return error_tool_result(format!("config load failed: {e}")),
+        };
+        let mut next = cfg.retention.clone();
+        if let Some(days) = p.retention_days_by_category {
+            let d = &mut next.retention_days_by_category;
+            if let Some(v) = days.read {
+                d.read = v;
+            }
+            if let Some(v) = days.write {
+                d.write = v;
+            }
+            if let Some(v) = days.ddl {
+                d.ddl = v;
+            }
+            if let Some(v) = days.admin {
+                d.admin = v;
+            }
+            if let Some(v) = days.tx_ctrl {
+                d.tx_ctrl = v;
+            }
+        }
+        if let Some(v) = p.backup_days {
+            next.backup_days = v;
+        }
+        if let Some(v) = p.audit_max_mb {
+            next.audit_max_mb = v.max(10);
+        }
+        if let Some(v) = p.backup_max_mb {
+            next.backup_max_mb = v.max(10);
+        }
+        if let Some(v) = p.auto_cleanup_hours {
+            next.auto_cleanup_hours = v.min(720);
+        }
+        if let Some(v) = p.redact_sql_in_log {
+            next.redact_sql_in_log = v;
+        }
+        if let Some(v) = p.tamper_evident_chain {
+            next.tamper_evident_chain = v;
+        }
+        let revision = cfg.revision;
+        let to_persist = next.clone();
+        match self.ctx.config.update(revision, move |c| {
+            c.retention = to_persist;
+            Ok(())
+        }) {
+            Ok(()) => json_tool_result(serde_json::to_value(&next).unwrap_or_default()),
+            Err(e) => error_tool_result(e.to_string()),
+        }
+    }
+
+    #[tool(
+        name = "history_search",
+        title = "Unified history (MCP audit + Sequel Ace)",
+        description = "Merge our audit_log with Sequel Ace queryHistory.db, sorted by timestamp DESC. Each row has a source field (mcp | sequel-ace). Use source=mcp or source=sequel-ace to filter to one. Useful when you want a single timeline regardless of where a query was run.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    fn history_search(&self, Parameters(p): Parameters<HistorySearchParams>) -> CallToolResult {
+        let source = p.source.as_deref().unwrap_or("both");
+        let limit = p.limit.unwrap_or(200).min(5000);
+        let mut out: Vec<serde_json::Value> = Vec::new();
+
+        if source == "mcp" || source == "both" {
+            let filters = crate::audit::AuditSearchFilters {
+                since: p.since_iso.clone(),
+                until: p.until_iso.clone(),
+                connection: p.connection.clone(),
+                category: None,
+                outcome: None,
+                limit: limit.saturating_mul(2),
+            };
+            if let Ok(rows) = crate::audit::search_audit_log(&self.ctx.audit, &filters) {
+                for r in rows {
+                    let sql = r.sql_redacted.clone();
+                    if let Some(needle) = &p.search
+                        && !sql.to_lowercase().contains(&needle.to_lowercase())
+                    {
+                        continue;
+                    }
+                    out.push(json!({
+                        "source": "mcp",
+                        "ts": r.ts,
+                        "sql": sql,
+                        "connection": r.connection,
+                        "category": r.category,
+                        "outcome": r.outcome,
+                        "decision": r.decision,
+                        "databases": r.databases,
+                        "durationMs": r.duration_ms,
+                        "affectedRows": r.affected_rows,
+                        "backupId": r.backup_id,
+                    }));
+                }
+            }
+        }
+
+        if source == "sequel-ace" || source == "both" {
+            let filters = crate::importer::history::SequelAceHistoryFilters {
+                since_iso: p.since_iso.as_deref(),
+                search: p.search.as_deref(),
+                limit: Some(limit.saturating_mul(2)),
+            };
+            for r in crate::importer::read_sequel_ace_history(&filters, None) {
+                if let Some(until) = &p.until_iso
+                    && r.created_at_iso.as_str() >= until.as_str()
+                {
+                    continue;
+                }
+                out.push(json!({
+                    "source": "sequel-ace",
+                    "ts": r.created_at_iso,
+                    "sql": r.query,
+                    "sequelAceId": r.id,
+                }));
+            }
+        }
+
+        out.sort_by(|a, b| b["ts"].as_str().cmp(&a["ts"].as_str()));
+        out.truncate(limit as usize);
+        json_tool_result(json!({ "count": out.len(), "rows": out }))
+    }
+
+    #[tool(
+        name = "sequel_ace_history",
+        title = "Read Sequel Ace query history",
+        description = "Read the queryHistory.db that Sequel Ace maintains in its sandbox. Returns distinct queries the user has run in the GUI (deduplicated by Sequel Ace, with latest createdTime). Read-only — no modification. Optional sinceIso, search (LIKE %text%), limit (default 200, max 5000).",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    fn sequel_ace_history(
+        &self,
+        Parameters(p): Parameters<SequelAceHistoryParams>,
+    ) -> CallToolResult {
+        let stat = crate::importer::stat_sequel_ace_history(None);
+        if !stat.exists {
+            return error_tool_result(format!(
+                "Sequel Ace queryHistory.db not found at {}. Open Sequel Ace and run at least one query first, or check that Sequel Ace is installed.",
+                stat.path.display()
+            ));
+        }
+        let filters = crate::importer::history::SequelAceHistoryFilters {
+            since_iso: p.since_iso.as_deref(),
+            search: p.search.as_deref(),
+            limit: p.limit,
+        };
+        let rows: Vec<serde_json::Value> = crate::importer::read_sequel_ace_history(&filters, None)
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "id": r.id,
+                    "query": r.query,
+                    "createdTime": r.created_time,
+                    "createdAtIso": r.created_at_iso,
+                })
+            })
+            .collect();
+        let returned = rows.len();
+        json_tool_result(json!({
+            "source": "sequel-ace",
+            "path": stat.path.display().to_string(),
+            "totalAvailable": stat.entry_count,
+            "returned": returned,
+            "note": "Sequel Ace dedupes by query text — only the latest createdTime is kept per distinct query.",
+            "rows": rows,
+        }))
+    }
+
+    #[tool(
+        name = "import_from_sequel_ace",
+        title = "Import connections from Sequel Ace",
+        description = "Read Sequel Ace Favorites.plist, copy connections (and optionally passwords via /usr/bin/security; macOS will prompt user to allow access) into our config + keychain. Sequel Ace data is never modified.",
+        annotations(idempotent_hint = true, open_world_hint = false)
+    )]
+    fn import_from_sequel_ace(&self, Parameters(p): Parameters<ImportParams>) -> CallToolResult {
+        let cfg = match self.ctx.config.load() {
+            Ok(c) => c,
+            Err(e) => return error_tool_result(format!("config load failed: {e}")),
+        };
+        let revision = cfg.revision;
+        let copy = p.copy_passwords;
+        let secrets = self.ctx.secrets.clone();
+        let result = match self.ctx.config.update(revision, move |c| {
+            Ok(crate::importer::import_from_sequel_ace(
+                c, &*secrets, copy, None, None,
+            ))
+        }) {
+            Ok(r) => r,
+            Err(e) => return error_tool_result(e.to_string()),
+        };
+        json_tool_result(json!({
+            "total": result.total,
+            "imported": result.imported,
+            "withPasswords": result.with_passwords,
+            "skipped": result.skipped.iter()
+                .map(|(name, reason)| json!({ "name": name, "reason": reason }))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    #[tool(
         name = "doctor",
         title = "Diagnostic report",
         description = "Print a sanitized JSON diagnostic of the MCP install: runtime versions, config state, every configured connection (host/user/db, policy), password presence. Contains zero passwords and zero secrets — redact hostnames before posting publicly.",
@@ -1195,6 +1534,400 @@ impl SequelServer {
     }
 }
 
+impl SequelServer {
+    /// restore_backup: dry-run returns the plan; execution is
+    /// confirmation-gated (MRTR in the modern era, elicitation in the
+    /// legacy era) and replays the plan on ONE connection inside ONE
+    /// transaction, after a policy deny-check. Faithful to the legacy
+    /// tool, which confirmed once and executed directly.
+    async fn call_restore(
+        &self,
+        p: RestoreParams,
+        modern: bool,
+        peer: rmcp::service::Peer<rmcp::RoleServer>,
+        request: rmcp::model::CallToolRequestParams,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        use crate::backup::restore::{RestoreDialect, plan_restore};
+
+        let cfg = self
+            .ctx
+            .config
+            .load()
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        let Some(detail) = crate::backup::restore::get_backup(&self.ctx.audit, p.backup_id) else {
+            return Ok(CallToolResponse::Complete(error_tool_result(format!(
+                "Backup #{} not found.",
+                p.backup_id
+            ))));
+        };
+        let Some(conn) = cfg.resolve(Some(detail.connection.as_str())).cloned() else {
+            return Ok(CallToolResponse::Complete(error_tool_result(format!(
+                "Connection {:?} referenced by backup no longer exists.",
+                detail.connection
+            ))));
+        };
+        let dialect = if conn.is_mysql() {
+            RestoreDialect::MySql
+        } else {
+            RestoreDialect::SQLite
+        };
+        let plan = match plan_restore(&self.ctx.audit, p.backup_id, dialect) {
+            Ok(plan) => plan,
+            Err(e) => {
+                return Ok(CallToolResponse::Complete(error_tool_result(format!(
+                    "Cannot plan restore: {e}"
+                ))));
+            }
+        };
+
+        if p.dry_run {
+            return Ok(CallToolResponse::Complete(json_tool_result(json!({
+                "backupId": p.backup_id,
+                "connection": detail.connection,
+                "rowCount": plan.row_count,
+                "statementCount": plan.statements.len(),
+                "warnings": plan.warnings,
+                "isInsertHintDelete": plan.is_insert_hint_delete,
+                "firstStatementPreview":
+                    plan.statements.first().map(|s| s.chars().take(240).collect::<String>()),
+                "note": "dry-run; pass dryRun=false to actually execute",
+            }))));
+        }
+        if plan.statements.is_empty() {
+            return Ok(CallToolResponse::Complete(json_tool_result(json!({
+                "backupId": p.backup_id,
+                "executedStatements": 0,
+                "warnings": plan.warnings,
+                "note": "nothing to restore",
+            }))));
+        }
+
+        // Confirmation: modern era = MRTR one-shot state bound to the
+        // backup id + policy revision; legacy era = elicitation.
+        let digest = {
+            use sha2::Digest;
+            let mut h = sha2::Sha256::new();
+            h.update(b"sequel-mcp/restore/v1\n");
+            h.update(detail.connection.as_bytes());
+            h.update(b"\n");
+            h.update(p.backup_id.to_le_bytes());
+            h.update(cfg.revision.to_le_bytes());
+            d_hex(h)
+        };
+
+        if modern {
+            if let Some(responses) = &request.input_responses {
+                let state = request
+                    .request_state
+                    .as_deref()
+                    .ok_or_else(|| rmcp::ErrorData::invalid_params("missing requestState", None))?;
+                if state.len() > super::limits::MAX_REQUEST_STATE_BYTES {
+                    return Err(rmcp::ErrorData::invalid_params(
+                        format!(
+                            "[mrtr_invalid_state] requestState exceeds {} bytes",
+                            super::limits::MAX_REQUEST_STATE_BYTES
+                        ),
+                        None,
+                    ));
+                }
+                let _pending = super::mrtr::take(
+                    state,
+                    "restore_backup",
+                    &detail.connection,
+                    &digest,
+                    cfg.revision,
+                )
+                .map_err(|e| {
+                    rmcp::ErrorData::invalid_params(
+                        format!("{}; approval rejected", e.message()),
+                        None,
+                    )
+                })?;
+                let value = responses.get("approval").cloned().ok_or_else(|| {
+                    rmcp::ErrorData::invalid_params("missing approval response", None)
+                })?;
+                match super::mrtr::parse_response(&value) {
+                    crate::approval::ConfirmOutcome::Chosen(
+                        crate::approval::GrantChoice::Decline,
+                    ) => Ok(CallToolResponse::Complete(error_tool_result(
+                        "Restore declined.",
+                    ))),
+                    outcome @ crate::approval::ConfirmOutcome::Chosen(_) => {
+                        let _ = outcome;
+                        self.execute_restore_plan(&conn, &detail, &plan).await
+                    }
+                    crate::approval::ConfirmOutcome::Unavailable { reason } => {
+                        Ok(CallToolResponse::Complete(error_tool_result(format!(
+                            "Restore needs confirmation, but no prompt could be shown: {reason}. Nothing was restored. This is not a refusal - set an explicit write policy, or restore outside this tool."
+                        ))))
+                    }
+                }
+            } else {
+                use rmcp::model::{
+                    ElicitRequestParams, ElicitationSchema, InputRequest, InputRequiredResult,
+                };
+                let message = format!(
+                    "Restore backup #{}: {} statement(s) into {}.{}.{}\n\nWarnings: {}\n\nPick an authorization scope.",
+                    p.backup_id,
+                    plan.statements.len(),
+                    detail.connection,
+                    detail.database.as_deref().unwrap_or("<default>"),
+                    detail.table_name,
+                    if plan.warnings.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        plan.warnings.join("; ")
+                    }
+                );
+                let mut input_requests = std::collections::BTreeMap::new();
+                input_requests.insert(
+                    "approval".to_string(),
+                    InputRequest::Elicitation(rmcp::model::ElicitRequest::new(
+                        ElicitRequestParams::FormElicitationParams {
+                            meta: None,
+                            message,
+                            requested_schema: ElicitationSchema::from_json_schema(
+                                serde_json::json!({
+                                    "type": "object",
+                                    "properties": {
+                                        "choice": {
+                                            "type": "string",
+                                            "title": "Authorization",
+                                            "enum": ["once", "decline"]
+                                        }
+                                    },
+                                    "required": ["choice"]
+                                })
+                                .as_object()
+                                .cloned()
+                                .unwrap_or_default(),
+                            )
+                            .map_err(|e| {
+                                rmcp::ErrorData::internal_error(
+                                    format!("elicitation schema: {e}"),
+                                    None,
+                                )
+                            })?,
+                        },
+                    )),
+                );
+                let pending = super::mrtr::PendingApproval {
+                    tool: "restore_backup",
+                    connection: detail.connection.clone(),
+                    operation_digest: digest,
+                    policy_revision: cfg.revision,
+                    approved_ddl_targets: None,
+                    expires_at: std::time::Instant::now() + super::mrtr::TTL,
+                };
+                let state = super::mrtr::issue(pending);
+                Ok(rmcp::model::CallToolResponse::InputRequired(
+                    InputRequiredResult::new(Some(input_requests), Some(state)),
+                ))
+            }
+        } else {
+            // Legacy era: elicit directly through the session peer.
+            let message = format!(
+                "About to RESTORE backup #{}: {} statement(s) into {}.{}.{}",
+                p.backup_id,
+                plan.statements.len(),
+                detail.connection,
+                detail.database.as_deref().unwrap_or("<default>"),
+                detail.table_name
+            );
+            let outcome = super::confirm::run_elicitation(&peer, message).await;
+            match outcome {
+                crate::approval::ConfirmOutcome::Chosen(crate::approval::GrantChoice::Decline) => {
+                    Ok(CallToolResponse::Complete(error_tool_result(
+                        "Restore declined.",
+                    )))
+                }
+                crate::approval::ConfirmOutcome::Chosen(_) => {
+                    self.execute_restore_plan(&conn, &detail, &plan).await
+                }
+                crate::approval::ConfirmOutcome::Unavailable { reason } => {
+                    Ok(CallToolResponse::Complete(error_tool_result(format!(
+                        "Restore needs confirmation, but no prompt could be shown: {reason}. Nothing was restored. This is not a refusal."
+                    ))))
+                }
+            }
+        }
+    }
+
+    /// Replay the plan on one connection in one transaction, after a
+    /// policy deny-check (writes must not be denied for the backup's
+    /// table scope).
+    async fn execute_restore_plan(
+        &self,
+        conn: &crate::config::Connection,
+        detail: &crate::backup::restore::BackupDetail,
+        plan: &crate::backup::restore::RestorePlan,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        // Policy deny-check: classify the first statement; a Deny on the
+        // write scope refuses the restore before touching anything.
+        let dialect = if conn.is_mysql() {
+            crate::policy::classifier::Dialect::MySql
+        } else {
+            crate::policy::classifier::Dialect::SQLite
+        };
+        let classified =
+            crate::policy::classifier::classify_statement(&plan.statements[0], dialect).map_err(
+                |e| {
+                    rmcp::ErrorData::internal_error(
+                        format!("cannot classify restore statement: {}", e.message()),
+                        None,
+                    )
+                },
+            )?;
+        let fallback = detail
+            .database
+            .clone()
+            .or_else(|| conn.database().map(str::to_string));
+        let resolution = crate::policy::resolver::resolve(conn, &classified, fallback.as_deref());
+        if resolution.action == crate::policy::model::PolicyAction::Deny {
+            return Ok(CallToolResponse::Complete(error_tool_result(
+                "Restore denied by policy for this connection/table scope.",
+            )));
+        }
+
+        let started = std::time::Instant::now();
+        let result: Result<crate::backup::restore::RestoreOutcome, String> = match conn {
+            crate::config::Connection::Sqlite(sc) => {
+                let sc = sc.clone();
+                let stmts = plan.statements.clone();
+                tokio::task::spawn_blocking(move || {
+                    let db = crate::sql::sqlite::open_sqlite_database(
+                        &sc,
+                        false,
+                        sc.policy.stmt_timeout_ms,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    db.execute_batch("BEGIN IMMEDIATE")
+                        .map_err(|e| e.to_string())?;
+                    match crate::backup::restore::execute_restore_sqlite(&db, &fake_plan(&stmts)) {
+                        Ok(r) => {
+                            db.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+                            Ok(r)
+                        }
+                        Err(e) => {
+                            let _ = db.execute_batch("ROLLBACK");
+                            Err(e.to_string())
+                        }
+                    }
+                })
+                .await
+                .map_err(|e| format!("join: {e}"))
+                .and_then(|r| r)
+            }
+            crate::config::Connection::Mysql(mc) => {
+                let Some(password) = self.ctx.secrets.get_password(&mc.name, &mc.user).ok() else {
+                    return Ok(CallToolResponse::Complete(error_tool_result(format!(
+                        "No password for {:?}.",
+                        mc.name
+                    ))));
+                };
+                let (host, port) = match &mc.ssh {
+                    Some(ssh) => {
+                        let ssh_pw = self
+                            .ctx
+                            .secrets
+                            .get_password(&format!("{}::ssh", mc.name), &ssh.user)
+                            .ok();
+                        match crate::sql::ssh::tunnel_endpoint(
+                            &mc.name,
+                            ssh,
+                            ssh_pw.as_ref().map(|p| p.as_str()),
+                            &mc.host,
+                            mc.port,
+                            1,
+                        )
+                        .await
+                        {
+                            Ok(lease) => (lease.host, lease.port),
+                            Err(e) => {
+                                return Ok(CallToolResponse::Complete(error_tool_result(format!(
+                                    "ssh tunnel: {e}"
+                                ))));
+                            }
+                        }
+                    }
+                    None => (mc.host.clone(), mc.port),
+                };
+                let mc = mc.clone();
+                let db = detail.database.clone();
+                let stmts = plan.statements.clone();
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        let opts = crate::sql::mysql::build_opts(
+                            &mc,
+                            &password,
+                            db.as_deref(),
+                            Some(&host),
+                            Some(port),
+                        );
+                        use mysql_async::prelude::Queryable;
+                        let mut c = mysql_async::Conn::new(opts)
+                            .await
+                            .map_err(|e| format!("connect: {e}"))?;
+                        c.query_drop("START TRANSACTION READ WRITE")
+                            .await
+                            .map_err(|e| format!("start tx: {e}"))?;
+                        let mut affected: u64 = 0;
+                        let mut run = 0usize;
+                        for stmt in &stmts {
+                            match c.query_iter(stmt.as_str()).await {
+                                Ok(_) => {
+                                    affected += c.affected_rows();
+                                    run += 1;
+                                }
+                                Err(e) => {
+                                    let _ = c.query_drop("ROLLBACK").await;
+                                    return Err(format!("statement {run} failed: {e}"));
+                                }
+                            }
+                        }
+                        c.query_drop("COMMIT")
+                            .await
+                            .map_err(|e| format!("commit: {e}"))?;
+                        let _ = c.disconnect().await;
+                        Ok(crate::backup::restore::RestoreOutcome {
+                            statements_run: run,
+                            affected,
+                        })
+                    })
+                })
+            }
+        };
+
+        match result {
+            Ok(r) => Ok(CallToolResponse::Complete(json_tool_result(json!({
+                "backupId": detail.id,
+                "executedStatements": r.statements_run,
+                "affected": r.affected,
+                "warnings": plan.warnings,
+                "durationMs": started.elapsed().as_millis() as u64,
+            })))),
+            Err(e) => Ok(CallToolResponse::Complete(error_tool_result(format!(
+                "Restore failed: {e}"
+            )))),
+        }
+    }
+}
+
+fn d_hex(h: sha2::Sha256) -> String {
+    use sha2::Digest;
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn fake_plan(stmts: &[String]) -> crate::backup::restore::RestorePlan {
+    crate::backup::restore::RestorePlan {
+        backup_id: 0,
+        statements: stmts.to_vec(),
+        row_count: 0,
+        warnings: Vec::new(),
+        is_insert_hint_delete: false,
+    }
+}
+
 /// Approval sink with a pre-decided outcome (MRTR retry path).
 struct PreDecidedSink(crate::approval::ConfirmOutcome);
 
@@ -1230,6 +1963,23 @@ impl ServerHandler for SequelServer {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         let name = request.name.as_ref();
+        if name == "restore_backup" {
+            let arg_value =
+                serde_json::Value::Object(request.arguments.clone().unwrap_or_default());
+            let Ok(p) = serde_json::from_value::<RestoreParams>(arg_value) else {
+                return Ok(CallToolResponse::Complete(error_tool_result(
+                    "invalid arguments for restore_backup",
+                )));
+            };
+            let modern = context
+                .meta
+                .protocol_version()
+                .map(|v| v >= rmcp::model::ProtocolVersion::V_2026_07_28)
+                .unwrap_or(false);
+            return self
+                .call_restore(p, modern, context.peer.clone(), request)
+                .await;
+        }
         if name == "query" || name == "execute" {
             let expect_read_only = name == "query";
             let tool: &'static str = if expect_read_only { "query" } else { "execute" };

@@ -2,6 +2,7 @@
 
 pub mod extractor;
 pub mod journal;
+pub mod restore;
 
 use crate::audit::AuditDb;
 use crate::policy::model::Policy;

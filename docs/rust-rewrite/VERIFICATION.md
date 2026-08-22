@@ -602,6 +602,64 @@ contention from docker matrices running in parallel — standalone and
 all subsequent runs green), clippy `-D warnings` 0, fmt clean, gitleaks
 clean, zero docker leftovers.
 
+## Session 8 (checkpoint #6: the six remaining tools)
+
+The legacy 27-tool surface is now complete. Six tools ported with their
+legacy JSON shapes and annotations:
+
+- **`restore_backup`** (`src/backup/restore.rs` + hand-route in
+  `tools.rs`): dialect-specific replay plans — row backups as per-row
+  upserts (`ON DUPLICATE KEY` / `ON CONFLICT DO UPDATE`), schema
+  backups as their captured `CREATE TABLE` (with the
+  fails-unless-dropped warning), insert-hint backups as the exact
+  DELETE of the rows the original INSERT created (range or explicit-PK
+  forms; flagged `isInsertHintDelete`). Value escaping is
+  dialect-aware (blobs as `0x…`/`X'…'`, structured binary values from
+  D5 restore losslessly, JSON round-trips escaped). dryRun (default
+  true) returns the plan summary; execution is confirmation-gated —
+  modern era through the SAME MRTR machinery (one-shot state bound to
+  backup id + connection + policy revision; typed rejections), legacy
+  era through elicitation — then replays ALL statements on ONE
+  connection inside ONE transaction (SQLite: BEGIN IMMEDIATE … COMMIT;
+  MySQL: START TRANSACTION READ WRITE … COMMIT, SSH tunnels included),
+  after a policy deny-check on the write scope. Statement failure
+  rolls back and reports typed.
+- **`audit_cleanup`** (`src/audit/retention.rs`): per-category cutoffs
+  (read 7 / write 30 / ddl 90 / admin 180 / txCtrl 7 days by default),
+  backup-age pruning, 20% oldest-trim when hard size caps are exceeded,
+  meta `last_cleanup_at`, VACUUM after the counted transaction; dryRun
+  counts without touching. `maybe_auto_cleanup` respects
+  `autoCleanupHours` since the last recorded run (boot hook-up pending
+  with the server lifecycle work).
+- **`set_retention`**: partial merge over `RetentionConfig` (category
+  days, backupDays, size caps, autoCleanupHours, redaction + chain
+  flags), persisted through the revision-checked config store.
+- **`history_search`**: unified timeline merging the MCP audit
+  (redacted SQL) with Sequel Ace queryHistory, `source=mcp|sequel-ace|both`,
+  text filter, ts-DESC, limit.
+- **`sequel_ace_history`** (`src/importer/history.rs`): read-only
+  QueryHistory.db access (file must exist, read-only + no-mutex flags,
+  createdTime/search/limit filters, DESC), stat with entry count;
+  missing DB → the legacy guidance error. Test-mode keeps these reads
+  under the isolated root (the Sequel Ace sandbox is real user data).
+- **`import_from_sequel_ace`** (`src/importer/plist_import.rs`):
+  Favorites.plist walk (folders recursed; favorites without
+  host/user/id/name skipped), SSH favorites mapped (key vs password
+  auth from sshKeyLocationEnabled), read-only preset policies,
+  idempotent upsert into the config through the revision-checked store;
+  optional password copy from the legacy Sequel Ace Keychain entries
+  via `/usr/bin/security` (fixed argv, no shell) into
+  `<name>`/`<name>::ssh`; SSH-tunnel passwords too. Plist/Keychain
+  reads are test-mode-gated to the isolated root.
+
+Tests: 145 lib (restore planning/escaping incl. binary + insert-hint
+DELETE forms, retention dry-run/cleanup/interval, QueryHistory
+filters, plist walk/mapping/idempotency, missing-file paths), 15
+lifecycle/isolation binary tests now asserting the 27-tool surface
+(legacy + modern tools/list), both-engine docker matrix 16/16, SSH
+matrix 27/27, workspace tests green, clippy `-D warnings` 0, fmt
+clean, gitleaks clean, zero docker leftovers.
+
 ## Session 5 record — unchanged summary
 
 Pool identity (CredentialGeneration, publish-after-healthy, coalescing,
