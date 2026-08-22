@@ -50,7 +50,10 @@ pub enum JournalError {
 /// executing-or-later state (crash/timeout ambiguity).
 const TRANSITIONS: &[(&str, &[&str])] = &[
     ("planned", &["backup_capturing", "failed"]),
-    ("backup_capturing", &["backup_durable", "failed"]),
+    (
+        "backup_capturing",
+        &["backup_durable", "mutation_executing", "failed"],
+    ),
     ("backup_durable", &["mutation_executing", "failed"]),
     (
         "mutation_executing",
@@ -218,7 +221,9 @@ mod tests {
         let j = Journal::create(&db, "req-2", "c1", &[], "ddl").unwrap();
         assert!(j.transition(JournalState::MutationCommitted, None).is_err());
         j.transition(JournalState::BackupCapturing, None).unwrap();
-        assert!(j.transition(JournalState::MutationExecuting, None).is_err());
+        // backup_capturing -> mutation_executing is legal for backup-less
+        // operations; the illegal jump is straight to committed.
+        assert!(j.transition(JournalState::MutationCommitted, None).is_err());
     }
 
     #[test]

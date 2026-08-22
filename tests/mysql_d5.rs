@@ -63,6 +63,7 @@ async fn d5_boundary_types() {
             audit: Some(audit.clone()),
             revision: 1,
             tunnel_endpoint: None,
+            expected_ddl_targets: None,
         })
         .await
         .unwrap()

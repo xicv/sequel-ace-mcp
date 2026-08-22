@@ -1,20 +1,71 @@
 #!/usr/bin/env bash
 # D8: reproducible benchmarks. Deterministic process-level MCP harness
 # (n samples, median/p95/max); live-server warm/cold queries when
-# SEQUEL_MCP_TEST_MYSQL points at a server. Reports go to stdout in a
-# parseable KEY=VALUE form; full samples to stderr.
+# SEQUEL_MCP_TEST_MYSQL points at a LOCAL docker server only.
+#
+# SAFETY: every spawned process runs under the shared fail-closed
+# isolation entry (scripts/lib/isolated-test-env.sh): a fresh temporary
+# root, clean env-map spawns (nothing inherited), SEQUEL_MCP_TEST_MODE=1.
+# The real user config (production connections), the real audit DB, and
+# the real Keychain are unreachable from benchmarks.
+#
+# RESULTS STATUS: development/debug-profile, same-machine directional
+# comparison only. Release/LTO numbers with identical methodology are
+# required before any packaging-gate performance claim.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# shellcheck source=scripts/lib/isolated-test-env.sh
+source scripts/lib/isolated-test-env.sh
+
 cargo build 2>/dev/null
 
 BIN=target/debug/sequel-mcp
 N="${1:-30}"   # warm-path iterations
 
+iso_init
+mkdir -p "$ISO_ROOT/config/sequel-mcp" "$ISO_ROOT/data/sequel-mcp"
+: > "$ISO_ROOT/demo.sqlite"
+cat > "$ISO_ROOT/config/sequel-mcp/config.json" <<JSON
+{
+  "version": 2,
+  "revision": 1,
+  "defaultConnection": "demo",
+  "connections": [{
+    "driver": "sqlite",
+    "name": "demo",
+    "path": "$ISO_ROOT/demo.sqlite",
+    "database": "main",
+    "policy": {
+      "read": "allow", "write": "deny", "ddl": "deny", "admin": "deny",
+      "txCtrl": "allow", "rowCap": 100, "stmtTimeoutMs": 5000,
+      "requireTouchID": false, "maxBackupRows": 100,
+      "maxBackupBytes": 1048576, "onBackupOverflow": "abort"
+    },
+    "tablePolicies": {}
+  }],
+  "retention": {}
+}
+JSON
+
+# The node driver receives the explicit env map (nothing else is
+# inherited by the children it spawns).
+ENV_MAP_FILE="$(mktemp)"
+iso_env_map > "$ENV_MAP_FILE"
+
 run_bench() {
-  node - "$BIN" "$N" <<'EOF'
+  node - "$BIN" "$N" "$ENV_MAP_FILE" <<'EOF'
 const { spawn } = require("node:child_process");
-const [bin, nArg] = process.argv.slice(2);
+const { readFileSync } = require("node:fs");
+const [bin, nArg, envMapPath] = process.argv.slice(2);
 const N = parseInt(nArg, 10);
+
+// Explicit environment ONLY (equivalent to env -i): the isolation map
+// plus nothing inherited from this process's environment.
+const env = {};
+for (const line of readFileSync(envMapPath, "utf8").split("\n")) {
+  const i = line.indexOf("=");
+  if (i > 0) env[line.slice(0, i)] = line.slice(i + 1);
+}
 
 const samples = {};
 const now = () => performance.now();
@@ -29,7 +80,7 @@ function once(cold) {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, ["serve"], {
       stdio: ["pipe", "pipe", "inherit"],
-      env: { ...process.env },
+      env,
     });
     let buf = "";
     const startedAt = now();
@@ -61,19 +112,21 @@ function once(cold) {
     });
     child.on("error", reject);
     child.stdin.write(JSON.stringify({
-      jsonrpc: "2.0", id: 1, method: "initialize",
+      "jsonrpc": "2.0", id: 1, method: "initialize",
       params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "bench", version: "0" } },
     }) + "\n");
   });
 }
 
-// Cold: process spawn -> initialized, and -> tools/list.
 (async () => {
+  // Cold: process spawn -> initialized, and -> tools/list.
+  // Warm the filesystem cache deterministically before sampling.
+  for (let i = 0; i < 3; i++) await once(false);
   for (let i = 0; i < N; i++) await once(true);
   console.log(`RUST_COLD_INIT ${stats(samples.init)}`);
   console.log(`RUST_COLD_TO_TOOLS_LIST ${stats(samples.toolsList)}`);
   // Warm tools/list within one process: reuse one server.
-  const child = spawn(bin, ["serve"], { stdio: ["pipe", "pipe", "inherit"] });
+  const child = spawn(bin, ["serve"], { stdio: ["pipe", "pipe", "inherit"], env });
   let buf = "", nextId = 1;
   const warm = [];
   const pending = new Map();
@@ -105,16 +158,41 @@ function once(cold) {
     warm.push(now() - s);
   }
   console.log(`RUST_WARM_TOOLS_LIST ${stats(warm)}`);
+  // Full MCP query round trip over the ISOLATED sqlite connection.
+  const firstQ = [];
+  const warmQ = [];
+  for (let i = 0; i < N; i++) {
+    const st = now();
+    send({ jsonrpc: "2.0", id: nextId, method: "tools/call", params: { name: "query", arguments: { sql: "SELECT 41 + 1 AS answer" } } });
+    await awaitId(nextId++);
+    (i < 3 ? firstQ : warmQ).push(now() - st);
+  }
+  firstQ.sort((a, b) => a - b);
+  console.log(`RUST_MCP_SQLITE_QUERY_FIRST3 median=${firstQ[Math.floor(firstQ.length / 2)].toFixed(2)}ms n=${firstQ.length}`);
+  console.log(`RUST_MCP_SQLITE_QUERY_WARM ${stats(warmQ)}`);
   child.kill();
-})();
+})().catch((e) => { console.error(e); process.exit(1); });
 EOF
 }
 
-echo "=== MCP process benchmarks (n=$N)"
+echo "=== MCP process benchmarks (n=$N, isolated config)"
 run_bench
-echo "=== Live-server benchmarks"
+echo "=== Environment"
+echo "PROFILE=debug"
+echo "BENCH_CLASS=development/directional (debug profile, same machine; not a release performance claim)"
+echo "ISOLATION=fail-closed (ISO_ROOT printed above; env-map spawns; TEST_MODE active)"
+echo "AUDIT_MODE=SQLite WAL + synchronous=NORMAL (AUDIT_WRITE measures API+transaction completion, not durable fsync)"
+echo "MAC=$(sysctl -n hw.model 2>/dev/null || echo unknown)"
+echo "ARCH=$(uname -m)"
+echo "MACOS=$(sw_vers -productVersion 2>/dev/null || echo unknown)"
+echo "SAMPLES=$N"
+echo "=== Live-server benchmarks (local docker only)"
 if [ -n "${SEQUEL_MCP_TEST_MYSQL:-}" ]; then
-  SEQUEL_MCP_TEST_MYSQL="$SEQUEL_MCP_TEST_MYSQL" cargo test --test bench_live -- --nocapture --test-threads=1
+  iso_export_for_cargo
+  SEQUEL_MCP_TEST_MYSQL="$SEQUEL_MCP_TEST_MYSQL" \
+    cargo test --test bench_live -- --nocapture --test-threads=1 2>&1 | grep -E "FIRST_QUERY|WARM_|POOL_|CANCEL_|AUDIT_"
+  rm -f "$ENV_MAP_FILE"
 else
   echo "LIVE_SKIPPED=SEQUEL_MCP_TEST_MYSQL not set"
+  rm -f "$ENV_MAP_FILE"
 fi

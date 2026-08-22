@@ -20,6 +20,11 @@ fn home() -> PathBuf {
         })
 }
 
+/// Public read of the effective home directory (test-mode path checks).
+pub fn home_dir() -> PathBuf {
+    home()
+}
+
 pub fn config_dir() -> PathBuf {
     match std::env::var_os("XDG_CONFIG_HOME") {
         Some(xdg) if !xdg.is_empty() => PathBuf::from(xdg).join(APP_NAME),

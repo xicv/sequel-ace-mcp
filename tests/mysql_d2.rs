@@ -69,6 +69,7 @@ async fn run_with_policy(
         audit: Some(ctx.audit.clone()),
         revision: 1,
         tunnel_endpoint: None,
+        expected_ddl_targets: None,
     })
     .await
 }

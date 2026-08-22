@@ -66,6 +66,7 @@ async fn backup_and_mutation_share_one_connection_and_lock() {
             audit: Some(audit.clone()),
             revision: 1,
             tunnel_endpoint: None,
+            expected_ddl_targets: None,
         })
         .await
     }
@@ -157,6 +158,7 @@ async fn backup_and_mutation_share_one_connection_and_lock() {
                 audit: Some(audit),
                 revision: 1,
                 tunnel_endpoint: None,
+                expected_ddl_targets: None,
             })
             .await
         }

@@ -81,6 +81,12 @@ pub enum DdlPreflightError {
         table: String,
         hint: &'static str,
     },
+    #[error("table {schema}.{table} already exists: {hint}")]
+    Conflict {
+        schema: String,
+        table: String,
+        hint: &'static str,
+    },
     #[error("preflight query failed: {0}")]
     Query(String),
 }
@@ -93,8 +99,46 @@ pub enum DdlPreflight {
     /// All mutated targets are missing AND the statement says IF EXISTS:
     /// audited local no-op — no DDL is sent to the server.
     MissingNoOp(Vec<(String, String)>),
-    /// A target is missing without IF EXISTS: typed not-found error.
-    NotFound(DdlPreflightError),
+    /// Some targets exist and some are missing under IF EXISTS: execute
+    /// ONLY the preflight-approved existing subset — as a REWRITTEN
+    /// statement naming exactly those targets (never the original
+    /// multi-target statement, which would also drop any target created
+    /// between preflight and execution); the missing list must be audited
+    /// as absent (never silently suppressed).
+    Mixed {
+        existing: Vec<(String, String)>,
+        missing: Vec<(String, String)>,
+    },
+}
+
+/// Build the fail-closed rewrite of a Mixed multi-target DROP: only the
+/// preflight-approved existing targets, fully qualified, backtick-escaped,
+/// with IF EXISTS retained. Returns `None` for object types whose drop
+/// cannot be safely reconstructed (`DROP INDEX` and friends) — the caller
+/// fails closed in that case. This closes the plan→execute TOCTOU: a
+/// table created after the preflight is not named by the rewritten
+/// statement, so it cannot be dropped without a fresh plan and approval.
+pub fn rewrite_drop_subset(object_type: &str, existing: &[(String, String)]) -> Option<String> {
+    let keyword = match object_type {
+        "table" => "DROP TABLE IF EXISTS",
+        "view" => "DROP VIEW IF EXISTS",
+        _ => return None,
+    };
+    if existing.is_empty() {
+        return None;
+    }
+    let targets = existing
+        .iter()
+        .map(|(schema, table)| {
+            format!(
+                "`{}`.`{}`",
+                schema.replace('`', "``"),
+                table.replace('`', "``")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("{keyword} {targets}"))
 }
 
 /// Check every mutated table of a DDL statement for existence using
@@ -110,57 +154,136 @@ pub async fn preflight_ddl(
         return Ok(DdlPreflight::Present);
     }
 
-    let mut missing: Vec<(String, String)> = Vec::new();
-    for (idx, target) in classified.mutated_tables.iter().enumerate() {
-        // RENAME statements list old and new identities per pair (old,
-        // new, old, new, ...). Only the OLD identity must exist; the new
-        // one is created by the rename itself.
-        if classified.ast_type == "rename" && idx % 2 == 1 {
-            continue;
-        }
-        // CREATE statements create their target: absence is expected, not
-        // an error; presence is a replace, also fine. Skip existence
-        // gating for `create` entirely.
-        if classified.ast_type == "create" {
-            return Ok(DdlPreflight::Present);
-        }
-        let schema = target
+    let resolve_schema = |target: &crate::policy::classifier::TableRef| -> Option<String> {
+        target
             .database
             .clone()
-            .or_else(|| fallback_db.map(str::to_string));
-        let Some(schema) = schema else {
-            // Unresolved schema scope: fail closed via the not-found path
-            // with a hint (the gate denies unqualified targets anyway).
-            return Err(DdlPreflightError::NotFound {
-                schema: "?".into(),
-                table: target.table.clone(),
-                hint: "no database in scope for the DDL target",
-            });
-        };
-        let exists: Option<i8> = conn
+            .or_else(|| fallback_db.map(str::to_string))
+    };
+
+    async fn table_exists(
+        conn: &mut Conn,
+        schema: &str,
+        table: &str,
+    ) -> Result<bool, DdlPreflightError> {
+        let found: Option<i8> = conn
             .exec_first(
                 "SELECT 1 FROM information_schema.tables
                   WHERE table_schema = ? AND table_name = ?",
-                (&schema, &target.table),
+                (schema, table),
             )
             .await
             .map_err(|e| DdlPreflightError::Query(e.to_string()))?;
-        if exists.is_none() {
-            missing.push((schema, target.table.clone()));
-        }
+        Ok(found.is_some())
     }
 
-    if missing.is_empty() {
-        return Ok(DdlPreflight::Present);
-    }
-    if classified.if_exists {
-        Ok(DdlPreflight::MissingNoOp(missing))
-    } else {
-        let (schema, table) = missing[0].clone();
-        Err(DdlPreflightError::NotFound {
-            schema,
-            table,
-            hint: "DROP/TRUNCATE target does not exist (no IF EXISTS)",
-        })
+    match classified.ast_type {
+        // CREATE statements create their targets: existence is not an
+        // error either way; skip gating entirely.
+        "create" => Ok(DdlPreflight::Present),
+
+        // RENAME chains execute left-to-right. Model the chain locally:
+        // each source must exist (after earlier steps), each destination
+        // must be absent (after earlier steps) — this correctly allows
+        // swap chains (a→tmp, b→a, tmp→b).
+        "rename" => {
+            let pairs: Vec<(
+                &crate::policy::classifier::TableRef,
+                &crate::policy::classifier::TableRef,
+            )> = classified
+                .mutated_tables
+                .chunks(2)
+                .map(|c| (&c[0], &c[1]))
+                .collect();
+            let mut known: Vec<((String, String), bool)> = Vec::new();
+            for (src, dst) in &pairs {
+                let src_schema = resolve_schema(src).ok_or(DdlPreflightError::NotFound {
+                    schema: "?".into(),
+                    table: src.table.clone(),
+                    hint: "no database in scope for the RENAME source",
+                })?;
+                let dst_schema = resolve_schema(dst).ok_or(DdlPreflightError::NotFound {
+                    schema: "?".into(),
+                    table: dst.table.clone(),
+                    hint: "no database in scope for the RENAME destination",
+                })?;
+                let src_id = (src_schema.clone(), src.table.clone());
+                let dst_id = (dst_schema.clone(), dst.table.clone());
+
+                // Source present? (chain-aware: earlier renames move ids)
+                let src_present =
+                    if let Some(p) = known.iter().find(|(id, _p)| *id == src_id).map(|(_, p)| *p) {
+                        p
+                    } else {
+                        table_exists(conn, &src_schema, &src.table).await?
+                    };
+                if !src_present {
+                    return Err(DdlPreflightError::NotFound {
+                        schema: src_schema,
+                        table: src.table.clone(),
+                        hint: "RENAME source does not exist",
+                    });
+                }
+
+                // Destination absent? (chain-aware)
+                let dst_present =
+                    if let Some(p) = known.iter().find(|(id, _p)| *id == dst_id).map(|(_, p)| *p) {
+                        p
+                    } else {
+                        table_exists(conn, &dst_schema, &dst.table).await?
+                    };
+                if dst_present {
+                    return Err(DdlPreflightError::Conflict {
+                        schema: dst_schema,
+                        table: dst.table.clone(),
+                        hint: "RENAME destination already exists",
+                    });
+                }
+
+                known.retain(|(id, _)| *id != src_id);
+                known.push((src_id, false));
+                known.push((dst_id, true));
+            }
+            Ok(DdlPreflight::Present)
+        }
+
+        // DROP / TRUNCATE: multi-target normalization across engines.
+        // Without IF EXISTS: ANY missing target → typed not-found, nothing
+        // executed (stricter than MariaDB's partial behaviour, matching
+        // MySQL 8.4). With IF EXISTS: all missing → audited no-op; some
+        // missing → proceed on the existing complete approved set with the
+        // absent list attached for audit.
+        _ => {
+            let mut existing: Vec<(String, String)> = Vec::new();
+            let mut missing: Vec<(String, String)> = Vec::new();
+            for target in &classified.mutated_tables {
+                let schema = resolve_schema(target).ok_or(DdlPreflightError::NotFound {
+                    schema: "?".into(),
+                    table: target.table.clone(),
+                    hint: "no database in scope for the DDL target",
+                })?;
+                if table_exists(conn, &schema, &target.table).await? {
+                    existing.push((schema, target.table.clone()));
+                } else {
+                    missing.push((schema, target.table.clone()));
+                }
+            }
+            if missing.is_empty() {
+                return Ok(DdlPreflight::Present);
+            }
+            if !classified.if_exists {
+                let (schema, table) = missing[0].clone();
+                return Err(DdlPreflightError::NotFound {
+                    schema,
+                    table,
+                    hint: "DDL target does not exist (no IF EXISTS)",
+                });
+            }
+            if existing.is_empty() {
+                Ok(DdlPreflight::MissingNoOp(missing))
+            } else {
+                Ok(DdlPreflight::Mixed { existing, missing })
+            }
+        }
     }
 }

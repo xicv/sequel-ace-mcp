@@ -4,6 +4,8 @@
 //! call the shared library services — no policy or SQL logic lives here.
 
 pub mod confirm;
+pub mod limits;
+pub mod mrtr;
 pub mod tools;
 
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};

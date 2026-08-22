@@ -45,6 +45,11 @@ pub struct ClassifiedStatement {
     /// `IF EXISTS` present on DROP/TRUNCATE DDL (absent-target handling:
     /// preflight turns a missing target into an audited local no-op).
     pub if_exists: bool,
+    /// Object type of a DROP statement (`table`, `view`, `index`,
+    /// `other`); `None` for non-DROP statements. The Mixed-IF-EXISTS
+    /// rewrite only reconstructs statements it knows (`table`/`view`)
+    /// and fails closed otherwise.
+    pub drop_object_type: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -362,6 +367,7 @@ fn empty_result(category: SqlCategory, ast_type: &'static str) -> ClassifiedStat
         file_io: false,
         executes_wrapped: false,
         if_exists: false,
+        drop_object_type: None,
     }
 }
 
@@ -595,6 +601,14 @@ fn classify_ast(
             r.mutated_tables = read;
         }
         Statement::Truncate(trunc) => {
+            if trunc.if_exists {
+                // Neither MySQL 8.4 nor MariaDB support TRUNCATE ... IF
+                // EXISTS (sqlparser accepts it; the servers would reject
+                // it at execution). Deny before any planning.
+                return Err(ClassifyError::Unknown(
+                    "TRUNCATE ... IF EXISTS is not valid MySQL/MariaDB syntax".to_string(),
+                ));
+            }
             r.category = SqlCategory::Ddl;
             r.ast_type = "truncate";
             for target in &trunc.table_names {
@@ -620,9 +634,17 @@ fn classify_ast(
                 r.read_tables = read;
             }
         }
-        Statement::Drop { names, .. } => {
+        Statement::Drop {
+            names, object_type, ..
+        } => {
             r.category = SqlCategory::Ddl;
             r.ast_type = "drop";
+            r.drop_object_type = Some(match object_type {
+                sqlparser::ast::ObjectType::Table => "table",
+                sqlparser::ast::ObjectType::View => "view",
+                sqlparser::ast::ObjectType::Index => "index",
+                _ => "other",
+            });
             for obj in names {
                 let (db, table) = object_name_parts(obj);
                 r.mutated_tables.push(TableRef {

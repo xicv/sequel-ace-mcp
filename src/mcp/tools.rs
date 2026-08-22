@@ -184,6 +184,7 @@ impl SequelServer {
                 connection: p.connection,
                 sql: p.sql,
                 database: p.database,
+                expected_ddl_targets: None,
             },
             true,
         )
@@ -201,6 +202,7 @@ impl SequelServer {
                 connection: p.connection,
                 sql: p.sql,
                 database: p.database,
+                expected_ddl_targets: None,
             },
             false,
         )
@@ -734,6 +736,7 @@ impl SequelServer {
                 connection: p.connection.clone(),
                 sql,
                 database: p.database.clone(),
+                expected_ddl_targets: None,
             },
             true,
         )
@@ -763,6 +766,7 @@ impl SequelServer {
                 connection: p.connection.clone(),
                 sql,
                 database: None,
+                expected_ddl_targets: None,
             },
             true,
         )
@@ -856,6 +860,324 @@ impl SequelServer {
             Err(e) => error_tool_result(e.to_string()),
         }
     }
+
+    /// Modern-era (2026-07-28) query/execute: MRTR approvals. The first
+    /// confirm-required call returns `input_required` with an
+    /// elicitation/create input request and an OPAQUE SERVER-SIDE
+    /// one-shot `requestState` (a random token; every binding — tool,
+    /// connection, operation digest, policy revision, DDL plan targets,
+    /// expiry — lives in the in-process pending store, never on the
+    /// wire). The retry echoes the token plus `inputResponses`; after
+    /// atomic single-use consumption and revalidation the statement
+    /// executes through the normal gate with the pre-decided outcome
+    /// injected. For MySQL DROP statements the plan-time preflight fixes
+    /// the approved target set BEFORE the approval is issued, and the
+    /// retry fails closed (`ddl_precondition_changed`) if any target
+    /// changed existence in between.
+    async fn call_sql_modern(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        p: SqlParams,
+        expect_read_only: bool,
+        tool: &'static str,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        use rmcp::model::{
+            ElicitRequestParams, ElicitationSchema, InputRequest, InputRequiredResult,
+        };
+
+        // Cheap pure recomputation of the operation identity + decision.
+        let cfg = self
+            .ctx
+            .config
+            .load()
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        let conn = cfg
+            .resolve(p.connection.as_deref())
+            .cloned()
+            .ok_or_else(|| {
+                rmcp::ErrorData::invalid_params(
+                    gate::no_connection_message(p.connection.as_deref()),
+                    None,
+                )
+            })?;
+        let dialect = if conn.is_mysql() {
+            crate::policy::classifier::Dialect::MySql
+        } else {
+            crate::policy::classifier::Dialect::SQLite
+        };
+        let classified =
+            crate::policy::classifier::classify_statement(&p.sql, dialect).map_err(|e| {
+                rmcp::ErrorData::invalid_params(format!("cannot classify: {}", e.message()), None)
+            })?;
+        if expect_read_only && classified.category != crate::policy::model::SqlCategory::Read {
+            return Ok(CallToolResponse::Complete(error_tool_result(format!(
+                "query tool only accepts read statements (got {}). Use the \"execute\" tool for non-read statements.",
+                classified.category
+            ))));
+        }
+        let fallback = p
+            .database
+            .clone()
+            .or_else(|| conn.database().map(str::to_string));
+        let resolution = crate::policy::resolver::resolve(&conn, &classified, fallback.as_deref());
+
+        let run_with_sink =
+            |outcome: Box<dyn gate::ApprovalSink>, expected_ddl: Option<Vec<(String, String)>>| {
+                let args = RunSqlArgs {
+                    connection: p.connection.clone(),
+                    sql: p.sql.clone(),
+                    database: p.database.clone(),
+                    expected_ddl_targets: expected_ddl,
+                };
+                let deps = gate_deps_blocking(outcome);
+                tokio::task::spawn_blocking(move || gate::run_sql(&deps, &args, expect_read_only))
+            };
+
+        if resolution.action != crate::policy::model::PolicyAction::Confirm {
+            let out = run_with_sink(Box::new(gate::UnavailableSink), None)
+                .await
+                .map_err(|e| rmcp::ErrorData::internal_error(format!("gate join: {e}"), None))?
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            return Ok(CallToolResponse::Complete(super::json_tool_result(
+                gate::outcome_to_json(&out),
+            )));
+        }
+
+        // Plan-time DDL preflight for MySQL DROP statements: fix the
+        // approved target set BEFORE any approval is issued. The retry
+        // can then only ever execute targets that existed when the user
+        // approved — a target created in between fails closed.
+        let mut approved_ddl: Option<Vec<(String, String)>> = None;
+        let mut plan_split: Option<(Vec<String>, Vec<String>)> = None;
+        if conn.is_mysql()
+            && classified.category == crate::policy::model::SqlCategory::Ddl
+            && classified.ast_type == "drop"
+        {
+            let Connection::Mysql(mysql_conn) = &conn else {
+                unreachable!("checked is_mysql above");
+            };
+            let pw = match self
+                .ctx
+                .secrets
+                .get_password(&mysql_conn.name, &mysql_conn.user)
+            {
+                Ok(pw) => pw,
+                Err(_) => {
+                    return Err(rmcp::ErrorData::invalid_params(
+                        format!(
+                            "no password stored for connection {:?}; cannot plan the approval",
+                            mysql_conn.name
+                        ),
+                        None,
+                    ));
+                }
+            };
+            let preflight = async {
+                let pool = crate::sql::mysql::pool_manager()
+                    .verified_pool(
+                        mysql_conn,
+                        &pw,
+                        fallback.as_deref(),
+                        cfg.revision,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| format!("pool initialization failed: {e}"))?;
+                let mut pconn = pool
+                    .get_conn()
+                    .await
+                    .map_err(|e| format!("connection failed: {e}"))?;
+                crate::sql::ddl::preflight_ddl(&mut pconn, &classified, fallback.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())
+            };
+            match preflight.await {
+                Ok(crate::sql::ddl::DdlPreflight::Present) => {
+                    let mut targets = Vec::new();
+                    for t in &classified.mutated_tables {
+                        if let Some(schema) = t.database.clone().or_else(|| fallback.clone()) {
+                            targets.push((schema, t.table.clone()));
+                        }
+                    }
+                    approved_ddl = Some(targets);
+                }
+                Ok(crate::sql::ddl::DdlPreflight::Mixed { existing, missing }) => {
+                    plan_split = Some((
+                        existing.iter().map(|(s, t)| format!("{s}.{t}")).collect(),
+                        missing.iter().map(|(s, t)| format!("{s}.{t}")).collect(),
+                    ));
+                    approved_ddl = Some(existing);
+                }
+                Ok(crate::sql::ddl::DdlPreflight::MissingNoOp(missing)) => {
+                    plan_split = Some((
+                        Vec::new(),
+                        missing.iter().map(|(s, t)| format!("{s}.{t}")).collect(),
+                    ));
+                    approved_ddl = Some(Vec::new());
+                }
+                Err(e) => {
+                    return Ok(CallToolResponse::Complete(error_tool_result(format!(
+                        "cannot plan the approval (DDL preflight failed; nothing executed): {e}"
+                    ))));
+                }
+            }
+        }
+
+        let digest = super::mrtr::operation_digest(&p.sql, conn.name(), cfg.revision);
+
+        // Retry: consume + validate the echoed state, parse the response,
+        // execute with the plan-approved DDL target set.
+        if let Some(responses) = &request.input_responses {
+            if serde_json::to_string(responses)
+                .map(|s| s.len())
+                .unwrap_or(usize::MAX)
+                > super::limits::MAX_INPUT_RESPONSES_BYTES
+            {
+                return Ok(CallToolResponse::Complete(error_tool_result(format!(
+                    "[argument_too_large] inputResponses exceeds {} bytes",
+                    super::limits::MAX_INPUT_RESPONSES_BYTES
+                ))));
+            }
+            let state = request
+                .request_state
+                .as_deref()
+                .ok_or_else(|| rmcp::ErrorData::invalid_params("missing requestState", None))?;
+            if state.len() > super::limits::MAX_REQUEST_STATE_BYTES {
+                return Err(rmcp::ErrorData::invalid_params(
+                    format!(
+                        "[mrtr_invalid_state] requestState exceeds {} bytes",
+                        super::limits::MAX_REQUEST_STATE_BYTES
+                    ),
+                    None,
+                ));
+            }
+            let pending = super::mrtr::take(state, tool, conn.name(), &digest, cfg.revision)
+                .map_err(|e| {
+                    rmcp::ErrorData::invalid_params(
+                        format!("{}; approval rejected", e.message()),
+                        None,
+                    )
+                })?;
+            let value = responses.get("approval").cloned().ok_or_else(|| {
+                rmcp::ErrorData::invalid_params("missing approval response", None)
+            })?;
+            match super::mrtr::parse_response(&value) {
+                crate::approval::ConfirmOutcome::Chosen(crate::approval::GrantChoice::Decline) => {
+                    Ok(CallToolResponse::Complete(error_tool_result(
+                        "User declined confirmation. Statement not executed.",
+                    )))
+                }
+                outcome @ crate::approval::ConfirmOutcome::Chosen(_) => {
+                    let out = run_with_sink(
+                        Box::new(PreDecidedSink(outcome)),
+                        pending.approved_ddl_targets,
+                    )
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(format!("gate join: {e}"), None))?
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                    Ok(CallToolResponse::Complete(super::json_tool_result(
+                        gate::outcome_to_json(&out),
+                    )))
+                }
+                crate::approval::ConfirmOutcome::Unavailable { reason } => {
+                    Ok(CallToolResponse::Complete(error_tool_result(format!(
+                        "confirmation required, but no prompt could be shown: {reason}. Statement not executed - nothing was changed. This is not a refusal."
+                    ))))
+                }
+            }
+        } else {
+            // First call: emit the input request (redacted SQL preview +
+            // the plan-time target split for mixed DROP statements).
+            let snippet = if p.sql.len() > 800 {
+                format!("{}…", &p.sql[..800])
+            } else {
+                p.sql.clone()
+            };
+            let tables: Vec<String> = resolution
+                .contributions
+                .iter()
+                .map(|c| format!("{}.{}", c.table.database, c.table.table))
+                .collect();
+            let plan_note = match &plan_split {
+                Some((exec, absent)) => format!(
+                    "\n\nConfirmed to exist at plan time (will be affected): {}\nAbsent at plan time (skipped, recorded in audit): {}",
+                    if exec.is_empty() {
+                        "(none — this will be a no-op)".to_string()
+                    } else {
+                        exec.join(", ")
+                    },
+                    absent.join(", ")
+                ),
+                None => String::new(),
+            };
+            let message = format!(
+                "About to run a {} statement on {}.\n\n--- SQL ---\n{}\n--- end ---\n\nAffected tables: {}{}\n\nPick an authorization scope.",
+                classified.category,
+                conn.name(),
+                snippet,
+                if tables.is_empty() {
+                    "(statement scope)".to_string()
+                } else {
+                    tables.join(", ")
+                },
+                plan_note,
+            );
+            let mut input_requests = std::collections::BTreeMap::new();
+            input_requests.insert(
+                "approval".to_string(),
+                InputRequest::Elicitation(rmcp::model::ElicitRequest::new(
+                    ElicitRequestParams::FormElicitationParams {
+                        meta: None,
+                        message,
+                        requested_schema: ElicitationSchema::from_json_schema(
+                            serde_json::json!({
+                                "type": "object",
+                                "properties": {
+                                    "choice": {
+                                        "type": "string",
+                                        "title": "Authorization",
+                                        "enum": ["once", "session", "decline"]
+                                    }
+                                },
+                                "required": ["choice"]
+                            })
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_default(),
+                        )
+                        .map_err(|e| {
+                            rmcp::ErrorData::internal_error(
+                                format!("elicitation schema: {e}"),
+                                None,
+                            )
+                        })?,
+                    },
+                )),
+            );
+            let pending = super::mrtr::PendingApproval {
+                tool,
+                connection: conn.name().to_string(),
+                operation_digest: digest,
+                policy_revision: cfg.revision,
+                approved_ddl_targets: approved_ddl,
+                expires_at: std::time::Instant::now() + super::mrtr::TTL,
+            };
+            let state = super::mrtr::issue(pending);
+            Ok(rmcp::model::CallToolResponse::InputRequired(
+                InputRequiredResult::new(Some(input_requests), Some(state)),
+            ))
+        }
+    }
+}
+
+/// Approval sink with a pre-decided outcome (MRTR retry path).
+struct PreDecidedSink(crate::approval::ConfirmOutcome);
+
+impl gate::ApprovalSink for PreDecidedSink {
+    fn confirm(&self, _request: gate::ApprovalRequest) -> crate::approval::ConfirmOutcome {
+        self.0.clone()
+    }
 }
 
 fn mysql_user(c: &Connection) -> Option<String> {
@@ -886,6 +1208,7 @@ impl ServerHandler for SequelServer {
         let name = request.name.as_ref();
         if name == "query" || name == "execute" {
             let expect_read_only = name == "query";
+            let tool: &'static str = if expect_read_only { "query" } else { "execute" };
             let arg_value =
                 serde_json::Value::Object(request.arguments.clone().unwrap_or_default());
             let params: Result<SqlParams, _> = serde_json::from_value(arg_value);
@@ -894,10 +1217,35 @@ impl ServerHandler for SequelServer {
                     "invalid arguments for query/execute",
                 )));
             };
+            if p.sql.len() > super::limits::MAX_TOOL_ARGUMENT_BYTES {
+                return Ok(CallToolResponse::Complete(error_tool_result(format!(
+                    "[argument_too_large] sql argument exceeds {} bytes",
+                    super::limits::MAX_TOOL_ARGUMENT_BYTES
+                ))));
+            }
+
+            // Modern (2026-07-28) era: rmcp's stdio server does not
+            // propagate per-request _meta capabilities into the legacy
+            // elicit path, so approvals go through MRTR here. The wire
+            // _meta lives in the RequestContext, not the deserialized
+            // params.
+            let modern = context
+                .meta
+                .protocol_version()
+                .map(|v| v >= rmcp::model::ProtocolVersion::V_2026_07_28)
+                .unwrap_or(false);
+
+            if modern {
+                return self
+                    .call_sql_modern(request, p, expect_read_only, tool)
+                    .await;
+            }
+
             let args = RunSqlArgs {
                 connection: p.connection,
                 sql: p.sql,
                 database: p.database,
+                expected_ddl_targets: None,
             };
             // Gate on the blocking pool; elicitation asks flow back over a
             // channel and are answered from the async runtime by a pump

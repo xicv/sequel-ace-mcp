@@ -36,6 +36,20 @@ fn main() {
 }
 
 fn serve() -> i32 {
+    // Fail-closed test-mode isolation check BEFORE anything else: if
+    // SEQUEL_MCP_TEST_MODE=1 is set, every derived path must live under
+    // SEQUEL_MCP_TEST_ROOT or the process terminates without starting
+    // the MCP server.
+    if let Err(e) = sequel_mcp::app::test_mode::verify_startup() {
+        eprintln!("sequel-mcp: refusing to start (test mode): {e}");
+        return sequel_mcp::app::test_mode::EXIT_ISOLATION;
+    }
+    if sequel_mcp::app::test_mode::is_active()
+        && let Ok(root) = std::env::var("SEQUEL_MCP_TEST_ROOT")
+    {
+        eprintln!("sequel-mcp: test mode active, isolated root {root}");
+    }
+
     // Logs to stderr only; stdout belongs to the protocol.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -59,7 +73,9 @@ fn serve() -> i32 {
     rt.block_on(async {
         use rmcp::ServiceExt;
         let server = sequel_mcp::mcp::SequelServer::with_defaults();
-        match server.serve(rmcp::transport::stdio()).await {
+        // Bounded stdio: stdin passes through the line-limit adapter so an
+        // oversized JSON-RPC line is discarded before it is ever buffered.
+        match server.serve(sequel_mcp::mcp::limits::limited_stdio()).await {
             Ok(service) => {
                 eprintln!("sequel-mcp ready");
                 if let Err(e) = service.waiting().await {

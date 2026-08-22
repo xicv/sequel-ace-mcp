@@ -144,8 +144,15 @@ impl SecretStore for UnsupportedSecretStore {
     }
 }
 
-/// Platform default store: macOS Keychain, explicit unsupported elsewhere.
+/// Platform default store: macOS Keychain, explicit unsupported
+/// elsewhere. In test mode the production Keychain is unavailable — an
+/// in-memory store (optionally seeded from `SEQUEL_MCP_TEST_SECRETS`)
+/// is used instead, so tests and benchmarks can never read or write the
+/// developer's real Keychain entries.
 pub fn default_store() -> std::sync::Arc<dyn SecretStore> {
+    if crate::app::test_mode::is_active() {
+        return crate::app::test_mode::secret_store();
+    }
     #[cfg(target_os = "macos")]
     {
         std::sync::Arc::new(KeychainSecretStore)

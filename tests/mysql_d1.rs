@@ -58,6 +58,7 @@ async fn run(
         audit: Some(audit),
         revision: 1,
         tunnel_endpoint: None,
+        expected_ddl_targets: None,
     })
     .await
     .map_err(|e| e.to_string())
