@@ -272,8 +272,13 @@ fn tunnel_key(
     kh_stamp: &str,
 ) -> String {
     let target_endpoint = format!("{target}:{port}");
+    let bridge = ssh
+        .docker
+        .as_ref()
+        .map(|d| format!("{}:{}", d.container, d.bridge_tool.as_str()))
+        .unwrap_or_default();
     format!(
-        "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+        "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
         conn_name,
         ssh.host,
         ssh.port,
@@ -282,7 +287,8 @@ fn tunnel_key(
         kh_stamp,
         ssh_credential_fragment(ssh_password),
         policy_revision,
-        target_endpoint
+        target_endpoint,
+        bridge
     )
 }
 
@@ -411,12 +417,36 @@ pub async fn tunnel_endpoint(
     })
 }
 
+/// When `ssh.docker` is configured, per-connection forwarding runs over
+/// an SSH **exec** channel (`docker exec -i <container> <tool> …`)
+/// instead of direct-tcpip — the bridge that works even where sshd
+/// denies TCP forwarding. All argv components are validated (no shell,
+/// no spaces), so the exec command line is a plain join.
+fn bridge_command(
+    ssh: &SshTunnel,
+    target_host: &str,
+    target_port: u16,
+) -> Result<Option<String>, SshError> {
+    let Some(docker) = &ssh.docker else {
+        return Ok(None);
+    };
+    let argv = super::docker::bridge_argv(
+        &docker.container,
+        docker.bridge_tool,
+        target_host,
+        target_port,
+    )
+    .map_err(|e| SshError::Setup(format!("docker bridge: {e}")))?;
+    Ok(Some(argv.join(" ")))
+}
+
 async fn establish(
     ssh: &SshTunnel,
     ssh_password: Option<&str>,
     target_host: &str,
     target_port: u16,
 ) -> Result<Arc<TunnelEntry>, SshError> {
+    let bridge_cmd = bridge_command(ssh, target_host, target_port)?;
     let kh_path = ssh.known_hosts_path.as_deref().map(std::path::Path::new);
     let entries =
         known_hosts::load_known_hosts_checked(kh_path).map_err(|e| SshError::HostKey {
@@ -556,11 +586,31 @@ async fn establish(
                     let host = forward_host.clone();
                     let tasks = Arc::clone(&accept_tasks);
                     accept_tasks.fetch_add(1, Ordering::Relaxed);
+                    let bridge_cmd = bridge_cmd.clone();
                     tokio::spawn(async move {
                         let target = format!("{host}:{forward_port}");
+                        // Bridge connections open a session channel and
+                        // exec the (validated, space-free) docker bridge
+                        // argv; direct connections use direct-tcpip.
                         let channel = tokio::time::timeout(
                             CHANNEL_OPEN_TIMEOUT,
-                            session.channel_open_direct_tcpip(host, forward_port, "127.0.0.1", 0),
+                            async {
+                                match &bridge_cmd {
+                                    Some(cmd) => {
+                                        let ch = session.channel_open_session().await?;
+                                        ch.exec(true, cmd.as_str()).await?;
+                                        Ok::<_, russh::Error>(ch)
+                                    }
+                                    None => session
+                                        .channel_open_direct_tcpip(
+                                            host,
+                                            forward_port,
+                                            "127.0.0.1",
+                                            0,
+                                        )
+                                        .await,
+                                }
+                            },
                         )
                         .await;
                         match channel {
@@ -655,6 +705,69 @@ mod tests {
             a,
             tunnel_key("c1", &ssh, Some("pw"), "db", 3306, 1, "stamp2")
         );
+        // Bridge identity (container + tool) is part of the key.
+        let mut bridged = ssh.clone();
+        bridged.docker = Some(crate::config::SshDocker {
+            container: "db".into(),
+            bridge_tool: crate::config::BridgeTool::Nc,
+        });
+        assert_ne!(
+            a,
+            tunnel_key("c1", &bridged, Some("pw"), "127.0.0.1", 3306, 1, "stamp")
+        );
+        let mut bridged2 = bridged.clone();
+        bridged2.docker = Some(crate::config::SshDocker {
+            container: "db".into(),
+            bridge_tool: crate::config::BridgeTool::Socat,
+        });
+        assert_ne!(
+            tunnel_key("c1", &bridged, Some("pw"), "127.0.0.1", 3306, 1, "stamp"),
+            tunnel_key("c1", &bridged2, Some("pw"), "127.0.0.1", 3306, 1, "stamp")
+        );
+    }
+
+    #[test]
+    fn bridge_command_forms() {
+        use crate::config::{BridgeTool, SshDocker};
+        let mk = |tool| SshTunnel {
+            host: "bastion".into(),
+            port: 22,
+            user: "u".into(),
+            auth_method: SshAuthMethod::Key,
+            docker: Some(SshDocker {
+                container: "db-1".into(),
+                bridge_tool: tool,
+            }),
+            ..SshTunnel::default()
+        };
+        assert_eq!(
+            bridge_command(&mk(BridgeTool::Nc), "127.0.0.1", 3306)
+                .unwrap()
+                .unwrap(),
+            "docker exec -i db-1 nc 127.0.0.1 3306"
+        );
+        assert_eq!(
+            bridge_command(&mk(BridgeTool::Ncat), "127.0.0.1", 3306)
+                .unwrap()
+                .unwrap(),
+            "docker exec -i db-1 ncat 127.0.0.1 3306"
+        );
+        assert_eq!(
+            bridge_command(&mk(BridgeTool::Socat), "127.0.0.1", 3306)
+                .unwrap()
+                .unwrap(),
+            "docker exec -i db-1 socat - TCP:127.0.0.1:3306"
+        );
+        // No docker config: direct-tcpip path.
+        let plain = SshTunnel::default();
+        assert_eq!(bridge_command(&plain, "db", 3306).unwrap(), None);
+        // Invalid inputs fail typed before any connection.
+        let mut bad = mk(BridgeTool::Nc);
+        bad.docker = Some(SshDocker {
+            container: "bad name!".into(),
+            bridge_tool: BridgeTool::Nc,
+        });
+        assert!(bridge_command(&bad, "127.0.0.1", 3306).is_err());
     }
 
     #[test]

@@ -555,6 +555,53 @@ never accepts dynamic destinations, and dies with its tunnel
 generation; the Unix-domain-socket replacement remains a documented
 #4B+ hardening direction.
 
+## Session 7B (checkpoint #5: Docker bridge transport)
+
+Unfreeze stage after #4A. **Design** (`src/sql/ssh.rs` +
+`src/sql/docker.rs`, the latter ported earlier): when a connection's
+SSH config carries `docker = { container, bridgeTool }`, forwarding
+runs over an SSH **exec channel** — `docker exec -i <container>
+(nc|ncat|socat) …` — instead of `direct-tcpip`. This is the bridge
+that works even where sshd denies TCP forwarding outright. Everything
+else (host-key verification, single-method auth, lease generations,
+LRU/retirement, rotation stamps) is transport-agnostic and unchanged;
+the bridge identity (container + tool) joins the tunnel cache key, and
+the exec argv comes from the validated, space-free `bridge_argv` (no
+shell, no string interpolation).
+
+**Live proof** (`scripts/test-ssh.sh` phase F): the bastion runs with
+the docker CLI and the mounted docker socket; the MariaDB variant uses
+a derived image with nc + socat INSIDE the database container (the
+bridge tool must exist there — an ops prerequisite). The phase flips
+`AllowTcpForwarding` to **no** and reloads sshd, so every bridge test
+runs where direct-tcpip is impossible:
+
+- 5/5 bridge tests green: nc round trip (password auth) with one
+  multiplexed session reused across queries; socat round trip (key
+  auth); wrong container → typed bounded failure, nothing cached;
+  strict host-key mismatch still rejected on the bridge path BEFORE
+  anything; and a CONTROL test proving the direct (non-bridge) path is
+  refused in this phase — the traffic demonstrably rides the exec
+  channel.
+- Found en route (diagnosed via forwarder logging): the sshd session
+  user needs docker access — with the socket at root:docker 660 the
+  exec fails with zero bytes (docker's stderr goes to SSH extended
+  data, which the MySQL stream legitimately ignores). The TEST bastion
+  opens the socket (chmod 666); production bastions must instead grant
+  the SSH user docker-group access — recorded as the bridge's ops
+  prerequisite alongside MaxSessions.
+- The mysql84+TLS variant skips the bridge phase (no bridge tools in
+  that image; the bridge sits below the MySQL protocol and is
+  engine-agnostic — proven on MariaDB).
+
+Gates on the final tree: 138 lib tests, 15 lifecycle/isolation, SSH
+matrix 27/27 on MariaDB 11 (22 + 5 bridge) and 22/22 on MySQL 8.4+TLS,
+both-engine docker matrix 16/16, workspace tests green on five
+consecutive runs (two earlier gate-test failures were resource
+contention from docker matrices running in parallel — standalone and
+all subsequent runs green), clippy `-D warnings` 0, fmt clean, gitleaks
+clean, zero docker leftovers.
+
 ## Session 5 record — unchanged summary
 
 Pool identity (CredentialGeneration, publish-after-healthy, coalescing,
