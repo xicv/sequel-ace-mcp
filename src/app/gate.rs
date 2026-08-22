@@ -670,6 +670,53 @@ fn audit(
     let _ = crate::audit::write_audit_entry(&deps.audit, &entry, opts);
 }
 
+impl ApprovalRequest {
+    /// Rebuild an IPC-able request from the elicitation message the
+    /// sink produced (connection/table scope are in the message body).
+    pub fn from_message(message: &str) -> crate::approval::ipc::ApprovalRequest {
+        // The message shape (from the gate): "About to run a {category}
+        // statement on {connection}. ... Affected tables: a.b, c.d".
+        let mut connection = String::new();
+        if let Some(idx) = message.find(" statement on ") {
+            let rest = &message[idx + " statement on ".len()..];
+            connection = rest
+                .split(['.', '\n', ' '])
+                .next()
+                .unwrap_or("")
+                .trim_matches(['"', '.'])
+                .to_string();
+        }
+        let mut tables = Vec::new();
+        if let Some(idx) = message.find("Affected tables: ") {
+            let rest = &message[idx + "Affected tables: ".len()..];
+            let tail = rest.split('\n').next().unwrap_or("");
+            for part in tail.split(", ") {
+                let part = part.trim();
+                if part.contains('.') && !part.contains(' ') {
+                    tables.push(part.to_string());
+                }
+            }
+        }
+        crate::approval::ipc::ApprovalRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            category: message
+                .split_whitespace()
+                .nth(3)
+                .unwrap_or("write")
+                .to_string(),
+            connection,
+            database: None,
+            tables,
+            snippet: message
+                .lines()
+                .find_map(|l| l.strip_prefix("--- SQL ---"))
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+        }
+    }
+}
+
 pub fn no_connection_message(explicit: Option<&str>) -> String {
     match explicit {
         Some(name) => {
