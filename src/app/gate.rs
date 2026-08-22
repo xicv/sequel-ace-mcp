@@ -450,40 +450,40 @@ pub fn run_sql(
             let sql = args.sql.clone();
             let expected_ddl = args.expected_ddl_targets.clone();
             // SSH direct transport: establish (or reuse) the tunnel and
-            // hand the executor the local endpoint. The MySQL pool keys
-            // on the tunnel endpoint, so tunneled pools stay separate
-            // from direct ones and are reused per bastion session.
-            let tunnel_endpoint: Option<(String, u16)> = match &mc.ssh {
+            // hand the executor the lease (loopback endpoint + transport
+            // generation). The MySQL pool keys on the generation, so
+            // tunneled pools stay separate from direct ones and can never
+            // be spliced onto a later transport that reuses the port.
+            let tunnel_endpoint: Option<crate::sql::ssh::TunnelLease> = match &mc.ssh {
                 Some(ssh) => {
-                    let ssh_password = if ssh.auth_method == crate::config::SshAuthMethod::Password
+                    // The secret is the SSH password under password auth
+                    // (required) and the private-key passphrase under key
+                    // auth (optional — unencrypted keys need none).
+                    let ssh_password = match deps
+                        .secrets
+                        .get_password(&format!("{}::ssh", mc.name), &ssh.user)
                     {
-                        match deps
-                            .secrets
-                            .get_password(&format!("{}::ssh", mc.name), &ssh.user)
-                        {
-                            Ok(p) => Some(p),
-                            Err(_) => {
-                                audit(
-                                    deps,
-                                    &request_id,
-                                    &conn,
-                                    &databases_for_log,
-                                    &classified,
-                                    &args.sql,
-                                    &resolution,
-                                    false,
-                                    crate::approval::outcomes::ApprovalOutcome::Denied,
-                                    approval_scope.as_deref(),
-                                    approval_digest,
-                                    Some(cfg.revision),
-                                    None,
-                                    &write_opts,
-                                );
-                                return Err(GateError::NoPassword(format!("{}::ssh", mc.name)));
-                            }
+                        Ok(p) => Some(p),
+                        Err(_) if ssh.auth_method == crate::config::SshAuthMethod::Key => None,
+                        Err(_) => {
+                            audit(
+                                deps,
+                                &request_id,
+                                &conn,
+                                &databases_for_log,
+                                &classified,
+                                &args.sql,
+                                &resolution,
+                                false,
+                                crate::approval::outcomes::ApprovalOutcome::Denied,
+                                approval_scope.as_deref(),
+                                approval_digest,
+                                Some(cfg.revision),
+                                None,
+                                &write_opts,
+                            );
+                            return Err(GateError::NoPassword(format!("{}::ssh", mc.name)));
                         }
-                    } else {
-                        None
                     };
                     let mc_name = mc.name.clone();
                     let ssh_cfg = ssh.clone();
@@ -497,12 +497,13 @@ pub fn run_sql(
                                 ssh_password.as_ref().map(|p| p.as_str()),
                                 &mysql_host,
                                 mysql_port,
+                                revision,
                             )
                             .await
                         })
                     });
                     match res {
-                        Ok(ep) => Some(ep),
+                        Ok(lease) => Some(lease),
                         Err(e) => {
                             let msg = format!("ssh tunnel: {e}");
                             audit(

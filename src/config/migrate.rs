@@ -93,6 +93,7 @@ pub fn parse_v1(json: &Json) -> Result<V1Config, ConfigError> {
                         database: str_field(raw, "database"),
                         ssl: raw.get("ssl").and_then(|v| v.as_bool()).unwrap_or(false),
                         ssl_server_name: str_field(raw, "sslServerName"),
+                        ssl_ca_path: str_field(raw, "sslCaPath"),
                         ssh,
                         policy: policy.clone(),
                         table_policies: TablePolicies::default(),

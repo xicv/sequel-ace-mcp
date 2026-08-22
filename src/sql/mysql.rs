@@ -86,6 +86,10 @@ pub fn build_opts(
             // (e.g. when connecting through a tunnel endpoint).
             ssl = ssl.with_danger_tls_hostname_override(Some(name.clone()));
         }
+        if let Some(ca_path) = &conn.ssl_ca_path {
+            let expanded = crate::app::paths::expand_tilde(ca_path);
+            ssl = ssl.with_root_certs(vec![expanded.to_path_buf().into()]);
+        }
         Some(ssl)
     } else {
         None
@@ -175,8 +179,9 @@ pub struct MySqlExecuteParams<'a> {
     pub database: Option<&'a str>,
     pub audit: Option<Arc<AuditDb>>,
     pub revision: u64,
-    /// Local endpoint when an SSH tunnel is in front of the server.
-    pub tunnel_endpoint: Option<(String, u16)>,
+    /// Lease on the SSH tunnel in front of the server: loopback endpoint
+    /// + transport generation (the pool keys on the generation).
+    pub tunnel_endpoint: Option<crate::sql::ssh::TunnelLease>,
     /// Plan-time approved DDL target set (MRTR plan→retry gap): every
     /// DROP target that exists at execution time must have existed at
     /// plan time, otherwise nothing executes (DdlPreconditionChanged).
@@ -274,9 +279,9 @@ pub async fn execute_mysql_statement(
 ) -> Result<ExecuteResult, MySqlError> {
     let start = Instant::now();
     let is_read = READ_CATEGORIES.contains(&params.classified.category);
-    let (host, port) = match &params.tunnel_endpoint {
-        Some((h, p)) => (h.clone(), *p),
-        None => (params.connection.host.clone(), params.connection.port),
+    let (host, port, tunnel_generation) = match &params.tunnel_endpoint {
+        Some(lease) => (lease.host.clone(), lease.port, Some(lease.generation)),
+        None => (params.connection.host.clone(), params.connection.port, None),
     };
     // Fail-closed test-mode endpoint gate: refused BEFORE any connect
     // attempt (a violation must never open a socket).
@@ -289,21 +294,33 @@ pub async fn execute_mysql_statement(
             params.revision,
             Some(&host),
             Some(port),
+            tunnel_generation,
         )
         .await
         .map_err(|e| MySqlError::Pool(e.to_string()))?;
-    let mut conn = pool.get_conn().await?;
+    // The pre-work session setup (checkout, CONNECTION_ID, START
+    // TRANSACTION, timeout knob) rides the same transport as the query:
+    // under a tunnel blackhole none of it will ever answer, so the whole
+    // setup is bounded by the statement budget and reports a typed
+    // Timeout — never an unbounded hang.
+    let setup_budget = Duration::from_millis(params.policy.stmt_timeout_ms.max(1) as u64);
+    let setup = async {
+        let mut conn = pool.get_conn().await?;
 
-    // Record the physical connection id for active cancellation (D2).
-    let executing_id: Option<u64> = conn
-        .exec_first::<(u64,), _, _>("SELECT CONNECTION_ID()", ())
+        // Record the physical connection id for active cancellation (D2).
+        let executing_id: Option<u64> = conn
+            .exec_first::<(u64,), _, _>("SELECT CONNECTION_ID()", ())
+            .await
+            .ok()
+            .flatten()
+            .map(|(id,)| id);
+
+        let (major, minor, _patch) = conn.server_version();
+        Ok::<_, MySqlError>((conn, executing_id, format!("{major}.{minor}")))
+    };
+    let (mut conn, executing_id, server_version) = tokio::time::timeout(setup_budget, setup)
         .await
-        .ok()
-        .flatten()
-        .map(|(id,)| id);
-
-    let (major, minor, _patch) = conn.server_version();
-    let server_version = format!("{major}.{minor}");
+        .map_err(|_| MySqlError::Timeout(params.policy.stmt_timeout_ms as u64))??;
     let mut in_tx = false;
     if params.classified.category != SqlCategory::TxCtrl {
         let stmt = if is_read {
@@ -582,8 +599,17 @@ pub async fn execute_mysql_statement(
             // Interrupt it via KILL QUERY from a same-pool control
             // connection, then let the work future resolve within a
             // bounded grace period.
+            // The control connection rides the same transport: under a
+            // tunnel blackhole the KILL reply never arrives, so the kill
+            // itself is bounded and a timeout counts as a FAILED kill
+            // (→ Uncertain), never an unbounded wait.
             let kill_result = match executing_id {
-                Some(id) => super::cancel::kill_query(&pool, id).await,
+                Some(id) => tokio::time::timeout(
+                    Duration::from_secs(5),
+                    super::cancel::kill_query(&pool, id),
+                )
+                .await
+                .unwrap_or_else(|_| Err("kill control connection timed out".into())),
                 None => Err("no executing connection id recorded".into()),
             };
             let grace = tokio::time::timeout(Duration::from_secs(5), &mut work).await;
@@ -1043,7 +1069,7 @@ mod tests {
         let c = conn();
         let pw = Zeroizing::new("pw".to_string());
         assert!(
-            mgr.verified_pool(&c, &pw, None, 1, None, Some(1))
+            mgr.verified_pool(&c, &pw, None, 1, None, Some(1), None)
                 .await
                 .is_err()
         );

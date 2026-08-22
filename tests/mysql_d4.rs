@@ -421,7 +421,7 @@ async fn d4a_drop_race_library_level() {
     let classified = classify_statement(sql, Dialect::MySql).unwrap();
     let pw = Zeroizing::new(ctx.password.clone());
     let pool = pool_manager()
-        .verified_pool(&ctx.conn, &pw, None, 1, None, None)
+        .verified_pool(&ctx.conn, &pw, None, 1, None, None, None)
         .await
         .unwrap();
     let mut conn = pool.get_conn().await.unwrap();

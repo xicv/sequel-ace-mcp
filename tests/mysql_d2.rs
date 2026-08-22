@@ -182,6 +182,7 @@ async fn cancellation_kills_statement_and_preserves_state() {
                 1,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();

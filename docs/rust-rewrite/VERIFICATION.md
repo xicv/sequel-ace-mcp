@@ -483,6 +483,78 @@ hash selection currently pins rsa-sha2-256 (never ssh-rsa/SHA-1);
 `best_supported_rsa_hash` negotiation and the typed unsupported-key
 error for non-RSA/non-Ed25519 formats land in #4A.
 
+## Session 7A (checkpoint #4A: SSH hardening envelope)
+
+The full reviewer-mandated #4A order, implemented and live-verified:
+
+- **Initialization coalescing + concurrent multiplexing**: per-key async
+  guards mean a thundering herd of first callers establishes EXACTLY ONE
+  SSH session. Live: 32 concurrent lease+query tasks → one tunnel, one
+  shared port, 32 answered queries. (Found en route: OpenSSH's default
+  `MaxSessions 10` rejects channel bursts — the test bastion sets
+  `MaxSessions 64`; production bastions carrying many MySQL connections
+  per tunnel need the same headroom, recorded as an ops note.)
+- **Tunnel-generation / pool coupling (ABA closed)**: every tunnel gets
+  a monotonic generation; `TunnelLease { host, port, generation }`
+  flows gate → executor → `verified_pool`, whose key now includes the
+  generation — a reused loopback port is always a NEW generation, so a
+  pool can never be spliced onto a later transport. Retirement runs the
+  fixed order: mark draining (no new channels) → evict pools by
+  generation → stop the listener → channel tasks wind down (live-task
+  counter drains to zero, asserted) → disconnect the SSH session.
+- **Bounded LRU eviction**: cache cap 8; victims are the
+  least-recently-used entries; live test fills 9 identities and asserts
+  the LRU victim is retired together with its MySQL pool.
+- **Half-open detection (real blackhole)**: the script inserts
+  `iptables -I INPUT -j DROP` inside the bastion (NET_ADMIN; fallback:
+  network disconnect) mid-test — no FIN/RST ever reaches the client.
+  Keepalive is a documented knob (`SEQUEL_MCP_SSH_KEEPALIVE_SECS`,
+  1..=300, default 30; the matrix runs at 2 s). Two REAL bugs found and
+  fixed by this test: the pre-work session setup (checkout,
+  CONNECTION_ID, START TRANSACTION) and the D2 KILL control connection
+  were both unbounded — the setup is now wrapped in the statement
+  budget and a timed-out KILL counts as a failed kill (→ Uncertain).
+  The half-open query fails typed (`statement timed out`) in ~15-18 s.
+- **No mutation replay**: an INSERT attempted during the blackhole
+  fails typed, exactly once; the recovery phase proves the row never
+  landed.
+- **Restart recovery**: bastion restart → fresh session → queries flow.
+- **Key coverage**: encrypted Ed25519 (passphrase = the `<conn>::ssh`
+  secret, which now also serves as the private-key passphrase under key
+  auth), ECDSA, plain Ed25519, RSA with `best_supported_rsa_hash`
+  negotiation (SHA-512 preferred, SHA-256 fallback, ssh-rsa/SHA-1
+  never); unsupported algorithms fail with a typed
+  `unsupported private key algorithm` error before any auth attempt.
+- **Rotation invalidation**: the tunnel cache key binds the config
+  revision, the SSH credential generation (process-keyed HMAC fragment
+  — never the secret), and a known_hosts content stamp; establishing a
+  tunnel retires stale entries of the same connection. Live: after the
+  script rotates the bastion password server-side, the OLD credential
+  gets a typed Auth failure (no stale authenticated session reuse) and
+  the NEW one works.
+- **TLS-over-SSH + MySQL 8.4**: new `sslCaPath` config field (PEM/DER
+  CA merged into the TLS roots; v1 migration reads it too). The
+  `mysql84` script variant runs MySQL 8.4 with a test CA,
+  `require_secure_transport=ON` and `caching_sha2_password` behind the
+  bastion — the ENTIRE matrix (all 22 tests) then runs over verified
+  TLS through the tunnel against the original hostname
+  (`sslServerName=db.internal.test`), plus a dedicated hostname-MISMATCH
+  test that fails closed.
+- **SSH cold/warm benchmarks** (opt-in phase,
+  `SEQUEL_MCP_TEST_SSH_BENCH=1`): `SSH_COLD_ESTABLISH median=15.81ms
+  p95=26.56ms`, `SSH_WARM_QUERY median=5.18ms p95=6.86ms` (n=20,
+  development/directional, debug profile, docker topology).
+
+Gates on the final tree: fmt clean, clippy `-D warnings` 0, 137 lib
+tests, 15 lifecycle/isolation tests, SSH matrix 22/22 on MariaDB 11
+(incl. bench) and 22/22 on MySQL 8.4+TLS, both-engine docker matrix
+16/16 (no regression from the executor bounds), workspace tests green,
+gitleaks clean, zero docker leftovers. Local-relay exposure: the
+listener binds 127.0.0.1 only, forwards to exactly one fixed target,
+never accepts dynamic destinations, and dies with its tunnel
+generation; the Unix-domain-socket replacement remains a documented
+#4B+ hardening direction.
+
 ## Session 5 record — unchanged summary
 
 Pool identity (CredentialGeneration, publish-after-healthy, coalescing,

@@ -14,6 +14,9 @@ cd "$(dirname "$0")/.."
 # shellcheck source=scripts/lib/isolated-test-env.sh
 source scripts/lib/isolated-test-env.sh
 
+# WHAT=mariadb (default) | mysql84 | both. The mysql84 variant enables
+# TLS (test CA + server cert for db.internal.test, require_secure_transport)
+# so the TLS-over-SSH and MySQL 8.4 caching_sha2 cases run against it.
 WHAT="${1:-mariadb}"
 STAMP="$(date +%s)-$$"
 NETWORK="sqm-ssh-net-$STAMP"
@@ -55,27 +58,66 @@ SSH_PORT="$(pick_port)"
 KEY_DIR="$ISO_ROOT/keys"
 mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"
 ssh-keygen -q -t ed25519 -N "" -f "$KEY_DIR/id_ed25519" -C "sqm-ssh-test"
+# Encrypted key: the passphrase plays the <conn>::ssh secret role.
+ssh-keygen -q -t ed25519 -N "$SSH_PASSWORD" -f "$KEY_DIR/id_enc" -C "sqm-ssh-enc"
+# ECDSA key (unencrypted).
+ssh-keygen -q -t ecdsa -N "" -f "$KEY_DIR/id_ecdsa" -C "sqm-ssh-ecdsa"
 # Decoy keypair: its public half masquerades as the "known" host key in
 # the mismatch fixture.
 ssh-keygen -q -t ed25519 -N "" -f "$KEY_DIR/decoy" -C "sqm-decoy"
-PUB_KEY="$(cat "$KEY_DIR/id_ed25519.pub")"
+PUB_KEY="$(cat "$KEY_DIR/id_ed25519.pub" "$KEY_DIR/id_enc.pub" "$KEY_DIR/id_ecdsa.pub")"
 
 # --- Topology -----------------------------------------------------------
-# Private network; MariaDB attached WITHOUT any published port (alias
-# "db"); bastion attached to the same network with its SSH port
+# Private network; the database attached WITHOUT any published port
+# (alias "db"); bastion attached to the same network with its SSH port
 # published on loopback only. The bastion is a purpose-built alpine
 # sshd image (deterministic config: TCP forwarding explicitly enabled,
 # password + pubkey auth) so the transport under test is not at the
 # mercy of a vendor image's defaults.
 docker network create "$NETWORK" >/dev/null
 
-{
-  printf 'MARIADB_ROOT_PASSWORD=%s\n' "$DB_PASSWORD"
-  printf 'MARIADB_DATABASE=app\n'
-} >"$SECRET_FILE"
-docker run -d --name "$DB_CONTAINER" --network "$NETWORK" \
-  --network-alias db --env-file "$SECRET_FILE" mariadb:11 >/dev/null
-rm -f "$SECRET_FILE"
+case "$WHAT" in
+  both)
+    # Two full, independent matrices (fresh topology each).
+    bash "$0" mariadb
+    bash "$0" mysql84
+    echo "==> SSH transport matrix PASSED (both)"
+    exit 0
+    ;;
+  mysql84)
+    DB_IMAGE="mysql:8.4"
+    DB_TLS=1
+    ;;
+  *)
+    DB_IMAGE="mariadb:11"
+    DB_TLS=0
+    ;;
+esac
+
+start_db() {
+  if [ "$DB_IMAGE" = "mysql:8.4" ]; then
+    {
+      printf 'MYSQL_ROOT_PASSWORD=%s\n' "$DB_PASSWORD"
+      printf 'MYSQL_DATABASE=app\n'
+    } >"$SECRET_FILE"
+    docker run -d --name "$DB_CONTAINER" --network "$NETWORK" \
+      --network-alias db --env-file "$SECRET_FILE" \
+      -v "$TLS_DIR:/etc/mysql/tls:ro" \
+      mysql:8.4 \
+      --ssl-ca=/etc/mysql/tls/ca-cert.pem \
+      --ssl-cert=/etc/mysql/tls/server-cert.pem \
+      --ssl-key=/etc/mysql/tls/server-key.pem \
+      --require_secure_transport=ON >/dev/null
+  else
+    {
+      printf 'MARIADB_ROOT_PASSWORD=%s\n' "$DB_PASSWORD"
+      printf 'MARIADB_DATABASE=app\n'
+    } >"$SECRET_FILE"
+    docker run -d --name "$DB_CONTAINER" --network "$NETWORK" \
+      --network-alias db --env-file "$SECRET_FILE" "$DB_IMAGE" >/dev/null
+  fi
+  rm -f "$SECRET_FILE"
+}
 
 SSHD_BUILD="$(mktemp -d)"
 cat >"$SSHD_BUILD/Dockerfile" <<'DOCKER'
@@ -83,7 +125,7 @@ cat >"$SSHD_BUILD/Dockerfile" <<'DOCKER'
 # base image is byte-stable across runs; the running sshd version is
 # printed below.
 FROM alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
-RUN apk add --no-cache openssh-server openssh-client
+RUN apk add --no-cache openssh-server openssh-client iptables
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
@@ -110,6 +152,9 @@ HostKey /etc/ssh/ssh_host_rsa_key
 # forwarding this bastion exists for; everything else is off.
 AllowTcpForwarding local
 PermitOpen any
+# One multiplexed SSH session carries one channel per MySQL connection;
+# concurrent clients need headroom beyond the OpenSSH default of 10.
+MaxSessions 64
 GatewayPorts no
 X11Forwarding no
 AllowAgentForwarding no
@@ -130,6 +175,7 @@ docker build -q -t "sqm-sshd:$STAMP" "$SSHD_BUILD" >/dev/null
 rm -rf "$SSHD_BUILD"
 
 docker run -d --name "$SSHD_CONTAINER" --network "$NETWORK" \
+  --cap-add NET_ADMIN \
   -p "127.0.0.1:$SSH_PORT:2222" \
   -e USER_NAME="$SSH_USER" -e USER_PASSWORD="$SSH_PASSWORD" \
   -e PUBLIC_KEY="$PUB_KEY" \
@@ -165,7 +211,8 @@ EOF
 wait_healthy_db() {
   local tries=120 consecutive=0
   for _ in $(seq 1 $tries); do
-    if docker exec "$DB_CONTAINER" mariadb-admin -uroot -p"$DB_PASSWORD" status >/dev/null 2>&1; then
+    if docker exec "$DB_CONTAINER" mariadb-admin -uroot -p"$DB_PASSWORD" status >/dev/null 2>&1 \
+      || docker exec "$DB_CONTAINER" mysqladmin -uroot -p"$DB_PASSWORD" status >/dev/null 2>&1; then
       consecutive=$((consecutive + 1))
       if [ "$consecutive" -ge 5 ]; then return 0; fi
     else
@@ -176,6 +223,33 @@ wait_healthy_db() {
   echo "database failed to become healthy" >&2
   return 1
 }
+
+# TLS material for the mysql84 variant (test CA + server cert for the
+# synthetic name db.internal.test — same recipe as tls-fixtures.sh).
+TLS_DIR="$ISO_ROOT/tls"
+gen_tls() {
+  mkdir -p "$TLS_DIR" && chmod 700 "$TLS_DIR"
+  (
+    cd "$TLS_DIR"
+    openssl req -x509 -newkey rsa:2048 -nodes \
+      -keyout ca-key.pem -out ca-cert.pem -days 1 \
+      -subj "/CN=sqm-ssh-ca" -addext "basicConstraints=critical,CA:TRUE" >/dev/null 2>&1
+    openssl req -newkey rsa:2048 -nodes \
+      -keyout server-key.pem -out server.csr \
+      -subj "/CN=db.internal.test" >/dev/null 2>&1
+    printf 'subjectAltName=DNS:db.internal.test\nextendedKeyUsage=serverAuth\n' >server.ext
+    openssl x509 -req -in server.csr \
+      -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial \
+      -out server-cert.pem -days 1 -extfile server.ext >/dev/null 2>&1
+  )
+}
+
+if [ "$DB_TLS" = "1" ]; then gen_tls; fi
+start_db
+export SEQUEL_MCP_TEST_SSH_TLS="$DB_TLS"
+if [ "$DB_TLS" = "1" ]; then
+  export SEQUEL_MCP_TEST_SSH_TLS_CA="$TLS_DIR/ca-cert.pem"
+fi
 
 wait_listening "$SSH_PORT"
 wait_healthy_db
@@ -241,7 +315,16 @@ export SEQUEL_MCP_TEST_SSH_KNOWN_REVOKED="$REVOKED_KNOWN"
 export SEQUEL_MCP_TEST_SSH_KNOWN_MALFORMED="$MALFORMED_KNOWN"
 export SEQUEL_MCP_TEST_SSH_KNOWN_MISSING="$MISSING_KNOWN"
 export SEQUEL_MCP_TEST_SSH_KEY="$KEY_DIR/id_ed25519"
+export SEQUEL_MCP_TEST_SSH_KEY_ENC="$KEY_DIR/id_enc"
+export SEQUEL_MCP_TEST_SSH_KEY_ECDSA="$KEY_DIR/id_ecdsa"
 export SEQUEL_MCP_TEST_SSH_MYSQL_CREDS="root:$DB_PASSWORD"
+# Rotation + half-open fixtures.
+SSH_PASSWORD2="$(head -c 18 /dev/urandom | base64 | tr -d '=+/' | head -c 20)"
+export SEQUEL_MCP_TEST_SSH_PASSWORD2="$SSH_PASSWORD2"
+export SEQUEL_MCP_TEST_SSH_SENTINEL="$ISO_ROOT/blackhole-now"
+# Shorter keepalive so half-open detection runs in seconds (knob is
+# clamped 1..=300 in the binary).
+export SEQUEL_MCP_SSH_KEEPALIVE_SECS=2
 
 refresh_host_key_fixture() {
   local pub
@@ -257,7 +340,10 @@ refresh_host_key_fixture() {
 # ---- Phase A: bastion up — transport, host-key gates, auth, reuse ----
 cargo test --test mysql_ssh -- --test-threads=1 \
   --skip ssh_bastion_death_typed_refusal \
-  --skip ssh_bastion_reconnect_after_restart
+  --skip ssh_bastion_reconnect_after_restart \
+  --skip ssh_halfopen_stale_session_bounded \
+  --skip ssh_blackhole_recovery \
+  --skip ssh_rotation_old_credential_rejected
 
 # ---- Phase B: bastion DOWN — typed, bounded refusal (fresh process) ----
 docker stop "$SSHD_CONTAINER" >/dev/null
@@ -270,6 +356,49 @@ docker start "$SSHD_CONTAINER" >/dev/null
 wait_listening "$SSH_PORT"
 refresh_host_key_fixture
 cargo test --test mysql_ssh ssh_bastion_reconnect_after_restart -- \
+  --exact --test-threads=1
+
+# ---- Phase D: packet blackhole (half-open) — DROP all bastion input
+# (established AND new), so no FIN/RST ever reaches the client. The
+# dropper creates the sentinel right after the rule lands; the test
+# holds a live session, waits for the sentinel, and must see the stale
+# session fail within a bounded window.
+rm -f "$SEQUEL_MCP_TEST_SSH_SENTINEL"
+BLACKHOLE_OK=0
+if docker exec "$SSHD_CONTAINER" iptables -L >/dev/null 2>&1; then
+  BLACKHOLE_OK=1
+  echo "==> blackhole via iptables DROP (lands at t+12s)"
+  ( sleep 12 \
+    && docker exec "$SSHD_CONTAINER" iptables -I INPUT -j DROP \
+    && touch "$SEQUEL_MCP_TEST_SSH_SENTINEL" ) &
+else
+  echo "==> iptables unavailable; falling back to network disconnect"
+  ( sleep 12 \
+    && docker network disconnect "$NETWORK" "$SSHD_CONTAINER" \
+    && touch "$SEQUEL_MCP_TEST_SSH_SENTINEL" ) &
+fi
+cargo test --test mysql_ssh ssh_halfopen_stale_session_bounded -- \
+  --exact --test-threads=1
+wait || true
+if [ "$BLACKHOLE_OK" = "1" ]; then
+  docker exec "$SSHD_CONTAINER" iptables -D INPUT -j DROP >/dev/null 2>&1 || true
+else
+  docker network connect "$NETWORK" "$SSHD_CONTAINER" 2>/dev/null || true
+fi
+# Recovery after the blackhole clears.
+cargo test --test mysql_ssh ssh_blackhole_recovery -- \
+  --exact --test-threads=1
+
+# ---- Optional bench phase (SSH cold/warm) ----
+if [ "${SEQUEL_MCP_TEST_SSH_BENCH:-0}" = "1" ]; then
+  cargo test --test mysql_ssh ssh_bench_cold_warm -- --exact --test-threads=1 --nocapture
+fi
+
+# ---- Phase E: credential rotation server-side — the OLD password must
+# fail authentication (no stale authenticated session reuse).
+docker exec "$SSHD_CONTAINER" sh -c \
+  "echo '$SSH_USER:$SSH_PASSWORD2' | chpasswd"
+cargo test --test mysql_ssh ssh_rotation_old_credential_rejected -- \
   --exact --test-threads=1
 
 echo "==> SSH transport matrix PASSED"
