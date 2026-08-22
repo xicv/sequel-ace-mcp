@@ -338,6 +338,151 @@ are each closed with executable evidence:
   Remaining gates (fmt/clippy/gitleaks/patch SHA) recorded in the
   checkpoint-#3A preservation artifacts.
 
+## Checkpoint #3A landing (verified 2026-08-22)
+
+The user ran the NORMAL Terminal `git commit` (hooks executed; no
+plumbing; no waiver reused):
+
+```text
+CHECKPOINT_3A_SHA=9ff55512636a8404db1536360896faba5e8aaa95
+CHECKPOINT_3A_BUNDLE_SHA256=0c7af8444e82e4f2ff8c58dc2c86b35d236ee3e696badce5c34f779ae5fd01c3
+WORKTREE_STATUS=clean
+PUSHED=false
+```
+
+Three-way verification immediately after: HEAD == bundle ref == reported
+SHA; parent `ec9a64c`; normal commit shape (configured author/committer,
+normal timestamps, single parent); full message byte-equal to the
+reviewer-specified two-paragraph text; reconstructed `git diff HEAD~1
+HEAD` byte-identical to the preserved staged patch (sha256 `5482b57d…`);
+worktree + index clean; `git fsck --strict` clean (3 harmless dangling
+blobs); remote has no `rewrite/rust-native` ref. One in-session normal
+commit attempt was made first under explicit user approval ("approve to
+run the cmds") and was blocked by the mimosa git-gate (L3 high finding on
+the LEGACY checkout's `src/sql/sshHostKey.ts` — HMAC-SHA1 of the OpenSSH
+hashed-known_hosts format — a false positive in a tree that is not the
+one being committed; the gate scans the session's primary working
+directory). Per the review instruction the block was reported, state was
+verified intact, and no plumbing path was taken.
+
+## Session 7 (SSH direct transport)
+
+Unfreeze stage 1. **Design** (`src/sql/ssh.rs`): russh 0.62 client +
+local loopback forwarder — `mysql_async` always connects to
+`127.0.0.1:<ephemeral>`; every local TCP connection is bridged onto a
+fresh `direct_tcpip` channel of ONE multiplexed SSH session to the
+bastion, which forwards to the MySQL host/port as seen from the bastion
+(the docker network name, not a host-published port). Tunnels are
+process-wide and bounded (MAX 8; dead sessions evicted; next request
+re-establishes transparently); the MySQL pool keys on the tunnel
+endpoint (config_key already includes host/port overrides), so tunneled
+pools stay separate from direct ones and are reused per bastion session.
+
+- **Host-key verification** goes through the ported known_hosts engine
+  (`decide_host_key`): strict = fail closed (unknown host or key
+  mismatch → no SSH session, no tunnel, nothing cached); lenient =
+  accept with loud logging (legacy semantics). `check_server_key` feeds
+  the wire-format key blob (`public_key_bytes`).
+- **Auth is exactly the configured method** — password (from the secret
+  store under `<connection>::ssh` / ssh user, fetched by the gate with
+  fail-closed NoPassword audit) or publickey (privateKeyPath, RSA
+  SHA-256 signatures, no silent fallback between methods).
+- **Bounded establish**: 15 s deadline around connect+KEX+auth;
+  keepalive 30 s × 3; channel-open failures are logged, never swallowed.
+- **Test-mode gate applies to the bastion endpoint too** (loopback or
+  allow-listed, checked before any socket).
+- **Gate wiring**: `gate.rs` establishes/reuses the tunnel and hands the
+  executor `tunnel_endpoint`; tunnel failures audit as `execution_error`
+  with a typed `ssh tunnel:` message.
+
+**Live topology** (`scripts/test-ssh.sh`): a purpose-built alpine sshd
+bastion (deterministic config: AllowTcpForwarding yes, password +
+pubkey auth, fresh host keys per run) with its port published on
+loopback, and a MariaDB container attached to a private docker network
+with NO published MySQL port (alias `db`) — the database is reachable
+ONLY through the bastion, proving the tunnel carries the traffic. Per-run
+synthetic credentials (0600 env-file), generated client + decoy ed25519
+keypairs, and three known_hosts fixtures (real key / decoy mismatch /
+unrelated host). All under the shared fail-closed isolation root.
+
+**Verified automatically** (`tests/mysql_ssh.rs`, 3 script-driven
+phases):
+- Phase A (bastion up) — 5/5: full SQL round trips through the tunnel
+  under strict password auth (CREATE/INSERT/SELECT COUNT); exactly ONE
+  multiplexed tunnel across the whole matrix (reuse), same local
+  endpoint on the second request; **strict host-key mismatch → typed
+  rejection, nothing cached**; **strict unknown host → typed rejection**;
+  strict publickey auth round trip; **full gate end-to-end** (config
+  with an ssh block, in-memory secrets incl. `<conn>::ssh`, `SELECT`
+  through `gate::run_sql`).
+- Phase B (bastion stopped by the script) — 1/1: a fresh process gets a
+  bounded (≤20 s) typed `SshError::Transport` — never a hang.
+- Phase C (bastion restarted, host-key fixture refreshed) — 1/1: queries
+  flow again through the fresh session.
+- Also found along the way: the stock linuxserver/openssh-server image
+  silently prohibits TCP forwarding (`AdministrativelyProhibited`) even
+  after an apparent config flip + reload — replaced with the purpose-
+  built alpine bastion so the transport is not at a vendor image's
+  mercy; the bastion entrypoint is idempotent across restarts.
+
+Docker-bridge forwarding (nc/ncat/socat inside the bastion container)
+remains a separate later stage; `SshDocker` config is still unimplemented
+runtime-wise.
+
+**Reviewer pre-commit gates for #4 (all closed, 2026-08-22)**:
+
+1. **Checkpoint #3A provenance re-verified**: HEAD `9ff5551` is a
+   normal commit (fuller format shows configured author/committer and
+   normal timestamps), parent `ec9a64c`, the #3A bundle lists the ref at
+   HEAD, no unstaged changes, `fsck --strict` clean.
+2. **russh pinned exactly**: `russh 0.62.7` from the crates.io registry
+   with lockfile checksum `9decb68e…`, no git dependencies (>= the
+   0.62.4 pre-auth X25519 malformed-reply DoS fix and the 0.62.5
+   channel-backpressure fix). `cargo audit`: only the pre-existing
+   allowed advisory (RUSTSEC-2026-0192 ttf-parser, egui embedded-font
+   exception); `cargo deny check`: advisories/bans/licenses/sources all
+   ok.
+3. **Host-key semantics narrowed (fail-closed everywhere except genuine
+   migration unknowns)**: lenient now REJECTS a key mismatch (server
+   identity change / possible impersonation is never acceptable) — only
+   a genuinely unknown host may be accepted under lenient, with a loud
+   warning; revoked keys are rejected in every mode; an EXPLICITLY
+   configured known_hosts file that is unreadable, or that contains no
+   parseable entry at all, is a typed deny (`load_known_hosts_checked`)
+   instead of a silently-empty host set (an absent default
+   ~/.ssh/known_hosts remains an empty set: strict rejects unknown
+   hosts anyway). Live-verified: strict @revoked deny, lenient unknown
+   accept (query still works), **lenient mismatch deny**, missing-file
+   deny ("unreadable"), malformed-file deny ("malformed"); unit tests
+   cover strict unknown/mismatch/revoked, lenient unknown/mismatch/
+   revoked, hashed hostnames, bracketed ports, multiple key algorithms
+   for one host, and the checked loader's fail-closed matrix.
+4. **Test bastion fully pinned and minimized**: base image
+   `alpine:3.20@sha256:d9e853e8…` (immutable digest; running OpenSSH
+   9.7p1 printed per run); sshd config allows ONLY what the transport
+   needs — verified per run via `sshd -T`: `allowtcpforwarding local`,
+   `gatewayports no`, `x11forwarding no`, `allowagentforwarding no`,
+   `permittunnel no`, `permituserenvironment no`, `permittty no`,
+   password+pubkey auth; the script asserts the database container has
+   ZERO published ports and prints the network name and ISO_ROOT.
+
+Full gates on the final tree: 135 lib tests, 15 lifecycle/isolation,
+SSH live matrix 12/12 across three phases, both-engine docker matrix
+16/16, `cargo test --workspace --all-features --locked` green, clippy
+`-D warnings` 0, fmt clean, cargo audit/deny clean, gitleaks clean,
+zero docker leftovers.
+
+Deferred to the SSH hardening checkpoint #4A (per review): concurrent
+initialization coalescing, tunnel-generation/pool invalidation (the
+loopback-port ABA concern), bounded LRU eviction + graceful shutdown,
+half-open detection, no-mutation-replay, TLS-over-SSH verification,
+MySQL 8.4 caching_sha2 over SSH, encrypted Ed25519/ECDSA/RSA key
+coverage, credential/known_hosts rotation, local listener exposure
+review (Unix-socket direction), SSH cold/warm benchmarks. RSA signature
+hash selection currently pins rsa-sha2-256 (never ssh-rsa/SHA-1);
+`best_supported_rsa_hash` negotiation and the typed unsupported-key
+error for non-RSA/non-Ed25519 formats land in #4A.
+
 ## Session 5 record — unchanged summary
 
 Pool identity (CredentialGeneration, publish-after-healthy, coalescing,

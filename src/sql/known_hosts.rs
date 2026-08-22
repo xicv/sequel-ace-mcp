@@ -255,6 +255,41 @@ pub fn load_known_hosts(file_path: Option<&std::path::Path>) -> Vec<KnownHostEnt
     }
 }
 
+/// Fail-closed loader: an EXPLICITLY configured known_hosts file that
+/// cannot be read, or that contains no parseable entry at all, is a
+/// deny (in every policy mode) rather than a silently-empty host set.
+/// An absent DEFAULT path (~/.ssh/known_hosts) stays an empty set —
+/// strict then rejects unknown hosts anyway, lenient TOFU-accepts.
+pub fn load_known_hosts_checked(
+    file_path: Option<&std::path::Path>,
+) -> Result<Vec<KnownHostEntry>, String> {
+    let explicit = file_path.is_some();
+    let target = file_path
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| crate::app::paths::expand_tilde("~/.ssh/known_hosts"));
+    match std::fs::read_to_string(&target) {
+        Err(e) if explicit => Err(format!(
+            "known_hosts file {} is unreadable: {e}",
+            target.display()
+        )),
+        Err(_) => Ok(Vec::new()),
+        Ok(content) => {
+            if content.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            let entries = parse_known_hosts(&content);
+            if entries.is_empty() {
+                Err(format!(
+                    "known_hosts file {} is malformed: no parseable entries",
+                    target.display()
+                ))
+            } else {
+                Ok(entries)
+            }
+        }
+    }
+}
+
 /// Decision for `check_server_key` in the SSH client handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostKeyDecision {
@@ -298,15 +333,20 @@ pub fn decide_host_key(
         }
         return HostKeyDecision::Accept;
     }
-    // lenient (migrated configs only, warned loudly)
+    // lenient (migration compatibility ONLY, warned loudly). A MISMATCH
+    // means the server identity changed or is being impersonated — that
+    // is rejected in EVERY mode. Only a genuinely unknown host may be
+    // accepted under lenient, with a high-visibility warning.
     if r.had_matching_host_entry && !r.matched {
         log(format!(
-            "SSH host key MISMATCH for {host}:{port} (lenient mode — accepting). Got={}",
+            "SSH host key MISMATCH for {host}:{port} (lenient mode — REJECTING). Got={}",
             r.fingerprint
         ));
-    } else if !r.had_matching_host_entry {
+        return HostKeyDecision::Reject;
+    }
+    if !r.had_matching_host_entry {
         log(format!(
-            "SSH host {host}:{port} not in known_hosts (lenient mode — accepting). Add {} to enable strict mode.",
+            "SSH host {host}:{port} not in known_hosts (lenient mode — accepting, migration compatibility only). Add {} to enable strict mode.",
             r.fingerprint
         ));
     }
@@ -470,6 +510,19 @@ mod tests {
             ),
             HostKeyDecision::Accept
         );
+        // lenient: MISMATCH REJECTED (server identity change is never
+        // acceptable, even in migration-compatibility mode)
+        assert_eq!(
+            decide_host_key(
+                SshHostKeyPolicy::Lenient,
+                "host-a.example.invalid",
+                22,
+                &h_no_revoke,
+                OTHER,
+                &mut log
+            ),
+            HostKeyDecision::Reject
+        );
         // revoked rejected even lenient
         assert_eq!(
             decide_host_key(
@@ -524,6 +577,75 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn multiple_algorithms_for_same_host() {
+        // Two entries for one host with different key types: either key
+        // is acceptable; a third, unseen key is a mismatch.
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let entries = parse_known_hosts(&format!(
+            "multi.example.invalid ssh-ed25519 {}\n             multi.example.invalid ssh-rsa {}",
+            b64(PUB),
+            b64(OTHER)
+        ));
+        assert_eq!(entries.len(), 2);
+        let mut log = |_: String| {};
+        assert_eq!(
+            decide_host_key(
+                crate::config::SshHostKeyPolicy::Strict,
+                "multi.example.invalid",
+                22,
+                &entries,
+                OTHER,
+                &mut log
+            ),
+            HostKeyDecision::Accept
+        );
+        let third = b"AAAAC3NzaC1lZDI1NTE5AAAAIThirdKeyNeverSeenBefore0000000000000";
+        assert_eq!(
+            decide_host_key(
+                crate::config::SshHostKeyPolicy::Strict,
+                "multi.example.invalid",
+                22,
+                &entries,
+                third,
+                &mut log
+            ),
+            HostKeyDecision::Reject
+        );
+    }
+
+    #[test]
+    fn checked_loader_fail_closed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let good = dir.path().join("good");
+        std::fs::write(
+            &good,
+            "h.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixture
+",
+        )
+        .unwrap();
+        assert!(load_known_hosts_checked(Some(&good)).is_ok());
+
+        // Explicit path that does not exist: deny.
+        let missing = dir.path().join("missing");
+        let err = load_known_hosts_checked(Some(&missing)).unwrap_err();
+        assert!(err.contains("unreadable"), "{err}");
+
+        // Non-empty file with zero parseable entries: deny. (A 3-part
+        // garbage line still parses, mirroring OpenSSH's tolerant
+        // reader — such lines simply never match; only lines with no
+        // key field at all are structurally unparseable.)
+        let malformed = dir.path().join("garbage");
+        std::fs::write(&malformed, "two-parts-only\n???\nno-key-here either-way\n").unwrap();
+        let err = load_known_hosts_checked(Some(&malformed)).unwrap_err();
+        assert!(err.contains("malformed"), "{err}");
+
+        // Empty file is an empty set (not an error).
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "\n").unwrap();
+        assert!(load_known_hosts_checked(Some(&empty)).unwrap().is_empty());
     }
 
     /// Differential check against the legacy fixtures.
