@@ -957,6 +957,32 @@ secret scan clean. Ubuntu clippy now carries only fixes the compiler
 itself prescribed; any residual Linux-only finding will surface on
 the next PR run for the same iterate-and-verify loop.
 
+## Session 16 (checkpoint #14: wall-clock statement timeout)
+
+CI run 32610914794 (after `ed44d97c`) — secret scan SUCCESS, Ubuntu
+clippy SUCCESS, 161 lib tests SUCCESS on the runner, 15/16 lifecycle
+tests green; the sole failure, `d7_eof_during_in_flight_request`,
+reproduced IDENTICALLY on a rerun (deterministic, not contention
+flakiness) and exposed a real bug:
+
+**the SQLite statement-timeout watchdog counted iterations, not
+wall-clock time.** `execute_sqlite_statement` armed its interrupt by
+sleeping 1 ms in a loop `stmt_timeout_ms` times — under scheduler
+contention each sleep stretches arbitrarily, so "5 s" became 25 s+
+on the 16-parallel-process lifecycle suite (≤4 runner vCPUs plus the
+infinite recursive CTE burning a core). The d7 test (stdin EOF during
+an in-flight runaway query; process must exit within 15 s) then hung
+past its bound because EOF shutdown drains the in-flight request.
+Locally the many-core dev machine kept the sleeps near 1 ms, which is
+why it never reproduced here — the runner was the better oracle.
+
+Fix: a true wall-clock `Instant` deadline, slept in ≤50 ms slices
+(still polling the done-flag so completion is noticed promptly);
+interrupt fires at the deadline regardless of scheduler pressure.
+Verified locally: sqlite unit tests incl. `statement_timeout_
+interrupts` (4/4), d7_eof (8.7 s incl. build), full 161 lib + 16
+lifecycle suites, clippy `-D warnings` 0, fmt clean.
+
 ## Session 5 record — unchanged summary
 
 Pool identity (CredentialGeneration, publish-after-healthy, coalescing,

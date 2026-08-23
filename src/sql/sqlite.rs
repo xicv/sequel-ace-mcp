@@ -236,11 +236,18 @@ pub fn execute_sqlite_statement(
     let done_flag = done.clone();
     let timeout_ms = params.policy.stmt_timeout_ms;
     let timer = std::thread::spawn(move || {
-        for _ in 0..(timeout_ms.max(1)) {
-            if done_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                return;
+        // TRUE wall-clock deadline: a fixed iteration count of 1 ms
+        // sleeps stretches arbitrarily under scheduler contention
+        // (found by the CI runner: 16 process-heavy tests in parallel
+        // turned "5 s" into 25 s+ and hung EOF shutdown past its
+        // bound). Sleep in slices only so `done` is noticed promptly.
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1) as u64);
+        while !done_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
             }
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep((deadline - now).min(Duration::from_millis(50)));
         }
         if !done_flag.load(std::sync::atomic::Ordering::SeqCst) {
             interrupt.interrupt();
