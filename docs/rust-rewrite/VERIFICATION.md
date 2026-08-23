@@ -815,6 +815,45 @@ the committed tree and belongs to the packaging stage), gitleaks
 clean, whitespace clean, SSH matrix 27/27 green (mariadb), both-engine
 docker matrix green, zero docker leftovers.
 
+## Session 12 (checkpoint #10: packaging, install, release/LTO benchmarks)
+
+The packaging-gate debt from the D8 benchmark header ("release/LTO
+numbers with identical methodology are required before any
+packaging-gate performance claim") is paid, and the whole packaging
+surface is now verified on the committed tree:
+
+- **`cargo package --locked`** — 86 files, 1.1 MiB (279.7 KiB
+  compressed); `src/gui/*` ships; the exclude list is respected (no
+  docs/rust-rewrite, .github, .codex, skills, tests/fixtures/legacy).
+  The in-package verification build compiles clean.
+- **`cargo publish --dry-run --locked`** — metadata accepted, upload
+  aborted by the dry run (nothing published; whether to actually use
+  crates.io is a separate decision — the legacy line went source-only).
+- **Install-from-package**: `cargo install` from the unpacked package
+  directory (`target/package/sequel-mcp-0.10.0/`, i.e. exactly what a
+  crates.io user builds) into an isolated `--root`: `--version` reports
+  0.10.0, `gui --help` documents the companion window, `gui --smoke 5`
+  opens a real window and self-closes (exit 0) FROM THE INSTALLED
+  ARTIFACT, and `approve --socket <missing>` fails with the typed
+  no-server error and exit 1.
+- **`scripts/bench-mcp.sh` PROFILE support** — `PROFILE=release`
+  builds/uses `target/release/sequel-mcp` and labels the run
+  packaging-grade; default stays debug-directional.
+- **Release/LTO numbers** (Mac15,6 arm64, isolated config, n=50,
+  identical methodology to the debug runs): RUST_COLD_INIT median
+  6.96 ms (p95 7.55, max 8.21); RUST_COLD_TO_TOOLS_LIST median
+  7.57 ms (p95 8.15, max 8.78); RUST_WARM_TOOLS_LIST median 0.18 ms
+  (p95 0.22, max 0.54); RUST_MCP_SQLITE_QUERY_FIRST3 1.61 ms (n=3);
+  RUST_MCP_SQLITE_QUERY_WARM median 1.53 ms (p95 1.64, max 1.69).
+  Same-day debug comparison (n=30): cold init 8.25 ms, cold
+  tools/list 11.08 ms, warm tools/list 1.53 ms, warm query 1.81 ms —
+  warm tools/list improves ~8.5× under release/LTO.
+
+Gates: `bash -n` on the edited script, cargo fmt --check clean,
+whitespace clean (the Rust tree is untouched this checkpoint; the
+package/publish gates above ran against the committed #9 tree and a
+scripts-only change does not invalidate them).
+
 ## Session 5 record — unchanged summary
 
 Pool identity (CredentialGeneration, publish-after-healthy, coalescing,
