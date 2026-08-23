@@ -34,6 +34,16 @@ enum Command {
         #[arg(long)]
         choice: Option<String>,
     },
+    /// Native approvals companion window: watches the runtime socket and
+    /// answers the server's confirmations with real clicks.
+    Gui {
+        /// Socket path override (default: the runtime registry socket).
+        #[arg(long)]
+        socket: Option<String>,
+        /// Smoke test: close the window after N rendered frames.
+        #[arg(long, hide = true)]
+        smoke: Option<u32>,
+    },
 }
 
 fn main() {
@@ -42,6 +52,12 @@ fn main() {
         Command::Serve => serve(),
         Command::Doctor { json } => doctor(json),
         Command::Approve { socket, choice } => approve(socket, choice),
+        Command::Gui { socket, smoke } => sequel_mcp::gui::run_gui(sequel_mcp::gui::GuiOptions {
+            socket: socket
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(sequel_mcp::gui::default_socket),
+            smoke_frames: smoke,
+        }),
     };
     std::process::exit(code);
 }

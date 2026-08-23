@@ -29,7 +29,7 @@ pub const APPROVAL_IPC_TIMEOUT: Duration = Duration::from_secs(60);
 /// Max protocol line (requests are small by construction).
 const MAX_LINE: usize = 64 * 1024;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ApprovalRequest {
     pub id: String,
     pub category: String,
