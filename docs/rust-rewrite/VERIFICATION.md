@@ -1197,6 +1197,49 @@ replay exist); (4) the MySQL password necessarily lives in pooled
 connection options (mysql_async owns a copy) — intermediates could be
 zeroized further, but pool lifetime cannot.
 
+## Session 21 (checkpoint #19: P1 — restore per-statement policy + journal link_audit, 0.10.2)
+
+The reviewer's P1 backlog pair, closing the two security-integrity
+follow-ups flagged before merge:
+
+- **restore_backup per-statement policy + audit** (`mcp/tools.rs`):
+  `resolve_restore_plan` classifies and two-layer-resolves EVERY
+  replayed statement — any Deny refuses the WHOLE replay with a typed
+  message naming the offending statement and its table scope (an outer
+  approval can never cover a denied statement), and the refusal itself
+  writes a Denied audit row linked to the backup. Dry-runs now carry a
+  per-statement `policy` preview (category/action/databases per
+  statement, `wouldDeny` + reason when denied) — strengthening the
+  manual-review discipline. Successful replays write ONE audit row per
+  statement (`restore-<backup>-<uuid>-<i>` request ids, `backupId`
+  linked, `approvalScope: "restore"`); a failed replay writes a single
+  ExecutionError row linked to the backup. Audit-write failures are
+  surfaced as `auditWarnings` in the result (never swallowed — the
+  Session 19 lesson), without erroring a committed restore.
+- **Journal `link_audit` wired** (`sql/mysql.rs` + `app/gate.rs`): the
+  MySQL executor no longer pre-finalizes journals after COMMIT (it
+  stops at `mutation_committed` — the crash-window ambiguity
+  `recoverable()` exists to surface is no longer masked); the journal
+  id is threaded out of the executor (previously dropped); the gate
+  finalizes AND calls `link_audit(audit_row_id)` after the audit write
+  succeeds (`audit()` now returns the row id). Direct executor callers
+  (tests) close out explicitly — the D3/D4/D4A matrices model that
+  contract and D3 asserts finalize + audit-row linkage end-to-end.
+- **Latent bug found and fixed by the new tests**: the legacy-era peer
+  elicitation (`ChoiceForm`) NEVER worked against a real client — the
+  typed GrantChoice enum's generated schema is rejected by rmcp's
+  `PrimitiveSchemaDefinition` (a plain-string PasswordForm was fine).
+  No test had ever driven the legacy elicitation confirm path
+  end-to-end. `ChoiceForm.choice` is now a plain string parsed
+  manually; unknown values map to Unavailable (never a decline).
+
+Verified: 2 new lifecycle tests (denied-statement refuses the whole
+replay, value unchanged, dry-run preview flags the deny; successful
+replay restores the pre-image AND audit_search shows the
+`restore-2-*` rows with `backupId` linked), 21/21 lifecycle, 165 lib,
+mariadb + mysql docker matrices and the SSH matrix PASSED, clippy 0,
+fmt clean.
+
 ## Session 5 record — unchanged summary
 
 Pool identity (CredentialGeneration, publish-after-healthy, coalescing,

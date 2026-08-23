@@ -204,10 +204,11 @@ async fn backup_and_mutation_share_one_connection_and_lock() {
     };
     assert_eq!(v, 999);
 
-    // Journal: the successful operations reached audit_finalized; the
-    // timed-out lock case is not applicable here (A's 4 s deadline > 2 s
-    // sleep). Verify at least one finalized journal exists and links the
-    // backup.
+    // Journal (P1 semantics): the executor now stops at
+    // mutation_committed — only the gate (or an explicit direct-executor
+    // close-out) finalizes after the audit row is durable. Model the
+    // direct-executor contract here: write an audit row, finalize, LINK
+    // it, then verify.
     let journal_dump: Vec<(i64, String, Option<i64>)> = audit
         .with(|c| {
             let mut stmt = c
@@ -220,12 +221,66 @@ async fn backup_and_mutation_share_one_connection_and_lock() {
         })
         .unwrap();
     eprintln!("JOURNAL: {journal_dump:?}");
-    let finalized = journal_dump
+    let committed: Vec<i64> = journal_dump
         .iter()
-        .filter(|(_, st, b)| st == "audit_finalized" && b.is_some())
-        .count() as i64;
+        .filter(|(_, st, b)| st == "mutation_committed" && b.is_some())
+        .map(|(id, _, _)| *id)
+        .collect();
     assert!(
-        finalized >= 1,
-        "journal must link backup and finalized mutation: {journal_dump:?}"
+        !committed.is_empty(),
+        "executor must leave committed journals for the gate/direct caller to finalize: {journal_dump:?}"
+    );
+    for jid in committed {
+        let j = sequel_mcp::backup::journal::Journal::from_id(&audit, jid);
+        // Direct-executor close-out (what the gate does after its audit
+        // write succeeds): finalize + link the audit row.
+        j.transition(
+            sequel_mcp::backup::journal::JournalState::AuditFinalized,
+            None,
+        )
+        .unwrap();
+        let audit_row = sequel_mcp::audit::write_audit_entry(
+            &audit,
+            &sequel_mcp::audit::AuditEntry {
+                request_id: format!("d3-closeout-{jid}"),
+                connection: "d3".into(),
+                databases: vec![],
+                category: sequel_mcp::policy::model::SqlCategory::Write,
+                ast_type: Some("update".into()),
+                sql: "UPDATE d3_items SET value = 999 WHERE id = 1".into(),
+                decision: sequel_mcp::policy::model::PolicyAction::Allow,
+                confirmed: false,
+                outcome: sequel_mcp::approval::outcomes::ApprovalOutcome::Approved,
+                affected_rows: None,
+                duration_ms: None,
+                error: None,
+                backup_id: None,
+                approval_scope: None,
+                approval_digest: None,
+                policy_revision: None,
+            },
+            &sequel_mcp::audit::WriteOptions::default(),
+        )
+        .unwrap();
+        j.link_audit(audit_row).unwrap();
+    }
+    let after: Vec<(i64, String, Option<i64>)> = audit
+        .with(|c| {
+            let mut stmt = c
+                .prepare("SELECT id, state, audit_id FROM operation_journal ORDER BY id")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap();
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap();
+    let linked = after
+        .iter()
+        .filter(|(_, st, a)| st == "audit_finalized" && a.is_some())
+        .count();
+    assert!(
+        linked >= 1,
+        "explicit close-out must finalize AND link the audit row: {after:?}"
     );
 }

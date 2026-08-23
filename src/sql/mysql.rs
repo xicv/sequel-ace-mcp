@@ -587,13 +587,15 @@ pub async fn execute_mysql_statement(
                     (Err(MySqlError::Driver(e)), Some(conn))
                 } else {
                     if let Some(j) = journal {
+                        // Review P1: stop at mutation_committed. The jump
+                        // to audit_finalized happens ONLY after a durable
+                        // audit row exists (the gate writes it and calls
+                        // link_audit); finalizing here used to mask the
+                        // crash-window ambiguity recoverable() exists to
+                        // surface (committed + audit_id NULL). Direct
+                        // executor callers (tests/CLI) close out
+                        // explicitly themselves.
                         let _ = j.transition(JournalState::MutationCommitted, None);
-                        // Direct-executor callers (tests/CLI) have no gate
-                        // audit write; the journal itself is durable here,
-                        // so close it out. Gate callers re-transition
-                        // harmlessly (idempotence guarded by the state
-                        // machine: committed -> finalized is legal).
-                        let _ = j.transition(JournalState::AuditFinalized, None);
                     }
                     (Ok(value), Some(conn))
                 }
@@ -772,7 +774,10 @@ async fn run_in_transaction(
     }
 
     let mut value = ExecuteResult {
-        journal_id: None,
+        // Review P1: thread the journal id so the gate can finalize +
+        // link the audit row after the write lands (previously dropped,
+        // so link_audit never fired).
+        journal_id: journal.as_ref().map(|j| j.id()),
         ddl_no_op: false,
         ddl_absent_targets: ddl_absent.iter().map(|(s, t)| format!("{s}.{t}")).collect(),
         ddl_executed_targets: ddl_executed,

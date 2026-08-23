@@ -2,6 +2,14 @@
 
 All notable changes to **sequel-mcp** are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.2] — 2026-08-23
+
+### Fixed (security integrity — review P1)
+
+- **`restore_backup` enforces the two-layer policy on EVERY replayed statement** and writes one audit row per replayed statement, linked to the backup. Previously only the first statement was deny-checked and restores wrote no audit rows at all: a plan whose later statements targeted policy-denied tables could execute them behind one outer approval. Denied statements now refuse the whole replay with a typed message naming the statement and its table scope; dry-runs carry a per-statement policy preview (`wouldDeny` + reason); a denied attempt is itself audited.
+- **Operation journals are no longer pre-finalized by the MySQL executor**: the executor stops at `mutation_committed` and threads the journal id out; the server finalizes and `link_audit`s the durable audit row only after the audit write succeeds. The crash window between COMMIT and the audit write is no longer masked (it surfaces as recoverable), and journal rows now actually point at their audit entries.
+- **Legacy-era elicitation confirmations work again** (latent bug): the typed choice form's generated schema was rejected by rmcp's elicit schema model, so any client without modern round-trip support got "no prompt could be shown" on every confirm-gated statement. The choice field is now a plain string parsed manually; unknown values fail closed as unavailable, never as a decline.
+
 ## [0.10.1] — 2026-08-23
 
 ### Fixed (documentation only — no runtime change)

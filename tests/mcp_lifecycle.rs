@@ -731,6 +731,349 @@ fn add_connection_without_elicitation_support_fails_closed() {
     drop(server);
 }
 
+// ---- restore_backup: per-statement policy + audit (review P1) ----
+
+/// Shared harness: an isolated sqlite connection with read/write/ddl
+/// allowed, a `users` table with one updated row (the update's pre-image
+/// is the backup we restore), legacy-era initialization.
+fn restore_harness() -> (
+    Server,
+    std::process::ChildStdin,
+    LineReceiver,
+    std::path::PathBuf,
+) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg_root = dir.path().join("cfg");
+    let data_root = dir.path().join("data");
+    std::fs::create_dir_all(cfg_root.join("sequel-mcp")).unwrap();
+    std::fs::create_dir_all(data_root.join("sequel-mcp")).unwrap();
+    let db = dir.path().join("demo.sqlite");
+    std::fs::write(&db, b"").unwrap();
+    let policy = serde_json::json!({
+        "read": "allow", "write": "allow", "ddl": "allow", "admin": "deny",
+        "txCtrl": "allow", "rowCap": 100, "stmtTimeoutMs": 5000,
+        "requireTouchID": false, "maxBackupRows": 100,
+        "maxBackupBytes": 1048576, "onBackupOverflow": "abort"
+    });
+    std::fs::write(
+        cfg_root.join("sequel-mcp").join("config.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "version": 2, "revision": 1, "defaultConnection": "demo",
+            "connections": [
+                {"driver": "sqlite", "name": "demo", "path": db.display().to_string(),
+                 "database": "main", "policy": policy, "tablePolicies": {}}
+            ],
+            "retention": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    eprintln!("ISO_ROOT={}", dir.path().display());
+    let root = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let (server, mut stdin, mut out) = Server::launch(&cfg_root, &data_root);
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"elicitation": {"form": {}}},
+                "clientInfo": {"name": "restore-test", "version": "0"}
+            }
+        }),
+    );
+    let msg = read_response(&mut out, 1, Duration::from_secs(10));
+    assert_eq!(msg["result"]["serverInfo"]["name"], "sequel-mcp");
+    send(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
+    (server, stdin, out, root)
+}
+
+fn restore_exec(
+    stdin: &mut impl Write,
+    out: &mut LineReceiver,
+    id: i64,
+    sql: &str,
+) -> serde_json::Value {
+    send(
+        stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "execute", "arguments": {"sql": sql}}
+        }),
+    );
+    read_response(out, id, Duration::from_secs(10))
+}
+
+fn restore_query(stdin: &mut impl Write, out: &mut LineReceiver, id: i64, sql: &str) -> String {
+    send(
+        stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "query", "arguments": {"sql": sql}}
+        }),
+    );
+    let msg = read_response(out, id, Duration::from_secs(10));
+    msg["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// After a restore call, the next relevant wire message is EITHER the
+/// confirmation elicitation (confirm-gated policy) or the final response
+/// (allow/deny resolves without prompting).
+fn restore_next(out: &mut LineReceiver, want_id: i64) -> (&'static str, serde_json::Value) {
+    let started = Instant::now();
+    loop {
+        if let Some(pos) = out.pending.iter().position(|m| m["id"] == want_id) {
+            return ("resp", out.pending.remove(pos).expect("pending resp"));
+        }
+        if let Some(pos) = out
+            .pending
+            .iter()
+            .position(|m| m["method"] == "elicitation/create")
+        {
+            return ("elicit", out.pending.remove(pos).expect("pending elicit"));
+        }
+        match out.rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => {
+                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if msg["id"] == want_id {
+                        return ("resp", msg);
+                    }
+                    if msg["method"] == "elicitation/create" {
+                        return ("elicit", msg);
+                    }
+                    out.pending.push_back(msg);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if started.elapsed() >= Duration::from_secs(10) {
+                    panic!("no response or elicitation for restore within 10s");
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("stdout closed waiting for restore outcome");
+            }
+        }
+    }
+}
+
+#[test]
+fn restore_denied_statement_refuses_whole_replay() {
+    let (server, mut stdin, mut out, _root) = restore_harness();
+    let mut id = 10;
+
+    let m = restore_exec(
+        &mut stdin,
+        &mut out,
+        id,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+    );
+    assert!(
+        m["result"]["structuredContent"]["affectedRows"].is_number()
+            || m["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("affectedRows"),
+        "{m}"
+    );
+    id += 1;
+    let _ = restore_exec(
+        &mut stdin,
+        &mut out,
+        id,
+        "INSERT INTO users (id, name) VALUES (1, 'alice')",
+    );
+    id += 1;
+    let _ = restore_exec(
+        &mut stdin,
+        &mut out,
+        id,
+        "UPDATE users SET name = 'bob' WHERE id = 1",
+    );
+    id += 1;
+
+    // Deny writes on the restore target AFTER the backup exists.
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "set_table_policy", "arguments": {
+                "connection": "demo", "table": "main.users",
+                "policy": {"write": "deny"}
+            }}
+        }),
+    );
+    let msg = read_response(&mut out, id, Duration::from_secs(10));
+    let set_text = serde_json::to_string(&msg["result"]).unwrap_or_default();
+    assert!(
+        set_text.contains("\"write\":\"deny\""),
+        "rule set: {set_text}"
+    );
+    id += 1;
+
+    // Dry-run shows the per-statement policy preview flagging the denial.
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "restore_backup", "arguments": {"backup_id": 2, "dry_run": true}}
+        }),
+    );
+    let msg = read_response(&mut out, id, Duration::from_secs(10));
+    let text = serde_json::to_string(&msg["result"]).unwrap_or_default();
+    assert!(
+        text.contains("policy"),
+        "dry-run must carry the policy preview: {text}"
+    );
+    assert!(
+        text.contains("wouldDeny") || text.contains("\"Deny\""),
+        "preview flags the deny: {text}"
+    );
+    id += 1;
+
+    // Confirmed restore: the per-statement deny refuses the WHOLE replay
+    // (the outer approval cannot cover a denied statement).
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "restore_backup", "arguments": {"backup_id": 2, "dry_run": false}}
+        }),
+    );
+    // The deny fires either before or after the confirmation depending
+    // on policy shape; answer the elicitation if it comes first.
+    let (kind, first) = restore_next(&mut out, id);
+    if kind == "elicit" {
+        send(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": first["id"],
+                "result": {"action": "accept", "content": {"choice": "once"}}
+            }),
+        );
+    }
+    let msg = read_response(&mut out, id, Duration::from_secs(10));
+    let text = msg["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("Restore denied by policy") && text.contains("statement"),
+        "typed refusal naming the statement: {text}"
+    );
+    id += 1;
+
+    // Nothing was restored: the updated value stands.
+    let q = restore_query(
+        &mut stdin,
+        &mut out,
+        id,
+        "SELECT name FROM users WHERE id = 1",
+    );
+    assert!(q.contains("bob"), "denied restore must not replay: {q}");
+
+    drop(stdin);
+    drop(server);
+}
+
+#[test]
+fn restore_success_writes_per_statement_audit_rows() {
+    let (server, mut stdin, mut out, _root) = restore_harness();
+    let mut id = 10;
+
+    let _ = restore_exec(
+        &mut stdin,
+        &mut out,
+        id,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+    );
+    id += 1;
+    let _ = restore_exec(
+        &mut stdin,
+        &mut out,
+        id,
+        "INSERT INTO users (id, name) VALUES (1, 'alice')",
+    );
+    id += 1;
+    let _ = restore_exec(
+        &mut stdin,
+        &mut out,
+        id,
+        "UPDATE users SET name = 'bob' WHERE id = 1",
+    );
+    id += 1;
+
+    // Confirmed restore replays the pre-image ('alice') back.
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "restore_backup", "arguments": {"backup_id": 2, "dry_run": false}}
+        }),
+    );
+    let (kind, first) = restore_next(&mut out, id);
+    if kind == "elicit" {
+        send(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": first["id"],
+                "result": {"action": "accept", "content": {"choice": "once"}}
+            }),
+        );
+    }
+    let msg = read_response(&mut out, id, Duration::from_secs(10));
+    let text = msg["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("executedStatements"),
+        "restore executed: {text}"
+    );
+    assert!(
+        !text.contains("audit-write-failed"),
+        "no audit warnings: {text}"
+    );
+    id += 1;
+
+    let q = restore_query(
+        &mut stdin,
+        &mut out,
+        id,
+        "SELECT name FROM users WHERE id = 1",
+    );
+    assert!(q.contains("alice"), "pre-image restored: {q}");
+    id += 1;
+
+    // Per-statement audit rows linked to the backup exist.
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "audit_search", "arguments": {"limit": 50}}
+        }),
+    );
+    let msg = read_response(&mut out, id, Duration::from_secs(10));
+    let audit = msg["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        audit.contains("restore-2-"),
+        "audit rows must carry the restore request-id prefix: {audit}"
+    );
+    assert!(
+        audit.contains("\"backupId\":2") || audit.contains("\"backup_id\":2"),
+        "rows link the backup: {audit}"
+    );
+
+    drop(stdin);
+    drop(server);
+}
+
 // ---- Modern era (2026-07-28): discovery, _meta requests, MRTR ----
 
 fn meta_2026() -> serde_json::Value {

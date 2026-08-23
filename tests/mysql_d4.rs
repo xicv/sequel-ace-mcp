@@ -212,6 +212,7 @@ async fn d4_ddl_semantics_matrix() {
 
     // --- Journal states: no-op and not-found landed as failed terminal
     // with explanatory detail; successful DDL finalized.
+    finalize_committed(&ctx).await;
     let states = dump_journal(&ctx).await;
     assert!(states.iter().any(|(st, detail)| st == "failed" && detail.as_deref().unwrap_or("").contains("no-op")),
         "no-op journalized: {states:?}");
@@ -224,6 +225,30 @@ async fn d4_ddl_semantics_matrix() {
         states.iter().any(|(st, _)| st == "audit_finalized"),
         "successful DDL finalized: {states:?}"
     );
+}
+
+/// Direct-executor close-out (the gate does this after its audit write):
+/// finalize every mutation_committed journal so terminal-state
+/// assertions hold under the P1 contract.
+async fn finalize_committed(ctx: &Ctx) {
+    let ids: Vec<i64> = ctx
+        .audit
+        .with(|c| {
+            let mut stmt = c
+                .prepare("SELECT id FROM operation_journal WHERE state = 'mutation_committed'")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap();
+    for jid in ids {
+        let j = sequel_mcp::backup::journal::Journal::from_id(&ctx.audit, jid);
+        j.transition(
+            sequel_mcp::backup::journal::JournalState::AuditFinalized,
+            None,
+        )
+        .unwrap();
+    }
 }
 
 async fn dump_journal(ctx: &Ctx) -> Vec<(String, Option<String>)> {
@@ -291,6 +316,7 @@ async fn d4a_multi_target_and_rename_matrix() {
         r.ddl_executed_targets
     );
     // Journal carries the mixed detail.
+    finalize_committed(&ctx).await;
     let states = dump_journal(&ctx).await;
     assert!(
         states.iter().any(|(st, d)| st == "audit_finalized"

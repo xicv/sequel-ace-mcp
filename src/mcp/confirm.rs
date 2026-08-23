@@ -7,11 +7,24 @@ use std::sync::mpsc as std_mpsc;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ChoiceForm {
-    /// How to authorize the statement: once, session, or decline.
-    choice: GrantChoice,
+    /// "once", "session", or "decline". A plain string by design: the
+    /// typed enum's generated schema is rejected by rmcp's elicit schema
+    /// model; unknown values parse to `unavailable`, never a decline.
+    choice: String,
 }
 
 rmcp::elicit_safe!(ChoiceForm);
+
+impl ChoiceForm {
+    fn grant_choice(&self) -> Option<GrantChoice> {
+        match self.choice.as_str() {
+            "once" => Some(GrantChoice::Once),
+            "session" => Some(GrantChoice::Session),
+            "decline" => Some(GrantChoice::Decline),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct PasswordForm {
@@ -131,7 +144,15 @@ pub async fn run_elicitation(
     message: String,
 ) -> ConfirmOutcome {
     match peer.elicit::<ChoiceForm>(message).await {
-        Ok(Some(form)) => ConfirmOutcome::Chosen(form.choice),
+        Ok(Some(form)) => match form.grant_choice() {
+            Some(choice) => ConfirmOutcome::Chosen(choice),
+            None => ConfirmOutcome::Unavailable {
+                reason: format!(
+                    "the client returned an unrecognized choice {:?}",
+                    form.choice
+                ),
+            },
+        },
         Ok(None) => ConfirmOutcome::Unavailable {
             reason: "the client accepted but returned no choice content".into(),
         },

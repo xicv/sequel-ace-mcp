@@ -1809,6 +1809,24 @@ impl SequelServer {
         };
 
         if p.dry_run {
+            // Per-statement policy preview (review P1): show what the
+            // two-layer gate says about EVERY replayed statement before
+            // anything executes — the manual-review surface.
+            let preview = match resolve_restore_plan(&conn, &detail, &plan) {
+                Ok(res) => res
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (c, r))| {
+                        json!({
+                            "statement": i,
+                            "category": c.category.as_str(),
+                            "action": r.action,
+                            "databases": c.target_databases,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                Err(reason) => vec![json!({ "wouldDeny": true, "reason": reason })],
+            };
             return Ok(CallToolResponse::Complete(json_tool_result(json!({
                 "backupId": p.backup_id,
                 "connection": detail.connection,
@@ -1818,6 +1836,7 @@ impl SequelServer {
                 "isInsertHintDelete": plan.is_insert_hint_delete,
                 "firstStatementPreview":
                     plan.statements.first().map(|s| s.chars().take(240).collect::<String>()),
+                "policy": preview,
                 "note": "dry-run; pass dryRun=false to actually execute",
             }))));
         }
@@ -1882,8 +1901,17 @@ impl SequelServer {
                     ))),
                     outcome @ crate::approval::ConfirmOutcome::Chosen(_) => {
                         let _ = outcome;
-                        self.execute_restore_plan(&conn, &detail, &plan, cfg.revision)
-                            .await
+                        self.execute_restore_plan(
+                            &conn,
+                            &detail,
+                            &plan,
+                            cfg.revision,
+                            &crate::audit::WriteOptions {
+                                redact_sql_in_log: cfg.retention.redact_sql_in_log,
+                                tamper_evident_chain: cfg.retention.tamper_evident_chain,
+                            },
+                        )
+                        .await
                     }
                     crate::approval::ConfirmOutcome::Unavailable { reason } => {
                         Ok(CallToolResponse::Complete(error_tool_result(format!(
@@ -1971,8 +1999,17 @@ impl SequelServer {
                     )))
                 }
                 crate::approval::ConfirmOutcome::Chosen(_) => {
-                    self.execute_restore_plan(&conn, &detail, &plan, cfg.revision)
-                        .await
+                    self.execute_restore_plan(
+                        &conn,
+                        &detail,
+                        &plan,
+                        cfg.revision,
+                        &crate::audit::WriteOptions {
+                            redact_sql_in_log: cfg.retention.redact_sql_in_log,
+                            tamper_evident_chain: cfg.retention.tamper_evident_chain,
+                        },
+                    )
+                    .await
                 }
                 crate::approval::ConfirmOutcome::Unavailable { reason } => {
                     Ok(CallToolResponse::Complete(error_tool_result(format!(
@@ -1992,33 +2029,45 @@ impl SequelServer {
         detail: &crate::backup::restore::BackupDetail,
         plan: &crate::backup::restore::RestorePlan,
         revision: u64,
+        write_opts: &crate::audit::WriteOptions,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
-        // Policy deny-check: classify the first statement; a Deny on the
-        // write scope refuses the restore before touching anything.
-        let dialect = if conn.is_mysql() {
-            crate::policy::classifier::Dialect::MySql
-        } else {
-            crate::policy::classifier::Dialect::SQLite
+        // Per-statement policy resolution (review P1): EVERY replayed
+        // statement must pass the two-layer gate, not just the first —
+        // an outer approval for "restore A" must never silently cover a
+        // statement the policy denies.
+        let resolutions = match resolve_restore_plan(conn, detail, plan) {
+            Ok(res) => res,
+            Err(reason) => {
+                // A denied restore still leaves its trace, linked to the
+                // backup (same discipline as gate denials).
+                let entry = crate::audit::AuditEntry {
+                    request_id: format!("restore-{}-{}", detail.id, uuid::Uuid::new_v4()),
+                    connection: detail.connection.clone(),
+                    databases: Vec::new(),
+                    category: crate::policy::model::SqlCategory::Write,
+                    ast_type: None,
+                    sql: plan
+                        .statements
+                        .first()
+                        .map(|s| s.chars().take(800).collect::<String>())
+                        .unwrap_or_default(),
+                    decision: crate::policy::model::PolicyAction::Deny,
+                    confirmed: false,
+                    outcome: crate::approval::outcomes::ApprovalOutcome::Denied,
+                    affected_rows: None,
+                    duration_ms: None,
+                    error: Some(reason.clone()),
+                    backup_id: Some(detail.id),
+                    approval_scope: None,
+                    approval_digest: None,
+                    policy_revision: Some(revision),
+                };
+                let _ = crate::audit::write_audit_entry(&self.ctx.audit, &entry, write_opts);
+                return Ok(CallToolResponse::Complete(error_tool_result(format!(
+                    "Restore denied by policy: {reason}"
+                ))));
+            }
         };
-        let classified =
-            crate::policy::classifier::classify_statement(&plan.statements[0], dialect).map_err(
-                |e| {
-                    rmcp::ErrorData::internal_error(
-                        format!("cannot classify restore statement: {}", e.message()),
-                        None,
-                    )
-                },
-            )?;
-        let fallback = detail
-            .database
-            .clone()
-            .or_else(|| conn.database().map(str::to_string));
-        let resolution = crate::policy::resolver::resolve(conn, &classified, fallback.as_deref());
-        if resolution.action == crate::policy::model::PolicyAction::Deny {
-            return Ok(CallToolResponse::Complete(error_tool_result(
-                "Restore denied by policy for this connection/table scope.",
-            )));
-        }
 
         let started = std::time::Instant::now();
         let result: Result<crate::backup::restore::RestoreOutcome, String> = match conn {
@@ -2130,16 +2179,91 @@ impl SequelServer {
         };
 
         match result {
-            Ok(r) => Ok(CallToolResponse::Complete(json_tool_result(json!({
-                "backupId": detail.id,
-                "executedStatements": r.statements_run,
-                "affected": r.affected,
-                "warnings": plan.warnings,
-                "durationMs": started.elapsed().as_millis() as u64,
-            })))),
-            Err(e) => Ok(CallToolResponse::Complete(error_tool_result(format!(
-                "Restore failed: {e}"
-            )))),
+            Ok(r) => {
+                // Per-statement audit rows (review P1): every replayed
+                // statement leaves its own row, linked to the backup.
+                // Write failures are SURFACED (never swallowed — the
+                // lesson from the audit-write blocker) but the restore
+                // already committed, so they become result warnings, not
+                // errors that would invite a retry.
+                let base_request = format!("restore-{}-{}", detail.id, uuid::Uuid::new_v4());
+                let mut audit_warnings: Vec<String> = Vec::new();
+                for (i, (classified, resolution)) in resolutions.iter().enumerate() {
+                    let entry = crate::audit::AuditEntry {
+                        request_id: format!("{base_request}-{i}"),
+                        connection: detail.connection.clone(),
+                        databases: classified.target_databases.clone(),
+                        category: classified.category,
+                        ast_type: Some(classified.ast_type.to_string()),
+                        sql: plan.statements[i].clone(),
+                        decision: resolution.action,
+                        confirmed: true,
+                        outcome: crate::approval::outcomes::ApprovalOutcome::Approved,
+                        affected_rows: None,
+                        duration_ms: None,
+                        error: None,
+                        backup_id: Some(detail.id),
+                        approval_scope: Some("restore".to_string()),
+                        approval_digest: None,
+                        policy_revision: Some(revision),
+                    };
+                    if let Err(e) =
+                        crate::audit::write_audit_entry(&self.ctx.audit, &entry, write_opts)
+                    {
+                        eprintln!(
+                            "sequel-mcp: AUDIT WRITE FAILED for restore statement {i} of backup #{}: {e}",
+                            detail.id
+                        );
+                        audit_warnings.push(format!("audit-write-failed (statement {i}): {e}"));
+                    }
+                }
+                Ok(CallToolResponse::Complete(json_tool_result(json!({
+                    "backupId": detail.id,
+                    "executedStatements": r.statements_run,
+                    "affected": r.affected,
+                    "warnings": plan.warnings,
+                    "auditWarnings": audit_warnings,
+                    "durationMs": started.elapsed().as_millis() as u64,
+                }))))
+            }
+            Err(e) => {
+                // Failure still links the attempt to the backup.
+                let entry = crate::audit::AuditEntry {
+                    request_id: format!("restore-{}-{}", detail.id, uuid::Uuid::new_v4()),
+                    connection: detail.connection.clone(),
+                    databases: Vec::new(),
+                    category: resolutions
+                        .first()
+                        .map(|(c, _)| c.category)
+                        .unwrap_or(crate::policy::model::SqlCategory::Write),
+                    ast_type: None,
+                    sql: plan
+                        .statements
+                        .first()
+                        .map(|s| s.chars().take(800).collect::<String>())
+                        .unwrap_or_default(),
+                    decision: crate::policy::model::PolicyAction::Confirm,
+                    confirmed: true,
+                    outcome: crate::approval::outcomes::ApprovalOutcome::ExecutionError,
+                    affected_rows: None,
+                    duration_ms: Some(started.elapsed().as_millis() as i64),
+                    error: Some(e.clone()),
+                    backup_id: Some(detail.id),
+                    approval_scope: Some("restore".to_string()),
+                    approval_digest: None,
+                    policy_revision: Some(revision),
+                };
+                if let Err(audit_err) =
+                    crate::audit::write_audit_entry(&self.ctx.audit, &entry, write_opts)
+                {
+                    eprintln!(
+                        "sequel-mcp: audit write also failed for the errored restore: {audit_err}"
+                    );
+                }
+                Ok(CallToolResponse::Complete(error_tool_result(format!(
+                    "Restore failed: {e}"
+                ))))
+            }
         }
     }
 }
@@ -2147,6 +2271,57 @@ impl SequelServer {
 fn d_hex(h: sha2::Sha256) -> String {
     use sha2::Digest;
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Per-statement classification + two-layer resolution for a restore
+/// plan (review P1): EVERY replayed statement must pass the gate, not
+/// just the first. Any Deny is a typed refusal naming the offending
+/// statement and its table scope; unclassifiable statements refuse too.
+#[allow(clippy::type_complexity)]
+fn resolve_restore_plan(
+    conn: &crate::config::Connection,
+    detail: &crate::backup::restore::BackupDetail,
+    plan: &crate::backup::restore::RestorePlan,
+) -> Result<
+    Vec<(
+        crate::policy::classifier::ClassifiedStatement,
+        crate::policy::resolver::Resolution,
+    )>,
+    String,
+> {
+    let dialect = if conn.is_mysql() {
+        crate::policy::classifier::Dialect::MySql
+    } else {
+        crate::policy::classifier::Dialect::SQLite
+    };
+    let fallback = detail
+        .database
+        .clone()
+        .or_else(|| conn.database().map(str::to_string));
+    let mut out = Vec::with_capacity(plan.statements.len());
+    for (i, stmt) in plan.statements.iter().enumerate() {
+        let classified = crate::policy::classifier::classify_statement(stmt, dialect)
+            .map_err(|e| format!("cannot classify restore statement {i}: {}", e.message()))?;
+        let resolution = crate::policy::resolver::resolve(conn, &classified, fallback.as_deref());
+        if resolution.action == crate::policy::model::PolicyAction::Deny {
+            let tables: Vec<String> = resolution
+                .contributions
+                .iter()
+                .map(|c| format!("{}.{}", c.table.database, c.table.table))
+                .collect();
+            return Err(format!(
+                "statement {i} ({}) is denied by policy{}",
+                stmt.chars().take(120).collect::<String>(),
+                if tables.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (tables: {})", tables.join(", "))
+                }
+            ));
+        }
+        out.push((classified, resolution));
+    }
+    Ok(out)
 }
 
 fn fake_plan(stmts: &[String]) -> crate::backup::restore::RestorePlan {

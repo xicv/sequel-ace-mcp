@@ -17,4 +17,4 @@ pub mod sql;
 pub mod vault;
 
 pub const PACKAGE_NAME: &str = "sequel-mcp";
-pub const PACKAGE_VERSION: &str = "0.10.1";
+pub const PACKAGE_VERSION: &str = "0.10.2";

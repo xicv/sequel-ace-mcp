@@ -647,7 +647,7 @@ pub fn run_sql(
             // client retry and a double execution) with a loud warning.
             let audit_ok = audit_result.is_ok();
             let mut warnings = r.warnings;
-            if let Err(e) = audit_result {
+            if let Err(e) = &audit_result {
                 eprintln!(
                     "sequel-mcp: AUDIT WRITE FAILED after a committed {cat} statement on {conn}: {e}. The audit chain is incomplete for request {rid}.",
                     cat = classified.category,
@@ -662,10 +662,15 @@ pub fn run_sql(
                 ));
             }
             // D3: only close the journal (mutation_committed ->
-            // audit_finalized) when the audit row is actually durable.
-            if audit_ok && let Some(jid) = r.journal_id {
+            // audit_finalized) when the audit row is actually durable —
+            // and LINK the row (review P1: link_audit never fired
+            // before, so the journal could not point at its audit entry).
+            if let (true, Some(jid)) = (audit_ok, r.journal_id) {
                 let j = crate::backup::journal::Journal::from_id(&deps.audit, jid);
                 let _ = j.transition(crate::backup::journal::JournalState::AuditFinalized, None);
+                if let Ok(audit_row) = audit_result {
+                    let _ = j.link_audit(audit_row);
+                }
             }
             Ok(RunOutcome {
                 connection: conn.name().to_string(),
@@ -735,7 +740,7 @@ fn audit(
     duration_ms: Option<u64>,
     backup_id: Option<i64>,
     opts: &WriteOptions,
-) -> Result<(), String> {
+) -> Result<i64, String> {
     let entry = AuditEntry {
         request_id: request_id.to_string(),
         connection: conn.name().to_string(),
@@ -754,9 +759,7 @@ fn audit(
         approval_digest,
         policy_revision,
     };
-    crate::audit::write_audit_entry(&deps.audit, &entry, opts)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    crate::audit::write_audit_entry(&deps.audit, &entry, opts).map_err(|e| e.to_string())
 }
 
 impl ApprovalRequest {
