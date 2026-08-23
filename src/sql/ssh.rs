@@ -83,7 +83,10 @@ struct HostKeyHandler {
     entries: Vec<known_hosts::KnownHostEntry>,
     host: String,
     port: u16,
-    logs: Mutex<Vec<String>>,
+    /// Shared with `establish` so the TOFU/mismatch commentary is
+    /// actually EMITTED (stderr — protocol-safe) after connect returns
+    /// instead of silently buffered (review finding).
+    logs: std::sync::Arc<Mutex<Vec<String>>>,
 }
 
 impl client::Handler for HostKeyHandler {
@@ -454,12 +457,13 @@ async fn establish(
             port: ssh.port,
             reason: e,
         })?;
+    let logs = std::sync::Arc::new(Mutex::new(Vec::new()));
     let handler = HostKeyHandler {
         policy: ssh.host_key_policy.unwrap_or(SshHostKeyPolicy::Lenient),
         entries,
         host: ssh.host.clone(),
         port: ssh.port,
-        logs: Mutex::new(Vec::new()),
+        logs: logs.clone(),
     };
 
     let keepalive = keepalive_interval();
@@ -475,6 +479,11 @@ async fn establish(
         let mut handle = client::connect(config, addr, handler)
             .await
             .map_err(|e| SshError::Transport(format!("connect to bastion: {e}")))?;
+        // Host-key commentary (TOFU accepts, migration-compat warnings)
+        // must reach the operator, not rot in a buffer.
+        for line in logs.lock().unwrap().drain(..) {
+            eprintln!("[sequel-mcp] SSH {}:{} {line}", ssh.host, ssh.port);
+        }
         // Authenticate with EXACTLY the configured method — no silent
         // fallback between password and key. The secret doubles as the
         // private-key passphrase under key auth.

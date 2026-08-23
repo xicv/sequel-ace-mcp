@@ -616,6 +616,12 @@ impl SequelServer {
                 ));
             }
         };
+        // Table rules previously bypassed all bounds validation — a rule
+        // could widen rowCap/stmtTimeoutMs beyond what any baseline
+        // policy allows (review finding).
+        if let Err(e) = p.policy.validate() {
+            return error_tool_result(format!("table policy invalid: {e}"));
+        }
         let mut conn = match resolve_conn(&self.ctx.config, p.connection.as_deref()) {
             Ok(Some(c)) => c,
             Ok(None) => {
@@ -1876,7 +1882,8 @@ impl SequelServer {
                     ))),
                     outcome @ crate::approval::ConfirmOutcome::Chosen(_) => {
                         let _ = outcome;
-                        self.execute_restore_plan(&conn, &detail, &plan).await
+                        self.execute_restore_plan(&conn, &detail, &plan, cfg.revision)
+                            .await
                     }
                     crate::approval::ConfirmOutcome::Unavailable { reason } => {
                         Ok(CallToolResponse::Complete(error_tool_result(format!(
@@ -1964,7 +1971,8 @@ impl SequelServer {
                     )))
                 }
                 crate::approval::ConfirmOutcome::Chosen(_) => {
-                    self.execute_restore_plan(&conn, &detail, &plan).await
+                    self.execute_restore_plan(&conn, &detail, &plan, cfg.revision)
+                        .await
                 }
                 crate::approval::ConfirmOutcome::Unavailable { reason } => {
                     Ok(CallToolResponse::Complete(error_tool_result(format!(
@@ -1983,6 +1991,7 @@ impl SequelServer {
         conn: &crate::config::Connection,
         detail: &crate::backup::restore::BackupDetail,
         plan: &crate::backup::restore::RestorePlan,
+        revision: u64,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         // Policy deny-check: classify the first statement; a Deny on the
         // write scope refuses the restore before touching anything.
@@ -2060,7 +2069,7 @@ impl SequelServer {
                             ssh_pw.as_ref().map(|p| p.as_str()),
                             &mc.host,
                             mc.port,
-                            1,
+                            revision,
                         )
                         .await
                         {
