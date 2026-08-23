@@ -23,16 +23,17 @@ Every classified statement maps to exactly one category. Misclassification is fa
 
 - `allow` — execute without prompting.
 - `confirm` — elicit a 3-choice prompt: once / session / decline. Durable allowances go through
-  `set_database_policy`, not the prompt.
+  `set_table_policy`, not the prompt.
 - `deny` — reject with a `Policy denies …` error; audit row stored with `outcome=denied`.
 
-`confirm` needs a client that implements MCP elicitation. Where it does not, the statement fails
-closed and is audited as `outcome=error` (not `declined`) with the reason — check
-`sequel-mcp:doctor` → `elicitation.supported` before relying on `confirm`.
+`confirm` prefers a client that implements MCP elicitation. Where it does not, the server asks the
+local approval companions instead (`sequel-mcp approve` CLI or the native GUI window, authenticated
+same-user IPC, 60 s deadline) and only then fails closed — audited as `outcome=error` (not
+`declined`) with the reason.
 
 ## Presets
 
-`sequel-mcp:add_connection` and `sequel-mcp:add_sqlite_connection` accept `policyPreset` ∈ `{ read-only, dev, admin }`.
+`sequel-mcp:add_sqlite_connection` (and `import_from_sequel_ace`) accept `policyPreset` ∈ `{ read-only, dev, admin }` (`development` / `administration` are accepted long forms).
 
 | Preset | read | write | ddl | admin | txCtrl | rowCap | stmtTimeoutMs | requireTouchID |
 |--------|------|-------|-----|-------|--------|--------|---------------|----------------|
@@ -42,26 +43,31 @@ closed and is audited as `outcome=error` (not `declined`) with the reason — ch
 
 After creation, `sequel-mcp:set_policy` overrides individual fields.
 
-## Per-database overrides + strictest-wins
+## Table rules + strictest-wins
 
-`databasePolicies` on a connection lets you tighten policy for sensitive DBs:
+`tablePolicies` on a connection holds exact (`db.table`) or wildcard (`db.*`) rules — migrated v1
+`databasePolicies` appear as `db.*` wildcards:
 
 ```jsonc
 {
   "policy": { "write": "allow", "ddl": "confirm", "admin": "deny", ... },
-  "databasePolicies": {
-    "prod_payments": { "write": "confirm", "ddl": "deny" },
-    "audit_archive": { "write": "deny" }
+  "tablePolicies": {
+    "prod_payments.*": { "write": "confirm", "ddl": "deny" },
+    "audit_archive.events": { "write": "deny" }
   }
 }
 ```
 
-When a single statement touches multiple databases (e.g. a cross-DB `UPDATE`), the **strictest action wins** (`deny` > `confirm` > `allow`). The response reports `contributingDatabase` (the DB that forced the strictest action) and `contributingDatabases` (all DBs in scope).
+Exact rules beat wildcards; wildcards beat the baseline. When a single statement touches multiple
+tables or databases (e.g. a cross-DB `UPDATE`), the **strictest action wins** (`deny` > `confirm` >
+`allow`). A rule may elevate a denied category, but elevated statements always confirm. Use
+`explain_policy` to preview the resolution for any statement without executing it.
 
 Tools:
-- `sequel-mcp:set_database_policy connection=<n> database=<d> policy={...}`
-- `sequel-mcp:clear_database_policy connection=<n> database=<d>`
-- `sequel-mcp:list_database_policies connection=<n>`
+- `sequel-mcp:set_table_policy connection=<n> table=<db.table|db.*> policy={...}`
+- `sequel-mcp:clear_table_policy connection=<n> table=<db.table|db.*>`
+- `sequel-mcp:list_table_policies connection=<n>`
+- `sequel-mcp:set_database_policy` / `clear_database_policy` / `list_database_policies` — the legacy per-DB view (backed by `db.*` wildcards)
 
 ## Numeric caps
 
