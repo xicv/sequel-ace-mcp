@@ -31,10 +31,12 @@ Client UIs render MCP tool names differently. Claude Code commonly shows `sequel
 - `sequel-mcp:restore_backup` — replay a pre-mutation backup; `dryRun=true` by default.
 
 **Policy + setup:**
-- `sequel-mcp:add_connection` / `sequel-mcp:remove_connection` — MySQL/MariaDB password is captured via elicitation, never via tool args.
 - `sequel-mcp:add_sqlite_connection` — SQLite file connection; no password or Keychain entry.
+- `sequel-mcp:remove_connection` — forget a connection + its Keychain entry.
+- `sequel-mcp:import_from_sequel_ace` — the guided MySQL/MariaDB setup path (imports favorites + Keychain). The interactive `add_connection` tool is not yet re-implemented in 0.10.0; MySQL connections otherwise come from the user's own config.
 - `sequel-mcp:set_policy` — change baseline action set + caps.
-- `sequel-mcp:set_database_policy` / `sequel-mcp:clear_database_policy` / `sequel-mcp:list_database_policies` — per-DB overrides; strictest wins for multi-DB statements.
+- `sequel-mcp:set_table_policy` / `sequel-mcp:clear_table_policy` / `sequel-mcp:list_table_policies` — exact (`db.table`) or wildcard (`db.*`) rules; exact beats wildcard, strictest wins across tables.
+- `sequel-mcp:explain_policy` — classify a statement and show the per-table resolution without executing.
 - `sequel-mcp:select_database` — change a connection's default DB.
 
 **Audit + housekeeping:**
@@ -95,7 +97,9 @@ When the server elicits `confirm` for a `write` / `ddl` / `admin` statement, the
 - **Allow for session** — skips the prompt for the same `(connection, database, category)` until the MCP server restarts. RAM-only.
 - **Decline** — abort; statement is audited as `declined`.
 
-There is no inline "always" (dropped in 0.9.0). To make an allowance durable, use `set_database_policy`.
+There is no inline "always" (dropped in 0.9.0). To make an allowance durable, use `set_table_policy`.
+
+If the client cannot elicit at all, the server falls back to the local approval companions (`sequel-mcp approve` CLI or the native GUI window) for 60 seconds before failing closed.
 
 A session grant on `staging` does **not** cover `prod`. Surface the scope clearly when relaying the prompt to the user.
 
@@ -135,9 +139,9 @@ is the user's call, on their data. If they choose the temporary-widen path, set 
 
 ## Common mistakes to avoid
 
-1. **Do not include passwords in `add_connection` arguments.** The server collects MySQL/MariaDB passwords through a separate elicitation channel and writes to the macOS Keychain. Tool arguments are logged; the elicitation reply is not. SQLite uses `add_sqlite_connection` and has no password.
+1. **Never put passwords in tool arguments.** MySQL/MariaDB credentials live in the macOS Keychain (`import_from_sequel_ace` copies them with the user's approval); SQLite uses `add_sqlite_connection` and has no password. Tool arguments are logged; secrets channels are not.
 2. **Do not stack statements.** `SELECT 1; SELECT 2;` is rejected. Issue two calls instead.
-3. **Do not bypass policy by asking the user to lower it.** If the user wants `write` allowed permanently, that is a `set_database_policy` change they make knowingly — scope it to the narrowest database, prefer `confirm` over `allow`, and put it back afterwards. The one case where proposing `allow` is legitimate is a client that cannot prompt at all (see above), and even then only with an explicit yes.
+3. **Do not bypass policy by asking the user to lower it.** If the user wants `write` allowed permanently, that is a `set_table_policy` change they make knowingly — scope it to the narrowest table or database, prefer `confirm` over `allow`, and put it back afterwards. The one case where proposing `allow` is legitimate is a client that cannot prompt at all (see above), and even then only with an explicit yes.
 4. **Do not lose the `backup_id`.** Whenever `sequel-mcp:execute` returns a non-null `backupId`, mention it to the user in your reply — it's their rollback handle.
 5. **Do not call `audit_cleanup` without `dryRun=true` first.** It deletes rows and VACUUMs.
 6. **Do not take a `declined` result at face value on sequel-mcp < 0.9.1.** `elicitation.supported: true` does not guarantee the prompt actually reached the user — check `doctor` → `version` too, and if it's below 0.9.1, confirm with the user in chat before telling them "you declined." See [When the confirm prompt cannot be shown](#when-the-confirm-prompt-cannot-be-shown).

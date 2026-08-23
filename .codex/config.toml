@@ -1,7 +1,8 @@
 # Project-scoped Codex setup. Codex loads this only after the project is trusted.
+# Requires the sequel-mcp binary on PATH (cargo install --path . --locked).
 
 [mcp_servers.sequel-mcp]
-command = "node"
-args = ["dist/index.js"]
+command = "sequel-mcp"
+args = ["serve"]
 startup_timeout_sec = 20
-tool_timeout_sec = 600
+tool_timeout_sec = 120

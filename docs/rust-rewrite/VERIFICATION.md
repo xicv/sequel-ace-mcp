@@ -983,6 +983,56 @@ Verified locally: sqlite unit tests incl. `statement_timeout_
 interrupts` (4/4), d7_eof (8.7 s incl. build), full 161 lib + 16
 lifecycle suites, clippy `-D warnings` 0, fmt clean.
 
+## Session 17 (checkpoint #15: documentation + repository governance)
+
+The external review verdict (2026-08-23) accepted the implementation as
+a feature-complete candidate with CI verified green at the exact head
+SHA, and identified two release blockers plus finalization steps —
+executed here as a strictly docs/governance-scoped pass (no Rust
+source changes):
+
+- **README.md fully rewritten for the Rust era**: 0.10.0 install
+  (`cargo install --path . --locked`, crates.io pending), truthful
+  MCP wiring (`command = "sequel-mcp"`, `args = ["serve"]` — stdio is
+  the only transport; there is no `--stdio` flag), CLI reference incl.
+  `approve`/`gui`, the three-channel approval resolution order
+  (elicitation → same-uid IPC → MRTR), two-layer table-rule semantics
+  (exact > wildcard > baseline, strictest-wins, elevation confirms),
+  the verified 27-tool surface, SSH/Docker transports, audit/backup/
+  retention, migration from 0.9.x, and the not-yet-published status.
+- **CHANGELOG.md**: 0.10.0 entry (rewrite, table rules, approvals,
+  transports, CI) with an explicit *Removed* note for `add_connection`.
+- **SECURITY.md / CONTRIBUTING.md / CLAUDE.md**: rewritten for the
+  Rust reality (SecItem, sqlparser closed-world, same-uid IPC trust
+  boundary, cargo gates, release checklist, repo layout).
+- **`.codex/config.toml`**: `command = "sequel-mcp"`, `args =
+  ["serve"]` (was `node dist/index.js`).
+- **skills/using-sequel-mcp/**: SKILL.md, references/policy.md, and
+  references/connections.md updated — table-policy tools, the IPC
+  approval fallback, russh/mysql_async reality, JSON connection shape;
+  stale `add_connection` examples replaced with the import/manual
+  paths. AGENTS.md contains only tooling boilerplate — no Node-era
+  content, left untouched.
+- **PR #2 body corrected**: 16 commits across 14 locally verified
+  checkpoints, verification sessions 1–16, "CI-clean at the head SHA
+  and awaiting independent review" (not "clean review state"), review
+  focus list included.
+- **Branch protection updated** (reviewer step 3): required contexts
+  replaced `[secret scan, test (node 20…), test (node 22…), test
+  (node 22 ubuntu…)]` → `[secret scan, rust (test on macos-14), rust
+  (check on ubuntu-24.04)]`; linear history, force-push/deletion
+  blocks, and conversation resolution all preserved (verified by
+  re-reading the protection object after the PUT).
+
+**Known gap surfaced during fact-gathering (recorded, not fixed in
+this docs-only pass):** the legacy interactive `add_connection` tool
+(elicited password → Keychain) is NOT among the 27 Rust tools —
+verified by asking the running binary. The `setup-connection` prompt
+text and one `gate.rs` error string still reference it (source
+strings; fixing them requires a source commit). Documented truthfully
+in README/CHANGELOG/skills; flagged to the reviewer as the top
+follow-up parity item before un-drafting.
+
 ## Session 5 record — unchanged summary
 
 Pool identity (CredentialGeneration, publish-after-healthy, coalescing,
