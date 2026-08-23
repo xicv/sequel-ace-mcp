@@ -892,6 +892,39 @@ Two closes out the pre-push sequence:
     is not this Mac and the Ubuntu check job executes for the first
     time on the PR.
 
+## Session 14 (checkpoint #12: first-runner CI fixes)
+
+The push and draft PR happened, and the new Rust CI executed for the
+first time on GitHub runners (run 32609970842, PR #2) — failing in
+11 s on two findings, both real, both fixed:
+
+1. **`dtolnay/rust-toolchain` requires an explicit `toolchain` input**
+   — it does NOT read `rust-toolchain.toml` itself ("'toolchain' is a
+   required input", exit 1). The workflow now passes
+   `toolchain: 1.97.1` (matching the file) alongside the clippy +
+   rustfmt components. Exactly the honest-limit Session 13 recorded:
+   runner behavior was not pre-verified; now it is being verified by
+   execution.
+2. **`scripts/bench-node.mjs` hardcoded an absolute user-home path**
+   to the legacy build (`/Users/xicao/…/dist/index.js`) — flagged by
+   the repo secret scan's user-home-path rule and shipped in the
+   package. The legacy entry is now the required
+   `SEQUEL_MCP_LEGACY_BIN` environment variable (missing ⇒ exit 2
+   with a clear message); no machine-specific path remains in any
+   tracked non-docs file (verified by `git ls-files` sweep).
+
+Also recorded: the push itself (user Terminal; the in-session attempt
+was blocked by the mimosa gate on the legacy checkout's known
+false positive — state verified intact, nothing transferred) landed
+`5aebfd6` on `origin/rewrite/rust-native` byte-identical, and — as
+the Session 13 static analysis predicted — **triggered zero workflow
+runs** (latest run before the PR was the legacy 2026-08-10 main CI).
+Draft PR #2 opened (rewrite/rust-native → main).
+
+Local re-verification: YAML valid, `node --check` clean, env-guard
+behavior confirmed, tracked-files user-home sweep clean, `cargo fmt
+--check` + whitespace clean (no Rust sources touched).
+
 ## Session 5 record — unchanged summary
 
 Pool identity (CredentialGeneration, publish-after-healthy, coalescing,
