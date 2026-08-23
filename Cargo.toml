@@ -7,8 +7,8 @@ description = "Local-first, policy-gated MySQL/MariaDB and SQLite access for AI 
 license = "MIT"
 repository = "https://github.com/xicv/sequel-mcp"
 readme = "README.md"
-keywords = ["mcp", "model-context-protocol", "mysql", "sqlite", "database"]
-categories = ["database-tools", "development-tools"]
+keywords = ["mcp", "mysql", "sqlite", "database", "ai"]
+categories = ["database", "development-tools"]
 exclude = ["docs/rust-rewrite", "tests/fixtures/legacy", ".github", ".codex", "skills"]
 
 [[bin]]
