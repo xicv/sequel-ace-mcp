@@ -1139,6 +1139,64 @@ lenient-TOFU warning never emitted; relative knownHostsPath;
 restore tunnel revision=1; PartialPolicy bounds validation; v1 config
 backup on update(); pooled-plaintext password lifetime; various NOTEs.
 
+## Session 20 (checkpoint #18: review SHOULD-FIX batch)
+
+Seven of the fourteen SHOULD-FIXes (the well-scoped, high-value set);
+the remaining four substantial ones are recorded below as known
+follow-ups:
+
+- **MySQL autocommit window closed** (`sql/mysql.rs`): a backup-required
+  write whose `START TRANSACTION READ WRITE` fails is now REFUSED —
+  running it in autocommit would release the `FOR UPDATE` pre-image
+  locks the moment capture finished, breaking backup/mutation
+  atomicity. Non-backup statements keep the legacy
+  log-and-continue behavior.
+- **Execution-time multi-statement second layer** (`sql/mysql.rs`):
+  `looks_like_multiple_statements` re-runs inside
+  `execute_mysql_statement` right before the statement is sent — the
+  classifier is no longer the only barrier against mysql_async's
+  default `CLIENT_MULTI_STATEMENTS`.
+- **Lenient-TOFU warnings actually emitted** (`sql/ssh.rs`): the host-key
+  handler's log buffer is now shared with `establish` and drained to
+  stderr after connect — the "accepting, migration compatibility only /
+  add this fingerprint" guidance (and every other host-key commentary)
+  reaches the operator instead of rotting in a Mutex.
+- **Relative `knownHostsPath` rejected** (`config/mod.rs`): must be
+  absolute or `~`-prefixed — a relative path would resolve against the
+  (client-controllable) process CWD, letting an attacker-placed
+  known_hosts satisfy even strict mode. The loader now also expands a
+  leading `~` for explicit paths (previously only the default path).
+- **Restore tunnel revision fixed** (`mcp/tools.rs`): the restore path
+  hardcoded `policy_revision = 1` in its tunnel key, so a restore and
+  concurrent gate traffic on one connection repeatedly killed each
+  other's tunnels; it now threads the real config revision.
+- **PartialPolicy bounds enforced** (`policy/model.rs` + tools +
+  config validation): table rules validate every present field against
+  the same bounds as baselines (`rowCap` 1..=100000,
+  `stmtTimeoutMs` 1..=600000, …) at `set_table_policy` time AND on
+  every connection validation — a rule can no longer smuggle in a
+  71-minute timeout or a zero row cap.
+- **v1 config backup on the real conversion path** (`config/mod.rs`):
+  `update()` now writes the timestamped 0600 `config.pre-v2.<ts>.json`
+  backup before its first v1→v2 persist (previously only the
+  never-called `migrate_file` created one — update() destroyed the v1
+  original with no rollback artifact).
+
+Gates: 165 lib + 19 lifecycle, clippy `-D warnings` 0, fmt clean,
+tracked-content sweep clean. **Known follow-ups (deferred deliberately,
+all real but non-blocking, tracked for post-merge issues)**: (1) MySQL
+executor pre-finalizes the operation journal and drops `journal_id` so
+`link_audit` never fires — crash window between COMMIT and audit write
+is masked for MySQL (SQLite has no journal at all); (2) per-category
+retention creates mid-chain gaps that `verify_chain` reports as
+tampering (`write_chain_epoch` is unwired) — chain verification should
+epoch at interior gaps; (3) `restore_backup` policy-checks only the
+first plan statement, skips Confirm/TouchID re-arming, and writes no
+audit rows for the replay (whole-operation confirmation + transactional
+replay exist); (4) the MySQL password necessarily lives in pooled
+connection options (mysql_async owns a copy) — intermediates could be
+zeroized further, but pool lifetime cannot.
+
 ## Session 5 record — unchanged summary
 
 Pool identity (CredentialGeneration, publish-after-healthy, coalescing,

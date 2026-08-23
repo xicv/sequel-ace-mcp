@@ -278,6 +278,15 @@ pub async fn execute_mysql_statement(
     params: MySqlExecuteParams<'_>,
 ) -> Result<ExecuteResult, MySqlError> {
     let start = Instant::now();
+    // Execution-time second layer (review finding): the classifier is the
+    // first barrier, but mysql_async negotiates CLIENT_MULTI_STATEMENTS
+    // by default, so re-verify single-statement-ness right before the
+    // statement is ever sent — belt and braces, same rule.
+    if crate::policy::classifier::looks_like_multiple_statements(params.sql) {
+        return Err(MySqlError::Uncertain(
+            "multi-statement input is not allowed (single statement per call)".into(),
+        ));
+    }
     let is_read = READ_CATEGORIES.contains(&params.classified.category);
     let (host, port, tunnel_generation) = match &params.tunnel_endpoint {
         Some(lease) => (lease.host.clone(), lease.port, Some(lease.generation)),
@@ -332,9 +341,18 @@ pub async fn execute_mysql_statement(
             if is_read {
                 return Err(MySqlError::ReadOnlyTx(e.to_string()));
             }
-            // Writes cannot open a transaction: execute without one and
-            // let the server's implicit behavior apply (legacy logged and
-            // continued for writes; reads are the hard gate).
+            // Review finding: a backup-required write that cannot open a
+            // transaction must NOT proceed in autocommit — the
+            // SELECT … FOR UPDATE pre-image would release its locks the
+            // moment capture finishes, breaking backup/mutation
+            // atomicity. Non-backup statements keep the legacy
+            // log-and-continue behavior.
+            if crate::backup::extractor::is_backup_required(params.classified.ast_type) {
+                return Err(MySqlError::Uncertain(format!(
+                    "START TRANSACTION READ WRITE failed ({e}); refusing to run a backed-up \
+                     write in autocommit — the pre-image would not be atomic with the mutation"
+                )));
+            }
             eprintln!(
                 "[sequel-mcp] {} START TRANSACTION failed: {e}; continuing without explicit tx",
                 params.connection.name

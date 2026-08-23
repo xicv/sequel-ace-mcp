@@ -264,9 +264,21 @@ pub fn load_known_hosts_checked(
     file_path: Option<&std::path::Path>,
 ) -> Result<Vec<KnownHostEntry>, String> {
     let explicit = file_path.is_some();
-    let target = file_path
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| crate::app::paths::expand_tilde("~/.ssh/known_hosts"));
+    let target = match file_path {
+        Some(p) => {
+            // Expand a leading `~` for explicit paths too (validation
+            // accepts absolute or `~`-prefixed; relative paths are
+            // rejected at config time — they would resolve against a
+            // client-controllable CWD).
+            let s = p.to_string_lossy();
+            if s.starts_with('~') {
+                crate::app::paths::expand_tilde(&s)
+            } else {
+                p.to_path_buf()
+            }
+        }
+        None => crate::app::paths::expand_tilde("~/.ssh/known_hosts"),
+    };
     match std::fs::read_to_string(&target) {
         Err(e) if explicit => Err(format!(
             "known_hosts file {} is unreadable: {e}",

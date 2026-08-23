@@ -204,6 +204,36 @@ pub struct PartialPolicy {
 }
 
 impl PartialPolicy {
+    /// Review finding: table rules previously bypassed ALL bounds
+    /// validation — a rule could set `rowCap: 0` or a 71-minute
+    /// `stmtTimeoutMs` that the baseline `Policy::validate` would never
+    /// allow. Every present field must sit inside the same bounds.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if let Some(v) = self.row_cap
+            && (v == 0 || v > 100_000)
+        {
+            return Err("rowCap must be an integer in 1..=100000");
+        }
+        if let Some(v) = self.stmt_timeout_ms
+            && (v == 0 || v > 600_000)
+        {
+            return Err("stmtTimeoutMs must be an integer in 1..=600000");
+        }
+        if let Some(v) = self.max_backup_rows
+            && (v == 0 || v > 1_000_000)
+        {
+            return Err("maxBackupRows must be an integer in 1..=1000000");
+        }
+        if let Some(v) = self.max_backup_bytes
+            && v == 0
+        {
+            return Err("maxBackupBytes must be positive");
+        }
+        Ok(())
+    }
+}
+
+impl PartialPolicy {
     pub fn action_for(&self, category: SqlCategory) -> Option<PolicyAction> {
         match category {
             SqlCategory::Read => self.read,

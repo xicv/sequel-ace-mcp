@@ -248,6 +248,12 @@ impl Connection {
         self.policy()
             .validate()
             .map_err(|e| ConfigError::Validation(e.into()))?;
+        // Table rules must respect the same bounds as the baseline
+        // (review finding: rules previously bypassed validation).
+        for rule in self.table_policies().values() {
+            rule.validate()
+                .map_err(|e| ConfigError::Validation(e.into()))?;
+        }
         if let Connection::Mysql(c) = self {
             if c.host.is_empty() {
                 return Err(ConfigError::Validation(
@@ -283,6 +289,19 @@ impl Connection {
                     return Err(ConfigError::Validation(
                         "ssh key auth requires privateKeyPath".into(),
                     ));
+                }
+                // Review finding: a relative knownHostsPath would resolve
+                // against the process CWD (often client-controlled),
+                // letting an attacker-placed known_hosts satisfy even
+                // strict mode. Require absolute paths (a leading `~` is
+                // fine — the loader expands it).
+                if let Some(p) = &ssh.known_hosts_path
+                    && !std::path::Path::new(p).is_absolute()
+                    && !p.starts_with('~')
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "ssh knownHostsPath must be absolute (got {p:?})"
+                    )));
                 }
                 if let Some(d) = &ssh.docker {
                     d.validate()?;
@@ -405,8 +424,34 @@ impl ConfigStore {
         let _guard = self.lock()?;
         let mut cfg = self.load_locked()?;
         if cfg.version == 1 {
-            // v1 on disk: migrate in-memory before mutating (persist below
-            // writes v2; the timestamped v1 backup is created by `migrate`).
+            // v1 on disk: take the timestamped backup HERE (review
+            // finding: `migrate_file` — the only code that created the
+            // backup — is never called, so this path used to persist v2
+            // over v1 with no rollback artifact), then migrate
+            // in-memory before mutating.
+            let raw = fs::read_to_string(self.path())?;
+            let stamp = time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| "unknown".to_string())
+                .replace(':', "");
+            let backup = self
+                .path()
+                .with_file_name(format!("config.pre-v2.{stamp}.json"));
+            {
+                use std::io::Write;
+                let mut f = fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&backup)?;
+                f.write_all(raw.as_bytes())?;
+                f.sync_all()?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&backup, fs::Permissions::from_mode(0o600));
+                }
+            }
             cfg = migrate::v1_to_v2(migrate::parse_v1(&serde_json::to_value(&cfg)?)?);
         }
         if cfg.revision != expected_revision {
