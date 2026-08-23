@@ -906,12 +906,14 @@ first time on GitHub runners (run 32609970842, PR #2) — failing in
    runner behavior was not pre-verified; now it is being verified by
    execution.
 2. **`scripts/bench-node.mjs` hardcoded an absolute user-home path**
-   to the legacy build (`/Users/xicao/…/dist/index.js`) — flagged by
+   to the legacy build's dist entry — flagged by
    the repo secret scan's user-home-path rule and shipped in the
    package. The legacy entry is now the required
    `SEQUEL_MCP_LEGACY_BIN` environment variable (missing ⇒ exit 2
    with a clear message); no machine-specific path remains in any
-   tracked non-docs file (verified by `git ls-files` sweep).
+   tracked non-docs file (verified by `git ls-files` sweep). (This
+   very record initially quoted the offending literal and was itself
+   flagged on the first PR scan — reworded.)
 
 Also recorded: the push itself (user Terminal; the in-session attempt
 was blocked by the mimosa gate on the legacy checkout's known
@@ -924,6 +926,36 @@ Draft PR #2 opened (rewrite/rust-native → main).
 Local re-verification: YAML valid, `node --check` clean, env-guard
 behavior confirmed, tracked-files user-home sweep clean, `cargo fmt
 --check` + whitespace clean (no Rust sources touched).
+
+## Session 15 (checkpoint #13: second-runner findings fixed)
+
+CI run 32610295656 (after `78dd5ccc` was pushed) executed the real
+gate commands and surfaced three more findings, all fixed:
+
+1. **Linux `-D warnings` unused imports** (the tree had only ever been
+   clippy'd on macOS): `vault/keychain.rs` imported `app::paths` for
+   the macOS-only SecItem store (now `#[cfg(target_os = "macos")]` on
+   the import; the cross-platform service-name test goes fully
+   qualified; the tests module imports its fallback-test items only
+   on non-macOS), and `approval/ipc.rs`'s Linux credential arm had a
+   redundant `AsRawFd` import (the method resolves through the
+   function-level bound) — removed.
+2. **Four `matches_legacy_*_fixtures` tests failed on the runner**:
+   the differential corpora under `tests/fixtures/legacy/` are
+   DELIBERATELY untracked (generated from the legacy checkout), so a
+   fresh CI checkout panics on read. The tests now skip with an
+   explanatory note when the corpus is absent. Verified BOTH ways
+   locally: with fixtures present the four run for real (161 lib
+   tests green), and with the directory temporarily hidden they all
+   pass via the skip path (restored afterwards — `ls` confirms).
+3. **The secret scan flagged this very document**: the Session 14
+   record quoted the offending user-home literal it was describing —
+   reworded to describe it without reproducing it.
+
+Gates: clippy `-D warnings` 0, fmt clean, 161 lib tests green, staged
+secret scan clean. Ubuntu clippy now carries only fixes the compiler
+itself prescribed; any residual Linux-only finding will surface on
+the next PR run for the same iterate-and-verify loop.
 
 ## Session 5 record — unchanged summary
 

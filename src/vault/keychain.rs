@@ -2,6 +2,9 @@
 //! legacy-compatible service naming, this-device-only accessibility, and
 //! no plaintext fallback on any platform.
 
+// Used by the macOS SecItem store below; keep the import out of
+// non-macOS lib builds (unused there → -D warnings).
+#[cfg(target_os = "macos")]
 use crate::app::paths;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -220,7 +223,10 @@ impl SecretStore for InMemorySecretStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Only the non-macOS fallback test needs parent items; importing
+    // them unconditionally would be an unused import on macOS.
+    #[cfg(not(target_os = "macos"))]
+    use super::{SecretStore, SecretStoreError, UnsupportedSecretStore};
 
     #[cfg(not(target_os = "macos"))]
     #[test]
@@ -238,6 +244,9 @@ mod tests {
 
     #[test]
     fn service_names_match_legacy() {
-        assert_eq!(paths::keychain_service_name("prod"), "sequel-mcp : prod");
+        assert_eq!(
+            crate::app::paths::keychain_service_name("prod"),
+            "sequel-mcp : prod"
+        );
     }
 }
