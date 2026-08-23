@@ -30,7 +30,15 @@ clap = { version = "4", features = ["derive"] }
 sqlparser = "=0.62.0"
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls", "minimal"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
-russh = { version = "0.62", default-features = false, features = ["ring"] }
+# "rsa" is NOT optional in practice: russh's default features are
+# ["flate2", "aws-lc-rs", "rsa"], and `default-features = false` drops it.
+# Without it `helpers::sign_with_hash_alg`'s `#[cfg(feature = "rsa")]` arm is
+# compiled out, so an RSA key falls through to the generic signer, loses the
+# negotiated hash and signs as `Rsa { hash: None }` (SHA-1) — which ssh-key
+# rejects with `AlgorithmUnsupported`. It fails at AUTH, after the server has
+# already sent USERAUTH_PK_OK, so it looks like a rejected credential rather
+# than a missing feature. Keep "rsa" whenever default-features is false.
+russh = { version = "0.62", default-features = false, features = ["ring", "rsa"] }
 plist = "1"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
