@@ -751,6 +751,70 @@ docker-parallel flake; mariadb-only, mysql-only, and both confirm runs
 all green), SSH matrix 27/27 green, clippy `-D warnings` 0, fmt clean,
 gitleaks clean, zero docker leftovers.
 
+## Session 11 (checkpoint #9: the native approvals GUI)
+
+The egui companion window (`src/gui/`) — the GUI half of the approval
+IPC architecture, speaking the `sequel-mcp approve` protocol verbatim
+(`wait` → `request` → id-bound `reply` → `ok`/`stale`/`bad-choice`,
+one round per connection, reconnect forever):
+
+- **`src/gui/companion.rs`** — the long-poll client loop, UI-free and
+  tokio-based: connect → `{"op":"wait","timeoutMs":30000}` → handle
+  `request`/`empty` → await the UI's choice → send the id-bound reply
+  → surface the ack → reconnect. Connection loss is an event, never a
+  stop: exponential backoff (250 ms → 5 s cap) finds a restarted
+  server. Reads carry a 75 s timeout (above the server's 60 s window so
+  a legitimate `empty` always arrives first); writes 5 s. No
+  client-side deadline while a request shows — a slow human simply gets
+  the server's `stale` when its own deadline expires. The companion
+  never fabricates answers and never auto-approves.
+- **`src/gui/app.rs`** — the plain-data view state plus a pure event
+  reducer (`apply_event`), deliberately free of egui types so every
+  transition (request shown, ack clears + counts, stale/bad-choice,
+  disconnect records a lost request and never invents history when
+  nothing was pending, history bounded at 100) is unit-testable
+  without a window system.
+- **`src/gui/window.rs`** — the thin egui 0.36 layer (`App::ui`, the
+  new 0.36 immediate-mode signature): status line (connecting /
+  waiting / no-server-retrying), session-registry census of live
+  servers (pids, refreshed every 5 s), the pending-request card
+  (colored category badge, connection/database/tables, monospace
+  snippet block, elapsed timer with a ≥55 s "may already be expired"
+  hint), the three buttons (Approve once / Approve for session /
+  Decline, disabled while a reply is in flight), and a bounded recent
+  answers list. Buttons deliver via `blocking_send` — the sanctioned
+  async bridge from a non-async UI thread; a failed delivery is
+  recorded as not-delivered (fail-closed, never silently retried).
+- **`src/gui/mod.rs`** — `run_gui` (companion thread with its own
+  current-thread runtime; dropping the window drops the choice channel,
+  which cleanly ends the loop) plus `live_sessions` discovery over
+  `runtime/sessions/*.json` (pid-liveness via signal-0 probe, newest
+  first, garbage entries ignored — informational only; the window
+  watches ONE socket, the registry path).
+- **CLI**: `sequel-mcp gui [--socket PATH]` (+ hidden `--smoke N` for
+  headless verification: close after N frames). The unused
+  `egui_extras` dependency was dropped (Cargo.lock −125 lines).
+
+Verified automatically: 12 new tests — 4 companion (once round trip
+through a real `ApprovalIpc` hub incl. table/request field checks,
+decline round trip, **server-restart survival** — hub dropped and
+re-created at the same path, the same companion answers through the
+new server, missing-server retry loop stays alive), 6 reducer (view
+transitions, misattributed-id ack guard, history bound,
+not-delivered), 2 session-discovery (parse + liveness + newest-first,
+garbage ignored). Real-window smoke: `sequel-mcp gui --smoke 12`
+opened an actual eframe window, rendered 12 frames, self-closed,
+exit 0. egui 0.36 API shifts absorbed: `App::ui(&mut Ui)` replaces
+`update(ctx)`, `CentralPanel::show` takes `&mut Ui`, `same_line`
+removed in favor of `horizontal`, `Margin::symmetric(x, y)`.
+
+Gates: 161 lib tests (12 new), 16 lifecycle/isolation binary tests,
+workspace check/test/clippy(`-D warnings` 0)/fmt/doc green
+(`scripts/ci-local.sh` up to `cargo package`, which by design requires
+the committed tree and belongs to the packaging stage), gitleaks
+clean, whitespace clean, SSH matrix 27/27 green (mariadb), both-engine
+docker matrix green, zero docker leftovers.
+
 ## Session 5 record — unchanged summary
 
 Pool identity (CredentialGeneration, publish-after-healthy, coalescing,

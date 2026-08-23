@@ -46,7 +46,6 @@ zeroize = "1"
 libc = "0.2"
 egui = "0.36"
 eframe = { version = "0.36", default-features = true }
-egui_extras = { version = "0.36", features = ["default"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
