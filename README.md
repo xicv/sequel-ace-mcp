@@ -16,7 +16,7 @@ Current release: **v0.10.0**. Full history: [CHANGELOG.md](./CHANGELOG.md).
 - **Single static binary** — pure Rust (`sequel-mcp`), no Node runtime, no `dist/`, no npm.
 - **Two-layer permissions** — connection baseline + table rules (exact `db.table` or wildcard `db.*`; exact beats wildcard; strictest-wins across everything a statement touches; fail-closed).
 - **Elevation still confirms** — a table rule can relax what the baseline denied, but elevated categories always require per-statement confirmation.
-- **27 tools** + 2 prompts + 1 no-secrets resource (`sequel-mcp://connections`).
+- **28 tools** + 2 prompts + 1 no-secrets resource (`sequel-mcp://connections`).
 - **Approvals, three ways** — MCP elicitation first; when the client cannot elicit, an authenticated same-user local IPC channel answers instead (`sequel-mcp approve` CLI or the native GUI window). Modern clients use server-side opaque `requestState` handles (MRTR) bound to the exact operation digest. Every path fails closed — nothing is ever auto-approved.
 - **Pre-mutation backups** for UPDATE / DELETE / REPLACE / INSERT / TRUNCATE / DROP / ALTER, multi-table aware; `restore_backup` replays through the same policy gate (`dryRun=true` default).
 - **Append-only audit log** (SQLite, optional SHA-256 chain) with per-category retention and boot-time auto-cleanup.
@@ -145,7 +145,7 @@ Each connection has a baseline policy; each category is `allow` | `confirm` | `d
 "Explain policy for: UPDATE staging.users SET email='x' WHERE id=1"
 ```
 
-## Tools (27)
+## Tools (28)
 
 | Tool | What it does |
 |------|--------------|
@@ -155,6 +155,7 @@ Each connection has a baseline policy; each category is `allow` | `confirm` | `d
 | `describe_table` | `DESCRIBE` (MySQL/MariaDB) / `PRAGMA table_info` (SQLite). |
 | `list_databases` | `SHOW DATABASES` / `PRAGMA database_list`. |
 | `list_connections` | Saved connections, no secrets; marks default + `hasStoredPassword`. |
+| `add_connection` | Add/update a MySQL/MariaDB connection; password elicited separately → Keychain. |
 | `add_sqlite_connection` | Add/update a SQLite file connection (no password). |
 | `remove_connection` | Forget a connection + delete its Keychain entry. |
 | `set_policy` | Change a connection's baseline. |
@@ -182,9 +183,17 @@ Prompts: `setup-connection` (guided connection setup), `analyze-table` (read-onl
 
 ### MySQL/MariaDB
 
-0.10.0 ships **`import_from_sequel_ace`** (macOS: reads Favorites.plist + Keychain with your approval) as the guided path, and **manual setup** as the explicit path — the interactive `add_connection` tool from 0.9.x has not been re-implemented yet (tracked as the top follow-up):
+The guided path is `add_connection` — arguments carry everything except the password; the server elicits the password separately (it never appears in tool arguments or logs) and stores it in the macOS Keychain:
 
-1. Add the connection to `~/.config/sequel-mcp/config.json` (v2). Example:
+```text
+"Add a connection named local, host 127.0.0.1, port 3306, user root, database app, read-only preset."
+```
+
+Optional `ssh_*` arguments build the tunnel in the same call (`ssh_host`, `ssh_port`, `ssh_user`, `ssh_key_path`, `ssh_docker_container` + `ssh_docker_bridge_tool`, `ssh_host_key_policy`, `ssh_known_hosts_path`); `ssl`, `ssl_server_name`, and `ssl_ca_path` control TLS. Declining or dismissing the password prompt cancels — nothing is saved.
+
+Alternatives: `import_from_sequel_ace` (one-time favorites + Keychain import on macOS) or manual setup — add the connection to `~/.config/sequel-mcp/config.json` (v2) and store the password yourself:
+
+1. Config entry (camelCase fields):
 
    ```json
    {

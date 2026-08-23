@@ -12,12 +12,20 @@
 
 ## Adding connections in 0.10.0
 
-The interactive `add_connection` tool is not yet re-implemented; MySQL/MariaDB connections are added by:
+- **MySQL/MariaDB — `sequel-mcp:add_connection`**: one call carries everything except the password; the server elicits the password over a separate prompt (never in tool args) and stores it in the macOS Keychain. Optional `ssh_*` arguments build the tunnel in the same call.
 
-- `sequel-mcp:import_from_sequel_ace` — guided import of existing favorites (macOS, requires Sequel Ace), or
-- the user editing `~/.config/sequel-mcp/config.json` directly (v2 shape below; passwords never go in the file — Keychain only).
+  ```text
+  sequel-mcp:add_connection
+    name=prod host=10.0.0.5 port=3306 user=readonly database=mydb
+    ssl=false policy_preset=read-only
+    ssh_host=bastion.example.com ssh_user=ops ssh_key_path=~/.ssh/id_ed25519
+    ssh_host_key_policy=strict
+  → elicits password → Keychain service "sequel-mcp : prod", account "readonly"
+  ```
 
-SQLite connections have a first-class tool: `add_sqlite_connection`.
+- **`sequel-mcp:import_from_sequel_ace`** — one-time import of existing favorites (macOS, requires Sequel Ace).
+- **Manual** — the user edits `~/.config/sequel-mcp/config.json` (v2 shape below; passwords never go in the file — Keychain only).
+- **SQLite** — `sequel-mcp:add_sqlite_connection` (no password).
 
 A MySQL/MariaDB connection entry (camelCase fields):
 

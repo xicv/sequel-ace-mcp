@@ -302,6 +302,35 @@ fn read_response(out: &mut LineReceiver, want_id: i64, deadline: Duration) -> se
         .unwrap_or_else(|| panic!("no response for id {want_id} within {deadline:?}"))
 }
 
+/// Next server-INITIATED request with `method` (e.g. elicitation/create);
+/// responses and other requests stay buffered for later lookups.
+fn recv_request(out: &mut LineReceiver, method: &str, deadline: Duration) -> serde_json::Value {
+    let started = Instant::now();
+    loop {
+        if let Some(pos) = out.pending.iter().position(|m| m["method"] == method) {
+            return out.pending.remove(pos).expect("pending request vanished");
+        }
+        match out.rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => {
+                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if msg["method"] == method {
+                        return msg;
+                    }
+                    out.pending.push_back(msg);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if started.elapsed() >= deadline {
+                    panic!("no {method} request within {deadline:?}");
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("stdout closed while waiting for {method}")
+            }
+        }
+    }
+}
+
 #[test]
 fn d7_lifecycle_legacy_and_tools() {
     let (server, mut stdin, mut out) = Server::spawn();
@@ -332,7 +361,7 @@ fn d7_lifecycle_legacy_and_tools() {
     );
     let msg = read_response(&mut out, 2, Duration::from_secs(10));
     let tools = msg["result"]["tools"].as_array().expect("tools");
-    assert_eq!(tools.len(), 27, "tool count");
+    assert_eq!(tools.len(), 28, "tool count");
     assert!(tools.iter().all(|t| t["name"].is_string()));
     assert!(tools.iter().any(|t| t["name"] == "query"));
 
@@ -382,7 +411,7 @@ fn d7_lifecycle_legacy_and_tools() {
     assert!(
         msg["result"]["tools"]
             .as_array()
-            .map(|t| t.len() == 27)
+            .map(|t| t.len() == 28)
             .unwrap_or(false),
         "server must keep answering after malformed input: {msg}"
     );
@@ -405,7 +434,7 @@ fn d7_lifecycle_legacy_and_tools() {
     let msg = read_response(&mut out, 6, Duration::from_secs(20));
     assert_eq!(
         msg["result"]["tools"].as_array().unwrap().len(),
-        27,
+        28,
         "follow-up after oversized input: {msg}"
     );
 
@@ -486,6 +515,222 @@ fn d7_eof_during_in_flight_request() {
     }
 }
 
+// ---- add_connection: elicited password → secret store + config ----
+
+fn initialize_with_elicitation(
+    stdin: &mut impl std::io::Write,
+    out: &mut LineReceiver,
+    elicitation: bool,
+) {
+    let caps = if elicitation {
+        serde_json::json!({"elicitation": {"form": {}}})
+    } else {
+        serde_json::json!({})
+    };
+    send(
+        stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": caps,
+                "clientInfo": {"name": "add-conn-test", "version": "0"}
+            }
+        }),
+    );
+    let msg = read_response(out, 1, Duration::from_secs(10));
+    assert_eq!(msg["result"]["serverInfo"]["name"], "sequel-mcp");
+    send(
+        stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
+}
+
+#[test]
+fn add_connection_round_trip() {
+    let (server, mut stdin, mut out) = Server::spawn();
+    initialize_with_elicitation(&mut stdin, &mut out, true);
+
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "add_connection", "arguments": {
+                "name": "rt-mysql", "host": "127.0.0.1", "port": 3306,
+                "user": "root", "database": "app", "ssl": false,
+                "policy_preset": "read-only",
+                "ssh_host": "bastion.example.com", "ssh_user": "ops",
+                "ssh_key_path": "~/.ssh/id_ed25519",
+                "ssh_docker_container": "mysql_prod",
+                "ssh_docker_bridge_tool": "nc",
+                "ssh_host_key_policy": "strict"
+            }}
+        }),
+    );
+    // The password arrives as a LIVE server-initiated elicitation, never
+    // through tool arguments.
+    let elicit = recv_request(&mut out, "elicitation/create", Duration::from_secs(10));
+    let message = elicit["params"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("root@127.0.0.1:3306"), "{message}");
+    assert!(message.contains("never in tool arguments"), "{message}");
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": elicit["id"],
+            "result": {"action": "accept", "content": {"password": "hunter2"}}
+        }),
+    );
+    let msg = read_response(&mut out, 2, Duration::from_secs(10));
+    let text = msg["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(text.contains("Saved connection \"rt-mysql\""), "{text}");
+
+    // list_connections: driver mysql, read-only preset applied, password
+    // present in the (test-mode in-memory) secret store.
+    send(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "list_connections", "arguments": {}}}),
+    );
+    let msg = read_response(&mut out, 3, Duration::from_secs(10));
+    let payload: serde_json::Value =
+        serde_json::from_str(msg["result"]["content"][0]["text"].as_str().unwrap())
+            .expect("list_connections returns JSON");
+    let conns = payload["connections"].as_array().unwrap();
+    // The isolated demo config pre-seeds one sqlite connection; the new
+    // MySQL connection adds to it.
+    assert_eq!(conns.len(), 2, "{payload}");
+    let rt = conns
+        .iter()
+        .find(|c| c["name"] == "rt-mysql")
+        .expect("rt-mysql present");
+    assert_eq!(rt["driver"], "mysql");
+    assert_eq!(rt["hasStoredPassword"], true);
+    assert_eq!(rt["policy"]["write"], "deny");
+
+    // The no-secrets connections resource echoes the SSH + docker shape.
+    send(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "resources/read",
+            "params": {"uri": "sequel-mcp://connections"}}),
+    );
+    let msg = read_response(&mut out, 4, Duration::from_secs(10));
+    let resource = msg["result"]["contents"][0]["text"].as_str().unwrap();
+    assert!(resource.contains("mysql_prod"), "{resource}");
+    assert!(resource.contains("bastion.example.com"), "{resource}");
+
+    drop(stdin);
+    let mut server = server;
+    let started = Instant::now();
+    loop {
+        match server.child.try_wait().unwrap() {
+            Some(_) => break,
+            None => {
+                assert!(started.elapsed() < Duration::from_secs(10));
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
+}
+
+#[test]
+fn add_connection_declined_not_saved() {
+    let (server, mut stdin, mut out) = Server::spawn();
+    initialize_with_elicitation(&mut stdin, &mut out, true);
+
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "add_connection", "arguments": {
+                "name": "declined-mysql", "host": "127.0.0.1", "user": "root"
+            }}
+        }),
+    );
+    let elicit = recv_request(&mut out, "elicitation/create", Duration::from_secs(10));
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": elicit["id"],
+            "result": {"action": "decline"}
+        }),
+    );
+    let msg = read_response(&mut out, 2, Duration::from_secs(10));
+    let text = msg["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("Password capture cancelled. Connection not saved."),
+        "{text}"
+    );
+
+    send(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "list_connections", "arguments": {}}}),
+    );
+    let msg = read_response(&mut out, 3, Duration::from_secs(10));
+    let payload: serde_json::Value =
+        serde_json::from_str(msg["result"]["content"][0]["text"].as_str().unwrap())
+            .expect("list_connections returns JSON");
+    assert!(
+        payload["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["name"] != "declined-mysql"),
+        "declined capture must leave the config untouched"
+    );
+    drop(stdin);
+    drop(server);
+}
+
+#[test]
+fn add_connection_without_elicitation_support_fails_closed() {
+    let (server, mut stdin, mut out) = Server::spawn();
+    initialize_with_elicitation(&mut stdin, &mut out, false);
+
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "add_connection", "arguments": {
+                "name": "no-elicit-mysql", "host": "127.0.0.1", "user": "root"
+            }}
+        }),
+    );
+    // A client that never declared elicitation.form gets a typed error,
+    // never a hang and never a saved connection.
+    let msg = read_response(&mut out, 2, Duration::from_secs(10));
+    let text = msg["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("Password capture cancelled. Connection not saved."),
+        "{text}"
+    );
+
+    send(
+        &mut stdin,
+        &serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "list_connections", "arguments": {}}}),
+    );
+    let msg = read_response(&mut out, 3, Duration::from_secs(10));
+    let payload: serde_json::Value =
+        serde_json::from_str(msg["result"]["content"][0]["text"].as_str().unwrap())
+            .expect("list_connections returns JSON");
+    assert!(
+        payload["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["name"] != "no-elicit-mysql")
+    );
+    drop(stdin);
+    drop(server);
+}
+
 // ---- Modern era (2026-07-28): discovery, _meta requests, MRTR ----
 
 fn meta_2026() -> serde_json::Value {
@@ -533,7 +778,7 @@ fn d7_modern_discover_meta_and_version_error() {
     );
     let msg = read_response(&mut out, 2, Duration::from_secs(10));
     assert_eq!(msg["result"]["resultType"], "complete");
-    assert_eq!(msg["result"]["tools"].as_array().unwrap().len(), 27);
+    assert_eq!(msg["result"]["tools"].as_array().unwrap().len(), 28);
 
     // Modern tools/call (read) succeeds without initialize.
     send(
@@ -1370,7 +1615,7 @@ fn d7_line_limit_boundaries() {
     let msg = read_response(&mut out, 10, Duration::from_secs(20));
     assert_eq!(
         msg["result"]["tools"].as_array().unwrap().len(),
-        27,
+        28,
         "{msg}"
     );
 
@@ -1381,7 +1626,7 @@ fn d7_line_limit_boundaries() {
     let msg = read_response(&mut out, 11, Duration::from_secs(20));
     assert_eq!(
         msg["result"]["tools"].as_array().unwrap().len(),
-        27,
+        28,
         "{msg}"
     );
 
@@ -1413,7 +1658,7 @@ fn d7_line_limit_boundaries() {
     let msg = read_response(&mut sink, 13, Duration::from_secs(20));
     assert_eq!(
         msg["result"]["tools"].as_array().unwrap().len(),
-        27,
+        28,
         "{msg}"
     );
 
@@ -1433,7 +1678,7 @@ fn d7_line_limit_boundaries() {
     let msg = read_response(&mut sink, 15, Duration::from_secs(20));
     assert_eq!(
         msg["result"]["tools"].as_array().unwrap().len(),
-        27,
+        28,
         "{msg}"
     );
 
@@ -1457,7 +1702,7 @@ fn d7_line_limit_boundaries() {
     let msg = read_response(&mut sink, 16, Duration::from_secs(30));
     assert_eq!(
         msg["result"]["tools"].as_array().unwrap().len(),
-        27,
+        28,
         "{msg}"
     );
     let _ = &mut stdin;
@@ -1609,7 +1854,7 @@ fn d7_concurrent_response_id_integrity() {
         &serde_json::json!({"jsonrpc": "2.0", "id": 999, "method": "tools/list"}),
     );
     let msg = read_response(&mut out, 999, Duration::from_secs(10));
-    assert_eq!(msg["result"]["tools"].as_array().unwrap().len(), 27);
+    assert_eq!(msg["result"]["tools"].as_array().unwrap().len(), 28);
 
     drop(stdin);
     let started = Instant::now();

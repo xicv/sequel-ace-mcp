@@ -31,9 +31,8 @@ Client UIs render MCP tool names differently. Claude Code commonly shows `sequel
 - `sequel-mcp:restore_backup` — replay a pre-mutation backup; `dryRun=true` by default.
 
 **Policy + setup:**
+- `sequel-mcp:add_connection` / `sequel-mcp:remove_connection` — MySQL/MariaDB password is captured via a separate elicitation prompt, never via tool args.
 - `sequel-mcp:add_sqlite_connection` — SQLite file connection; no password or Keychain entry.
-- `sequel-mcp:remove_connection` — forget a connection + its Keychain entry.
-- `sequel-mcp:import_from_sequel_ace` — the guided MySQL/MariaDB setup path (imports favorites + Keychain). The interactive `add_connection` tool is not yet re-implemented in 0.10.0; MySQL connections otherwise come from the user's own config.
 - `sequel-mcp:set_policy` — change baseline action set + caps.
 - `sequel-mcp:set_table_policy` / `sequel-mcp:clear_table_policy` / `sequel-mcp:list_table_policies` — exact (`db.table`) or wildcard (`db.*`) rules; exact beats wildcard, strictest wins across tables.
 - `sequel-mcp:explain_policy` — classify a statement and show the per-table resolution without executing.
