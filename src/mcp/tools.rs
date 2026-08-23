@@ -18,8 +18,13 @@ use crate::policy::model::{PartialPolicy, PolicyPresetName, SqlCategory, TableRu
 
 use super::{SequelServer, error_tool_result, json_tool_result, text_tool_result};
 
-fn gate_deps_blocking(sink: Box<dyn gate::ApprovalSink>) -> GateDeps {
-    GateDeps::with_sink(sink)
+impl SequelServer {
+    /// Process-shared approval engine: "Allow for session" grants must
+    /// survive across tool calls (a fresh engine per call silently
+    /// voided the documented session scope).
+    fn gate_deps_blocking(&self, sink: Box<dyn gate::ApprovalSink>) -> GateDeps {
+        GateDeps::with_sink_and_approvals(sink, self.ctx.approvals.clone())
+    }
 }
 
 fn resolve_conn(store: &ConfigStore, name: Option<&str>) -> Result<Option<Connection>, String> {
@@ -1247,7 +1252,7 @@ impl SequelServer {
     /// (read-only helper tools; confirm-gated statements report
     /// unavailable — use query/execute for those).
     fn run_sql_blocking(&self, args: RunSqlArgs, expect_read_only: bool) -> CallToolResult {
-        let deps = gate_deps_blocking(Box::new(gate::UnavailableSink));
+        let deps = self.gate_deps_blocking(Box::new(gate::UnavailableSink));
         match gate::run_sql(&deps, &args, expect_read_only) {
             Ok(out) => json_tool_result(gate::outcome_to_json(&out)),
             Err(e) => error_tool_result(e.to_string()),
@@ -1322,7 +1327,7 @@ impl SequelServer {
                     database: p.database.clone(),
                     expected_ddl_targets: expected_ddl,
                 };
-                let deps = gate_deps_blocking(outcome);
+                let deps = self.gate_deps_blocking(outcome);
                 tokio::task::spawn_blocking(move || gate::run_sql(&deps, &args, expect_read_only))
             };
 
@@ -1441,7 +1446,11 @@ impl SequelServer {
             }
         }
 
-        let digest = super::mrtr::operation_digest(&p.sql, conn.name(), cfg.revision);
+        // Bind the approval to the effective database scope as well:
+        // replaying the same SQL against a different database arg (or a
+        // changed connection default) must fail with mrtr_invalid_state.
+        let digest =
+            super::mrtr::operation_digest(&p.sql, conn.name(), fallback.as_deref(), cfg.revision);
 
         // Retry: consume + validate the echoed state, parse the response,
         // execute with the plan-approved DDL target set.
@@ -2447,7 +2456,7 @@ Use only read-only tools: describe_table, list_databases, and query (SELECT/SHOW
             // thread (block_on from a blocking thread is legal).
             let (ask_tx, ask_rx) = std::sync::mpsc::sync_channel::<super::confirm::ElicitAsk>(4);
             let sink = super::confirm::ElicitationSink::new(ask_tx);
-            let deps = gate_deps_blocking(Box::new(sink));
+            let deps = self.gate_deps_blocking(Box::new(sink));
             let handle =
                 tokio::task::spawn_blocking(move || gate::run_sql(&deps, &args, expect_read_only));
             let peer = context.peer.clone();

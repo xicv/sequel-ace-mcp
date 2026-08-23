@@ -484,6 +484,15 @@ impl ObjectGraph {
                 self.walk_query(&cte.query);
             }
         }
+        // ORDER BY lives on the Query node (not Select); a scalar
+        // subquery there reads tables too.
+        if let Some(order) = &q.order_by
+            && let sqlparser::ast::OrderByKind::Expressions(exprs) = &order.kind
+        {
+            for o in exprs {
+                self.walk_expr_tables(&o.expr);
+            }
+        }
         self.walk_set_expr(&q.body);
     }
 
@@ -496,6 +505,32 @@ impl ObjectGraph {
                 if let Some(expr) = &select.selection {
                     self.walk_expr_tables(expr);
                 }
+                // Expression contexts beyond WHERE — projection, GROUP BY,
+                // HAVING, ORDER BY — also read tables through scalar
+                // subqueries (`SELECT (SELECT … FROM denied)` used to
+                // bypass table-level read denies entirely).
+                for item in &select.projection {
+                    match item {
+                        sqlparser::ast::SelectItem::UnnamedExpr(e) => {
+                            self.walk_expr_tables(e);
+                        }
+                        sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
+                            self.walk_expr_tables(expr);
+                        }
+                        _ => {}
+                    }
+                }
+                if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &select.group_by {
+                    for e in exprs {
+                        self.walk_expr_tables(e);
+                    }
+                }
+                if let Some(having) = &select.having {
+                    self.walk_expr_tables(having);
+                }
+                for o in &select.sort_by {
+                    self.walk_expr_tables(&o.expr);
+                }
             }
             SetExpr::Query(q) => self.walk_query(q),
             SetExpr::SetOperation { left, right, .. } => {
@@ -507,19 +542,225 @@ impl ObjectGraph {
         }
     }
 
-    /// Subqueries inside expressions (`IN (SELECT …)`, EXISTS, scalar).
+    /// Subqueries inside expressions (`IN (SELECT …)`, EXISTS, scalar
+    /// subqueries in projections/SET values, subqueries wrapped in
+    /// function calls, CASE arms, casts, …). Every expression-bearing
+    /// shape recurses so a read table can never hide from resolution.
     fn walk_expr_tables(&mut self, expr: &Expr) {
         match expr {
+            // Direct subquery carriers.
             Expr::Subquery(s) => self.walk_query(s),
-            Expr::InSubquery { subquery, .. } => self.walk_query(subquery),
             Expr::Exists { subquery, .. } => self.walk_query(subquery),
+            Expr::InSubquery { expr, subquery, .. } => {
+                self.walk_expr_tables(expr);
+                self.walk_query(subquery);
+            }
+            Expr::InUnnest {
+                expr, array_expr, ..
+            } => {
+                self.walk_expr_tables(expr);
+                self.walk_expr_tables(array_expr);
+            }
+            // Recurse through every expression-bearing shape.
             Expr::BinaryOp { left, right, .. } => {
                 self.walk_expr_tables(left);
                 self.walk_expr_tables(right);
             }
-            Expr::UnaryOp { expr, .. } => self.walk_expr_tables(expr),
-            Expr::Nested(e) => self.walk_expr_tables(e),
+            Expr::UnaryOp { expr, .. }
+            | Expr::Nested(expr)
+            | Expr::IsFalse(expr)
+            | Expr::IsNotFalse(expr)
+            | Expr::IsTrue(expr)
+            | Expr::IsNotTrue(expr)
+            | Expr::IsNull(expr)
+            | Expr::IsNotNull(expr)
+            | Expr::IsUnknown(expr)
+            | Expr::IsNotUnknown(expr)
+            | Expr::Cast { expr, .. }
+            | Expr::Convert { expr, .. }
+            | Expr::Extract { expr, .. }
+            | Expr::Ceil { expr, .. }
+            | Expr::Floor { expr, .. }
+            | Expr::Collate { expr, .. }
+            | Expr::CompoundFieldAccess { root: expr, .. }
+            | Expr::AtTimeZone {
+                timestamp: expr, ..
+            }
+            | Expr::Prefixed { value: expr, .. }
+            | Expr::IsNormalized { expr, .. }
+            | Expr::OuterJoin(expr)
+            | Expr::Prior(expr) => self.walk_expr_tables(expr),
+            Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
+                self.walk_expr_tables(a);
+                self.walk_expr_tables(b);
+            }
+            Expr::InList { expr, list, .. } => {
+                self.walk_expr_tables(expr);
+                for e in list {
+                    self.walk_expr_tables(e);
+                }
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.walk_expr_tables(expr);
+                self.walk_expr_tables(low);
+                self.walk_expr_tables(high);
+            }
+            Expr::Like { expr, pattern, .. }
+            | Expr::ILike { expr, pattern, .. }
+            | Expr::SimilarTo { expr, pattern, .. }
+            | Expr::RLike { expr, pattern, .. } => {
+                self.walk_expr_tables(expr);
+                self.walk_expr_tables(pattern);
+            }
+            Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+                self.walk_expr_tables(left);
+                self.walk_expr_tables(right);
+            }
+            Expr::Position { expr, r#in, .. } => {
+                self.walk_expr_tables(expr);
+                self.walk_expr_tables(r#in);
+            }
+            Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
+                self.walk_expr_tables(expr);
+                if let Some(e) = substring_from {
+                    self.walk_expr_tables(e);
+                }
+                if let Some(e) = substring_for {
+                    self.walk_expr_tables(e);
+                }
+            }
+            Expr::Trim {
+                expr,
+                trim_what,
+                trim_characters,
+                ..
+            } => {
+                self.walk_expr_tables(expr);
+                if let Some(e) = trim_what {
+                    self.walk_expr_tables(e);
+                }
+                if let Some(list) = trim_characters {
+                    for e in list {
+                        self.walk_expr_tables(e);
+                    }
+                }
+            }
+            Expr::Overlay {
+                expr,
+                overlay_what,
+                overlay_from,
+                overlay_for,
+                ..
+            } => {
+                self.walk_expr_tables(expr);
+                self.walk_expr_tables(overlay_what);
+                self.walk_expr_tables(overlay_from);
+                if let Some(e) = overlay_for {
+                    self.walk_expr_tables(e);
+                }
+            }
+            Expr::Function(f) => {
+                self.walk_function_arguments(&f.parameters);
+                self.walk_function_arguments(&f.args);
+                if let Some(filter) = &f.filter {
+                    self.walk_expr_tables(filter);
+                }
+            }
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                if let Some(e) = operand {
+                    self.walk_expr_tables(e);
+                }
+                for cw in conditions {
+                    self.walk_expr_tables(&cw.condition);
+                    self.walk_expr_tables(&cw.result);
+                }
+                if let Some(e) = else_result {
+                    self.walk_expr_tables(e);
+                }
+            }
+            Expr::GroupingSets(lists) | Expr::Cube(lists) | Expr::Rollup(lists) => {
+                for list in lists {
+                    for e in list {
+                        self.walk_expr_tables(e);
+                    }
+                }
+            }
+            Expr::Tuple(exprs) => {
+                for e in exprs {
+                    self.walk_expr_tables(e);
+                }
+            }
+            Expr::Struct { values, .. } => {
+                for e in values {
+                    self.walk_expr_tables(e);
+                }
+            }
+            Expr::Named { expr, .. } => self.walk_expr_tables(expr),
+            Expr::Map(m) => {
+                for entry in &m.entries {
+                    self.walk_expr_tables(&entry.key);
+                    self.walk_expr_tables(&entry.value);
+                }
+            }
+            Expr::Array(a) => {
+                for e in &a.elem {
+                    self.walk_expr_tables(e);
+                }
+            }
+            Expr::MemberOf(m) => self.walk_expr_tables(&m.value),
+            // No nested expressions (identifiers, literals, wildcards,
+            // intervals, …).
             _ => {}
+        }
+    }
+
+    fn walk_function_arguments(&mut self, args: &sqlparser::ast::FunctionArguments) {
+        use sqlparser::ast::{FunctionArguments, OrderByKind};
+        match args {
+            FunctionArguments::None => {}
+            FunctionArguments::Subquery(q) => self.walk_query(q),
+            FunctionArguments::List(list) => {
+                for a in &list.args {
+                    match a {
+                        sqlparser::ast::FunctionArg::Named { arg, .. } => {
+                            self.walk_function_arg_expr(arg)
+                        }
+                        sqlparser::ast::FunctionArg::ExprNamed { name, arg, .. } => {
+                            self.walk_expr_tables(name);
+                            self.walk_function_arg_expr(arg);
+                        }
+                        sqlparser::ast::FunctionArg::Unnamed(arg) => {
+                            self.walk_function_arg_expr(arg)
+                        }
+                    }
+                }
+                for clause in &list.clauses {
+                    if let sqlparser::ast::FunctionArgumentClause::OrderBy(exprs) = clause {
+                        for o in exprs {
+                            self.walk_expr_tables(&o.expr);
+                        }
+                    }
+                    let _ = OrderByKind::All;
+                }
+            }
+        }
+    }
+
+    fn walk_function_arg_expr(&mut self, arg: &sqlparser::ast::FunctionArgExpr) {
+        if let sqlparser::ast::FunctionArgExpr::Expr(e) = arg {
+            self.walk_expr_tables(e);
         }
     }
 
@@ -589,16 +830,34 @@ fn classify_ast(
                     }
                 }
             }
-            let (read, _, _) = g.finish();
-            r.mutated_tables = read;
+            let (mutated, _, _) = g.finish();
+            // WHERE and SET values can carry subqueries that READ other
+            // tables (`SET c = (SELECT … FROM denied)`); collect them on
+            // a separate graph so they authorize as reads, not mutations.
+            let mut rg = ObjectGraph::default();
+            if let Some(sel) = &update.selection {
+                rg.walk_expr_tables(sel);
+            }
+            for a in &update.assignments {
+                rg.walk_expr_tables(&a.value);
+            }
+            let (read, _, _) = rg.finish();
+            r.mutated_tables = mutated;
+            r.read_tables = read;
         }
         Statement::Delete(delete) => {
             r.category = SqlCategory::Write;
             r.ast_type = "delete";
             let mut g = ObjectGraph::default();
             walk_delete_sources(delete, &mut g);
-            let (read, _, _) = g.finish();
-            r.mutated_tables = read;
+            let (mutated, _, _) = g.finish();
+            let mut rg = ObjectGraph::default();
+            if let Some(sel) = &delete.selection {
+                rg.walk_expr_tables(sel);
+            }
+            let (read, _, _) = rg.finish();
+            r.mutated_tables = mutated;
+            r.read_tables = read;
         }
         Statement::Truncate(trunc) => {
             if trunc.if_exists {
@@ -1019,6 +1278,84 @@ mod tests {
         let c = classify_statement("EXPLAIN ANALYZE SELECT * FROM users", mysql).unwrap();
         assert!(c.executes_wrapped);
         assert_eq!(c.category, SqlCategory::Read);
+    }
+
+    /// Review finding (2026-08-23 independent review): expression-context
+    /// subqueries must count as read tables, or table-level read denies
+    /// are bypassable (`SELECT (SELECT … FROM denied)`).
+    #[test]
+    fn expression_context_subqueries_are_read_tables() {
+        let mysql = Dialect::MySql;
+        let secret = TableRef {
+            database: Some("secrets".into()),
+            table: "tokens".into(),
+        };
+        let cases = [
+            // Scalar subquery in the projection.
+            "SELECT (SELECT token FROM secrets.tokens) AS x",
+            // Subquery wrapped in a function call.
+            "SELECT UPPER((SELECT token FROM secrets.tokens)) AS x",
+            // CASE with an EXISTS subquery.
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM secrets.tokens) THEN 1 ELSE 2 END AS x",
+            // Subquery in GROUP BY / HAVING / ORDER BY.
+            "SELECT 1 FROM app.users GROUP BY (SELECT token FROM secrets.tokens)",
+            "SELECT 1 FROM app.users HAVING COUNT(*) > (SELECT COUNT(*) FROM secrets.tokens)",
+            "SELECT id FROM app.users ORDER BY (SELECT token FROM secrets.tokens)",
+            // ANY/ALL comparisons.
+            "SELECT id FROM app.users WHERE id = ANY (SELECT uid FROM secrets.tokens)",
+        ];
+        for sql in cases {
+            let c = classify_statement(sql, mysql)
+                .unwrap_or_else(|e| panic!("{sql}: must classify: {e:?}"));
+            assert!(
+                c.read_tables.contains(&secret),
+                "{sql}: read_tables must include secrets.tokens (got {:?})",
+                c.read_tables
+            );
+        }
+    }
+
+    /// UPDATE SET values / WHERE and DELETE WHERE subqueries authorize as
+    /// READS of the subquery table while the mutation targets stay exact.
+    #[test]
+    fn update_delete_subqueries_authorize_as_reads() {
+        let mysql = Dialect::MySql;
+        let secret = TableRef {
+            database: Some("secrets".into()),
+            table: "tokens".into(),
+        };
+        let jobs = TableRef {
+            database: Some("app".into()),
+            table: "jobs".into(),
+        };
+
+        let c = classify_statement(
+            "UPDATE app.jobs SET note = (SELECT token FROM secrets.tokens LIMIT 1)",
+            mysql,
+        )
+        .unwrap();
+        assert_eq!(c.mutated_tables, vec![jobs.clone()]);
+        assert!(
+            c.read_tables.contains(&secret),
+            "SET-value subquery must be a read table (got {:?})",
+            c.read_tables
+        );
+
+        let c = classify_statement(
+            "UPDATE app.jobs SET note = 'x' WHERE id IN (SELECT id FROM secrets.tokens)",
+            mysql,
+        )
+        .unwrap();
+        assert_eq!(c.mutated_tables, vec![jobs.clone()]);
+        assert!(c.read_tables.contains(&secret));
+
+        let c = classify_statement(
+            "DELETE FROM app.jobs WHERE id IN (SELECT id FROM secrets.tokens)",
+            mysql,
+        )
+        .unwrap();
+        assert_eq!(c.mutated_tables, vec![jobs]);
+        assert!(c.read_tables.contains(&secret));
     }
 
     /// Differential check against the legacy fixture corpus: categories and

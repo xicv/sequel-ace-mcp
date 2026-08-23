@@ -92,10 +92,20 @@ pub struct GateDeps {
 
 impl GateDeps {
     pub fn with_sink(sink: Box<dyn ApprovalSink>) -> Self {
+        Self::with_sink_and_approvals(sink, Arc::new(ApprovalEngine::new()))
+    }
+
+    /// Server entry point: the approval engine is PROCESS-SHARED so
+    /// "Allow for session" grants survive across tool calls (a fresh
+    /// engine per call silently voided the documented session scope).
+    pub fn with_sink_and_approvals(
+        sink: Box<dyn ApprovalSink>,
+        approvals: Arc<ApprovalEngine>,
+    ) -> Self {
         Self {
             config: Arc::new(ConfigStore::new()),
             audit: AuditDb::shared(),
-            approvals: Arc::new(ApprovalEngine::new()),
+            approvals,
             auth: Arc::new(SessionAuthenticator::new(
                 crate::vault::touchid::system_touch_id(),
             )),
@@ -216,7 +226,7 @@ pub fn run_sql(
     let mut approval_digest: Option<[u8; 32]> = None;
     match resolution.action {
         PolicyAction::Deny => {
-            audit(
+            if let Err(e) = audit(
                 deps,
                 &request_id,
                 &conn,
@@ -230,8 +240,13 @@ pub fn run_sql(
                 None,
                 None,
                 None,
+                None,
+                None,
+                None,
                 &write_opts,
-            );
+            ) {
+                eprintln!("sequel-mcp: audit write failed for a denied statement: {e}");
+            }
             let hint = resolution
                 .contributions
                 .iter()
@@ -256,7 +271,7 @@ pub fn run_sql(
                     conn.name()
                 ));
                 if !ok {
-                    audit(
+                    if let Err(audit_err) = audit(
                         deps,
                         &request_id,
                         &conn,
@@ -270,8 +285,15 @@ pub fn run_sql(
                         None,
                         None,
                         None,
+                        None,
+                        None,
+                        None,
                         &write_opts,
-                    );
+                    ) {
+                        eprintln!(
+                            "sequel-mcp: audit write failed for a touch-id-denied statement: {audit_err}"
+                        );
+                    }
                     return Err(GateError::TouchIdFailed);
                 }
             }
@@ -300,7 +322,7 @@ pub fn run_sql(
                 });
                 match outcome {
                     ConfirmOutcome::Unavailable { reason } => {
-                        audit(
+                        if let Err(e) = audit(
                             deps,
                             &request_id,
                             &conn,
@@ -314,12 +336,17 @@ pub fn run_sql(
                             None,
                             None,
                             Some(&reason),
+                            None,
+                            None,
+                            None,
                             &write_opts,
-                        );
+                        ) {
+                            eprintln!("sequel-mcp: audit write failed: {e}");
+                        }
                         return Err(GateError::Unavailable(classified.category, reason));
                     }
                     ConfirmOutcome::Chosen(GrantChoice::Decline) => {
-                        audit(
+                        if let Err(e) = audit(
                             deps,
                             &request_id,
                             &conn,
@@ -333,8 +360,13 @@ pub fn run_sql(
                             None,
                             None,
                             None,
+                            None,
+                            None,
+                            None,
                             &write_opts,
-                        );
+                        ) {
+                            eprintln!("sequel-mcp: audit write failed: {e}");
+                        }
                         return Err(GateError::Declined(classified.category));
                     }
                     ConfirmOutcome::Chosen(GrantChoice::Session) => {
@@ -378,7 +410,7 @@ pub fn run_sql(
             })?;
         let resolution2 = resolver::resolve(&conn2, &classified, fallback.as_deref());
         if resolution2.action != resolution.action {
-            audit(
+            if let Err(e) = audit(
                 deps,
                 &request_id,
                 &conn,
@@ -392,8 +424,13 @@ pub fn run_sql(
                 approval_digest,
                 Some(cfg2.revision),
                 None,
+                None,
+                None,
+                None,
                 &write_opts,
-            );
+            ) {
+                eprintln!("sequel-mcp: audit write failed: {e}");
+            }
             return Err(GateError::Denied(
                 "policy changed during approval; re-run the statement".into(),
             ));
@@ -425,7 +462,7 @@ pub fn run_sql(
             let password = match deps.secrets.get_password(&mc.name, &mc.user) {
                 Ok(p) => p,
                 Err(_) => {
-                    audit(
+                    if let Err(e) = audit(
                         deps,
                         &request_id,
                         &conn,
@@ -439,8 +476,13 @@ pub fn run_sql(
                         approval_digest,
                         Some(cfg.revision),
                         None,
+                        None,
+                        None,
+                        None,
                         &write_opts,
-                    );
+                    ) {
+                        eprintln!("sequel-mcp: audit write failed: {e}");
+                    }
                     return Err(GateError::NoPassword(mc.name.clone()));
                 }
             };
@@ -466,7 +508,7 @@ pub fn run_sql(
                         Ok(p) => Some(p),
                         Err(_) if ssh.auth_method == crate::config::SshAuthMethod::Key => None,
                         Err(_) => {
-                            audit(
+                            if let Err(e) = audit(
                                 deps,
                                 &request_id,
                                 &conn,
@@ -480,8 +522,13 @@ pub fn run_sql(
                                 approval_digest,
                                 Some(cfg.revision),
                                 None,
+                                None,
+                                None,
+                                None,
                                 &write_opts,
-                            );
+                            ) {
+                                eprintln!("sequel-mcp: audit write failed: {e}");
+                            }
                             return Err(GateError::NoPassword(format!("{}::ssh", mc.name)));
                         }
                     };
@@ -506,7 +553,7 @@ pub fn run_sql(
                         Ok(lease) => Some(lease),
                         Err(e) => {
                             let msg = format!("ssh tunnel: {e}");
-                            audit(
+                            if let Err(audit_err) = audit(
                                 deps,
                                 &request_id,
                                 &conn,
@@ -520,8 +567,13 @@ pub fn run_sql(
                                 approval_digest,
                                 Some(cfg.revision),
                                 Some(&msg),
+                                None,
+                                None,
+                                None,
                                 &write_opts,
-                            );
+                            ) {
+                                eprintln!("sequel-mcp: audit write failed: {audit_err}");
+                            }
                             return Err(GateError::Execution(msg));
                         }
                     }
@@ -569,7 +621,7 @@ pub fn run_sql(
 
     match exec_result {
         Ok(r) => {
-            audit(
+            let audit_result = audit(
                 deps,
                 &request_id,
                 &conn,
@@ -583,11 +635,35 @@ pub fn run_sql(
                 approval_digest,
                 Some(cfg.revision),
                 None,
+                Some(r.affected_rows),
+                Some(r.duration_ms.max(started.elapsed().as_millis() as u64)),
+                r.backup_id,
                 &write_opts,
             );
-            // D3: the audit row is durable, so the operation journal can
-            // close out (mutation_committed -> audit_finalized).
-            if let Some(jid) = r.journal_id {
+            // Review blocker: a committed mutation with a FAILED audit
+            // write must never be reported as a clean success — and the
+            // journal must NOT close out over a missing row. Report an
+            // Ok outcome (the mutation happened; an error invites a
+            // client retry and a double execution) with a loud warning.
+            let audit_ok = audit_result.is_ok();
+            let mut warnings = r.warnings;
+            if let Err(e) = audit_result {
+                eprintln!(
+                    "sequel-mcp: AUDIT WRITE FAILED after a committed {cat} statement on {conn}: {e}. The audit chain is incomplete for request {rid}.",
+                    cat = classified.category,
+                    conn = conn.name(),
+                    rid = request_id,
+                );
+                warnings.push(Box::leak(
+                    format!(
+                        "audit-write-failed: the statement committed but its audit entry could not be persisted ({e}); the audit chain is incomplete"
+                    )
+                    .into_boxed_str(),
+                ));
+            }
+            // D3: only close the journal (mutation_committed ->
+            // audit_finalized) when the audit row is actually durable.
+            if audit_ok && let Some(jid) = r.journal_id {
                 let j = crate::backup::journal::Journal::from_id(&deps.audit, jid);
                 let _ = j.transition(crate::backup::journal::JournalState::AuditFinalized, None);
             }
@@ -606,12 +682,12 @@ pub fn run_sql(
                 ddl_no_op: r.ddl_no_op,
                 ddl_absent_targets: r.ddl_absent_targets,
                 ddl_executed_targets: r.ddl_executed_targets,
-                warnings: r.warnings,
+                warnings,
                 request_id,
             })
         }
         Err(e) => {
-            audit(
+            if let Err(audit_err) = audit(
                 deps,
                 &request_id,
                 &conn,
@@ -625,8 +701,16 @@ pub fn run_sql(
                 approval_digest,
                 Some(cfg.revision),
                 Some(&e),
+                None,
+                Some(started.elapsed().as_millis() as u64),
+                None,
                 &write_opts,
-            );
+            ) {
+                eprintln!(
+                    "sequel-mcp: audit write also failed for the errored statement (request {rid}): {audit_err}",
+                    rid = request_id,
+                );
+            }
             Err(GateError::Execution(e))
         }
     }
@@ -647,8 +731,11 @@ fn audit(
     approval_digest: Option<[u8; 32]>,
     policy_revision: Option<u64>,
     error: Option<&str>,
+    affected_rows: Option<u64>,
+    duration_ms: Option<u64>,
+    backup_id: Option<i64>,
     opts: &WriteOptions,
-) {
+) -> Result<(), String> {
     let entry = AuditEntry {
         request_id: request_id.to_string(),
         connection: conn.name().to_string(),
@@ -659,32 +746,62 @@ fn audit(
         decision: resolution.action,
         confirmed,
         outcome,
-        affected_rows: None,
-        duration_ms: None,
+        affected_rows: affected_rows.map(|v| v as i64),
+        duration_ms: duration_ms.map(|v| v as i64),
         error: error.map(str::to_string),
-        backup_id: None,
+        backup_id,
         approval_scope: approval_scope.map(str::to_string),
         approval_digest,
         policy_revision,
     };
-    let _ = crate::audit::write_audit_entry(&deps.audit, &entry, opts);
+    crate::audit::write_audit_entry(&deps.audit, &entry, opts)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 impl ApprovalRequest {
     /// Rebuild an IPC-able request from the elicitation message the
-    /// sink produced (connection/table scope are in the message body).
+    /// sink produced. The message shape (from the sink):
+    /// "About to run a {label} statement on {conn}[ · {db}].\n\n
+    /// --- SQL ---\n{statement}\n--- end ---\n\nAffected tables: a.b, c.d…"
     pub fn from_message(message: &str) -> crate::approval::ipc::ApprovalRequest {
-        // The message shape (from the gate): "About to run a {category}
-        // statement on {connection}. ... Affected tables: a.b, c.d".
+        // "About to run a {label} statement on {target}."
+        let mut category = String::new();
         let mut connection = String::new();
-        if let Some(idx) = message.find(" statement on ") {
-            let rest = &message[idx + " statement on ".len()..];
-            connection = rest
-                .split(['.', '\n', ' '])
-                .next()
-                .unwrap_or("")
-                .trim_matches(['"', '.'])
-                .to_string();
+        let mut database = None;
+        // Category label sits between "run a " and " statement on".
+        if let Some(run) = message.find("run a ")
+            && let Some(stmt) = message[run..].find(" statement on ")
+        {
+            category = message[run + "run a ".len()..run + stmt].trim().to_string();
+            let target = &message[run + stmt + " statement on ".len()..];
+            // Target ends at the first '.' that terminates it (the
+            // sentence) — take up to newline or ".\n".
+            let line = target.split('\n').next().unwrap_or("");
+            let line = line.trim_end_matches('.');
+            if let Some(dot) = line.find(" · ") {
+                connection = line[..dot].trim_matches('"').to_string();
+                database = Some(line[dot + 3..].trim().trim_matches('"').to_string());
+            } else {
+                connection = line.trim_matches('"').to_string();
+            }
+        }
+        // The SQL sits on the line AFTER the "--- SQL ---" marker.
+        let mut snippet = String::new();
+        if let Some(pos) = message.find("--- SQL ---") {
+            let after = &message[pos + "--- SQL ---".len()..];
+            let mut lines = after.lines();
+            let _ = lines.next(); // the marker's own remainder (empty)
+            for line in lines {
+                let trimmed = line.trim();
+                if trimmed == "--- end ---" {
+                    break;
+                }
+                if !snippet.is_empty() {
+                    snippet.push('\n');
+                }
+                snippet.push_str(line.trim_end());
+            }
         }
         let mut tables = Vec::new();
         if let Some(idx) = message.find("Affected tables: ") {
@@ -699,20 +816,11 @@ impl ApprovalRequest {
         }
         crate::approval::ipc::ApprovalRequest {
             id: uuid::Uuid::new_v4().to_string(),
-            category: message
-                .split_whitespace()
-                .nth(3)
-                .unwrap_or("write")
-                .to_string(),
+            category,
             connection,
-            database: None,
+            database,
             tables,
-            snippet: message
-                .lines()
-                .find_map(|l| l.strip_prefix("--- SQL ---"))
-                .unwrap_or("")
-                .trim()
-                .to_string(),
+            snippet,
         }
     }
 }
@@ -756,6 +864,34 @@ mod tests {
     use crate::policy::model::{PartialPolicy, PolicyPresetName, TableRuleKey, policy_from_preset};
     use crate::vault::touchid::NoTouchId;
     use std::sync::Mutex;
+
+    /// The IPC fallback rebuilds its request from the elicitation
+    /// message; category / connection / database / snippet / tables must
+    /// all come through (review finding: the snippet used to parse as
+    /// empty and the category as "a", so companion approvals showed no
+    /// SQL).
+    #[test]
+    fn approval_request_from_message_round_trip() {
+        let message = "About to run a WRITE statement on prod · staging.\n\n--- SQL ---\nUPDATE users SET email = 'x' WHERE id = 1\n--- end ---\n\nAffected tables: staging.users, other.things\n\nPick an authorization scope.";
+        let r = ApprovalRequest::from_message(message);
+        assert_eq!(r.category, "WRITE");
+        assert_eq!(r.connection, "prod");
+        assert_eq!(r.database.as_deref(), Some("staging"));
+        assert_eq!(r.snippet, "UPDATE users SET email = 'x' WHERE id = 1");
+        assert_eq!(
+            r.tables,
+            vec!["staging.users".to_string(), "other.things".to_string()]
+        );
+
+        // No database scope variant.
+        let message = "About to run a DDL (schema-changing) statement on \"local-dev\".\n\n--- SQL ---\nDROP TABLE x\n--- end ---\n\nAffected tables: (statement scope)\n";
+        let r = ApprovalRequest::from_message(message);
+        assert_eq!(r.category, "DDL (schema-changing)");
+        assert_eq!(r.connection, "local-dev");
+        assert!(r.database.is_none());
+        assert_eq!(r.snippet, "DROP TABLE x");
+        assert!(r.tables.is_empty());
+    }
 
     struct ScriptedSink(Vec<Mutex<Option<ConfirmOutcome>>>);
 
@@ -830,6 +966,40 @@ mod tests {
         let out = run_sql(&d, &args("SELECT id FROM users"), true).unwrap();
         assert_eq!(out.rows.len(), 1);
         assert_eq!(out.category, SqlCategory::Read);
+    }
+
+    /// Review finding: the approval engine must be shared across calls,
+    /// or an "Allow for session" grant dies with the request. The sink
+    /// holds ONE scripted Session outcome; the second call must succeed
+    /// without prompting (an exhausted sink reports unavailable, which
+    /// would fail the run).
+    #[test]
+    fn session_grant_persists_across_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = GateDeps::with_sink_and_approvals(
+            sink_with(ConfirmOutcome::Chosen(GrantChoice::Session)),
+            Arc::new(ApprovalEngine::new()),
+        );
+        d.config = Arc::new(ConfigStore::with_path(dir.path().join("cfg.json")));
+        d.audit = Arc::new(AuditDb::at_path(&dir.path().join("audit.sqlite")).unwrap());
+        d.auth = Arc::new(SessionAuthenticator::new(Box::new(NoTouchId)));
+        sqlite_config(
+            &dir,
+            policy_from_preset(PolicyPresetName::Development),
+            vec![],
+        );
+        bootstrap_table(&d, &dir);
+        let out = run_sql(&d, &args("UPDATE users SET id = 2 WHERE id = 1"), false).unwrap();
+        assert_eq!(out.affected_rows, 1);
+        // Same engine, exhausted sink: the session grant must cover it.
+        let out2 = run_sql(&d, &args("UPDATE users SET id = 1 WHERE id = 2"), false).unwrap();
+        assert_eq!(out2.affected_rows, 1);
+        // A different table set is NOT covered by the grant.
+        let err = run_sql(&d, &args("UPDATE users SET id = 3 WHERE id = 1"), false);
+        // (still covered — same table set; see approval tests for the
+        // exact-set semantics. Here the sink is exhausted, so a miss
+        // would surface as Unavailable.)
+        assert!(err.is_ok(), "{err:?}");
     }
 
     #[test]

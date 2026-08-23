@@ -89,13 +89,23 @@ impl MrtrError {
     }
 }
 
-/// Digest binding the approved operation: connection + statement text +
-/// policy revision. A retry with a different statement (including a
-/// reordered table set) produces a different digest.
-pub fn operation_digest(sql: &str, connection: &str, revision: u64) -> String {
+/// Digest binding the approved operation: connection + EFFECTIVE
+/// DATABASE + statement text + policy revision. Binding the database
+/// (the per-call `database` arg or the connection's default) stops a
+/// once-approved statement from being replayed against a different
+/// database scope on the same connection; a different statement
+/// (including a reordered table set) also produces a different digest.
+pub fn operation_digest(
+    sql: &str,
+    connection: &str,
+    database: Option<&str>,
+    revision: u64,
+) -> String {
     let mut h = sha2::Sha256::new();
-    h.update(b"sequel-mcp/mrtr/v2\n");
+    h.update(b"sequel-mcp/mrtr/v3\n");
     h.update(connection.as_bytes());
+    h.update(b"\n");
+    h.update(database.unwrap_or("").as_bytes());
     h.update(b"\n");
     h.update(sql.as_bytes());
     h.update(b"\n");
@@ -253,7 +263,7 @@ mod tests {
         PendingApproval {
             tool: "execute",
             connection: "c1".into(),
-            operation_digest: operation_digest("DROP TABLE x", "c1", 1),
+            operation_digest: operation_digest("DROP TABLE x", "c1", Some("app"), 1),
             policy_revision: 1,
             approved_ddl_targets: None,
             expires_at,
@@ -265,7 +275,7 @@ mod tests {
             state,
             "execute",
             "c1",
-            &operation_digest("DROP TABLE x", "c1", 1),
+            &operation_digest("DROP TABLE x", "c1", Some("app"), 1),
             1,
         )
     }
@@ -282,7 +292,7 @@ mod tests {
     fn wrong_tool_connection_revision_and_digest_are_typed() {
         let _store = lock();
         let state = issue(pending(Instant::now() + TTL));
-        let digest = operation_digest("DROP TABLE x", "c1", 1);
+        let digest = operation_digest("DROP TABLE x", "c1", Some("app"), 1);
         let err = take(&state, "query", "c1", &digest, 1).unwrap_err();
         assert_eq!(err.code(), "mrtr_invalid_state");
         assert!(err.detail().contains("different tool"));
@@ -296,6 +306,21 @@ mod tests {
         let err = take(&state, "execute", "c1", &digest, 2).unwrap_err();
         assert_eq!(err.code(), "mrtr_policy_changed");
 
+        // Review blocker: replaying the same statement against a
+        // DIFFERENT database scope must fail — the digest binds the
+        // effective database.
+        let state = issue(pending(Instant::now() + TTL));
+        let err = take(
+            &state,
+            "execute",
+            "c1",
+            &operation_digest("DROP TABLE x", "c1", Some("payroll"), 1),
+            1,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "mrtr_invalid_state");
+        assert!(err.detail().contains("operation changed"));
+
         // Same revision, mutated statement (reordered table set included):
         // digest mismatch is invalid_state, and the token is consumed.
         let state = issue(pending(Instant::now() + TTL));
@@ -303,7 +328,7 @@ mod tests {
             &state,
             "execute",
             "c1",
-            &operation_digest("DROP TABLE y", "c1", 1),
+            &operation_digest("DROP TABLE y", "c1", Some("app"), 1),
             1,
         )
         .unwrap_err();

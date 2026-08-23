@@ -1077,6 +1077,68 @@ Docs flipped to match: README (28 tools; add_connection the guided
 MySQL path), CHANGELOG 0.10.0 (Removed → nothing missing), skill
 SKILL.md/policy.md/connections.md restored to add_connection-first.
 
+## Session 19 (checkpoint #17: independent-review blockers fixed)
+
+Four parallel read-only reviews (permission resolution + migration;
+approval replay + IPC; audit/backup + Keychain; SSH/Docker/stdout)
+reported **3 BLOCKERs and 14 SHOULD-FIXes**. This checkpoint fixes all
+three blockers plus the directly-coupled items; the remaining
+SHOULD-FIXes are recorded below as the follow-up batch.
+
+- **BLOCKER 1 — classifier missed expression-context subqueries**
+  (`policy/classifier.rs`): `SELECT (SELECT … FROM denied)`,
+  function-wrapped subqueries, CASE/EXISTS arms, GROUP BY/HAVING/
+  ORDER BY, UPDATE SET values and UPDATE/DELETE WHERE subqueries were
+  never collected as read tables, so table-level read denies were
+  bypassable and secrets could be exfiltrated into allowed tables.
+  Fixed: full expression walking (every sqlparser Expr variant that
+  nests expressions or subqueries, incl. function args/filters,
+  Query-level ORDER BY) and UPDATE/DELETE subqueries collected on a
+  SEPARATE read graph so they authorize as reads while mutation
+  targets stay exact. Two regression tests (7 SELECT-side shapes incl.
+  ANY/ALL; UPDATE SET/WHERE + DELETE WHERE with mutated==jobs and
+  read∋secrets.tokens).
+- **BLOCKER 2 — MRTR digest did not bind the `database` argument**
+  (`mcp/mrtr.rs` + `mcp/tools.rs`): a once-approved statement could be
+  replayed against a different database scope on the same connection.
+  Fixed: `operation_digest` now hashes the effective database
+  (per-call `database` or the connection default) with the domain tag
+  bumped to v3; extended typed test asserts the payroll-scope replay
+  fails `mrtr_invalid_state`.
+- **BLOCKER 3 — audit-write failures silently swallowed**
+  (`app/gate.rs`): a committed mutation could report success with ZERO
+  audit rows. Fixed: `audit()` returns `Result`; on the success path a
+  failed audit write appends a loud `audit-write-failed: …` warning to
+  the tool result (deliberately NOT a hard error — the mutation
+  happened and an error would invite a client retry and double
+  execution), eprintlns to stderr, and the operation journal is NOT
+  transitioned to audit_finalized over a missing row. All nine call
+  sites updated. Same change threads the real `affected_rows` /
+  `duration_ms` / `backup_id` into every audit row (previously
+  hardcoded None despite being in hand — audit↔backup linkage now
+  actually persists).
+- **Coupled — session grants never persisted** (review amplifying
+  note): every tool call built a fresh `ApprovalEngine`, voiding the
+  documented "Allow for session" scope. Fixed:
+  `GateDeps::with_sink_and_approvals` + the server wires its
+  process-shared `ctx.approvals`; new gate test proves a single
+  Session approval covers subsequent calls with an exhausted sink.
+- **Coupled — IPC fallback mis-parsed the elicitation message**
+  (`ApprovalRequest::from_message`): category parsed as "a" and the
+  SQL snippet as empty, so companion (CLI/GUI) approvals never showed
+  the statement. Fixed parser + round-trip unit tests (with and
+  without database scope, DDL label, multi-table list).
+
+Gates: 165 lib tests (+4), 19 lifecycle, clippy `-D warnings` 0, fmt
+clean. Remaining SHOULD-FIX backlog (next batch, all real but
+non-blocking): MySQL autocommit fallback when START TRANSACTION fails
+on backup-required writes; execution-time multi-statement re-check on
+MySQL; restore_backup per-statement policy gate + audit rows; journal
+pre-finalize + link_audit wiring; retention chain-epoch handling;
+lenient-TOFU warning never emitted; relative knownHostsPath;
+restore tunnel revision=1; PartialPolicy bounds validation; v1 config
+backup on update(); pooled-plaintext password lifetime; various NOTEs.
+
 ## Session 5 record — unchanged summary
 
 Pool identity (CredentialGeneration, publish-after-healthy, coalescing,
