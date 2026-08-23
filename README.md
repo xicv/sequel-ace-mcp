@@ -5,7 +5,7 @@
 
 A native-Rust Model Context Protocol server for **MySQL/MariaDB and SQLite** with policy-gated action sets, table-level rules, pre-mutation backups, an append-only audit log, macOS Keychain credential storage, optional Touch ID, and authenticated approval companions (CLI + native GUI). Designed so Claude Code, Codex CLI, or any MCP client can run real SQL safely enough to use every day.
 
-> **0.10.0 is a full native-Rust rewrite** of the former TypeScript implementation (0.9.x). The Node/npm install path is gone; see [Migration from 0.9.x](#migration-from-09x-node). **Not yet published to crates.io** — install from source for now; the `cargo install sequel-mcp` path arrives with the first real publish.
+> **0.10.0 is a full native-Rust rewrite** of the former TypeScript implementation (0.9.x). The Node/npm install path is gone; see [Migration from 0.9.x](#migration-from-09x-node). **Published to crates.io** — `cargo install sequel-mcp --locked` works today.
 
 > **Sequel Ace is OPTIONAL.** This is a fully standalone MCP. Sequel Ace integration is a *bootstrap convenience* (one-time import of saved MySQL/MariaDB favorites) and a *history augment*. Without Sequel Ace, everything else works — only `import_from_sequel_ace` and `sequel_ace_history` report "not found".
 
@@ -31,7 +31,15 @@ Current release: **v0.10.0**. Full history: [CHANGELOG.md](./CHANGELOG.md).
 - macOS 12+ (Apple Silicon or Intel) for Keychain + Touch ID. Linux builds compile (CI check), but Keychain/Touch ID degrade to explicit errors — fail-closed, no plaintext fallback.
 - Rust toolchain matching [`rust-toolchain.toml`](./rust-toolchain.toml) (1.97.1) — `rustup` picks it up automatically.
 
-### From source (current path)
+### From crates.io (primary)
+
+```bash
+cargo install sequel-mcp --locked
+```
+
+That builds and installs the `sequel-mcp` binary into `~/.cargo/bin` (make sure it's on your `PATH`). To update: re-run the same command after a new release.
+
+### From source (developer path)
 
 ```bash
 git clone https://github.com/xicv/sequel-mcp.git
@@ -39,15 +47,7 @@ cd sequel-mcp
 cargo install --path . --locked
 ```
 
-That builds and installs the `sequel-mcp` binary into `~/.cargo/bin` (make sure it's on your `PATH`). To update an existing install: `git pull && cargo install --path . --locked`, then restart your MCP client session.
-
-### After the crates.io publish (future)
-
-```bash
-cargo install sequel-mcp --locked
-```
-
-This path does not work yet — 0.10.0 has not been published. It is verified publishable (`cargo publish --dry-run` is green); the real publish happens per the release checklist in [CONTRIBUTING.md](./CONTRIBUTING.md).
+Use this to track `main` or hack on the server locally.
 
 ## Wire into an MCP client
 

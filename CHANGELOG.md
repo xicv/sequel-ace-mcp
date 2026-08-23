@@ -2,11 +2,18 @@
 
 All notable changes to **sequel-mcp** are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] — 2026-08-23
+
+### Fixed (documentation only — no runtime change)
+
+- README and this changelog previously stated the crate was "not yet published to crates.io"; 0.10.0 went live on 2026-08-23. The registry install (`cargo install sequel-mcp --locked`) is now documented as the primary path and source installs as the developer path.
+- Removed the unused `scripts/touchid-helper.swift` (Touch ID is native Rust `LocalAuthentication` in 0.10.0; the legacy Swift helper was referenced by no build or runtime path).
+
 ## [0.10.0] — 2026-08-23
 
 ### Changed
 
-- **Full native-Rust rewrite.** The TypeScript/Node implementation is replaced by a single static `sequel-mcp` binary (Rust 2024, toolchain pinned in `rust-toolchain.toml`). The npm/`node dist/index.js` install path is gone: `cargo install --path . --locked` now. Not yet published to crates.io — the registry path arrives with the first real publish (verified publishable via `cargo publish --dry-run`).
+- **Full native-Rust rewrite.** The TypeScript/Node implementation is replaced by a single static `sequel-mcp` binary (Rust 2024, toolchain pinned in `rust-toolchain.toml`). The npm/`node dist/index.js` install path is gone. **Published to crates.io on 2026-08-23** — `cargo install sequel-mcp --locked` is the primary install path.
 - **MCP surface**: 28 tools + 2 prompts (`setup-connection`, `analyze-table`) + the `sequel-mcp://connections` no-secrets resource, on rmcp 3.1.4 over stdio with a 1 MiB streaming line limit and bounded request state. `add_connection` elicits the password over a live server-initiated prompt (zeroized in memory, stored straight to Keychain, never in arguments/logs).
 - **Two-layer permissions, now table-granular**: connection baseline plus exact (`db.table`) / wildcard (`db.*`) table rules — exact beats wildcard, strictest-wins across every table a statement touches, fail-closed. Rules that elevate a denied baseline still require per-statement confirmation. New tools: `set_table_policy`, `clear_table_policy`, `list_table_policies`, `explain_policy` (dry classification + resolution preview). Legacy per-database overrides migrate to `db.*` wildcards in place (v1→v2 config migration).
 - **Approvals, three fail-closed channels**: MCP elicitation first; when the client cannot elicit, an authenticated same-uid approval IPC (Unix socket, credential-checked before any protocol byte, single-use id-bound replies, 60 s deadline) answered by `sequel-mcp approve` (CLI) or `sequel-mcp gui` (native egui companion window); modern clients use server-side opaque `requestState` (MRTR) handles bound to the operation digest. Nothing is ever auto-approved; unavailable prompts audit as errors, never as declines.

@@ -1,6 +1,6 @@
 [package]
 name = "sequel-mcp"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Local-first, policy-gated MySQL/MariaDB and SQLite access for AI agents: native Rust MCP server, CLI and GUI"
