@@ -11,6 +11,15 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+// The legacy TypeScript build to compare against is supplied by the
+// operator (its location is machine-specific); nothing home-grown is
+// baked into the script.
+const LEGACY_BIN = process.env.SEQUEL_MCP_LEGACY_BIN;
+if (!LEGACY_BIN) {
+  console.error("bench-node: set SEQUEL_MCP_LEGACY_BIN to the legacy build entry (dist/index.js) to run the differential benchmark");
+  process.exit(2);
+}
+
 const N = parseInt(process.argv[2] || "30", 10);
 const dir = mkdtempSync(join(tmpdir(), "bench-node-"));
 mkdirSync(join(dir, "cfg", "sequel-mcp"), { recursive: true });
@@ -41,7 +50,7 @@ const tools = [];
 
 const once = () => new Promise((resolve, reject) => {
   const t0 = performance.now();
-  const child = spawn("node", ["/Users/xicao/Projects/sequel-mcp-legacy/dist/index.js"], { env, stdio: ["pipe", "pipe", "ignore"] });
+  const child = spawn("node", [LEGACY_BIN], { env, stdio: ["pipe", "pipe", "ignore"] });
   let buf = "";
   const timer = setTimeout(() => { child.kill(); reject(new Error("timeout")); }, 30000);
   child.on("error", (e) => { clearTimeout(timer); reject(e); });
