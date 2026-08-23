@@ -9,17 +9,23 @@
 # The real user config (production connections), the real audit DB, and
 # the real Keychain are unreachable from benchmarks.
 #
-# RESULTS STATUS: development/debug-profile, same-machine directional
-# comparison only. Release/LTO numbers with identical methodology are
-# required before any packaging-gate performance claim.
+# RESULTS STATUS: default runs are development/debug-profile directional
+# numbers. Run with PROFILE=release for the packaging-grade release/LTO
+# numbers (same machine, same methodology); Session 12 of
+# docs/rust-rewrite/VERIFICATION.md records both.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 # shellcheck source=scripts/lib/isolated-test-env.sh
 source scripts/lib/isolated-test-env.sh
 
-cargo build 2>/dev/null
-
-BIN=target/debug/sequel-mcp
+PROFILE="${PROFILE:-debug}"
+if [ "$PROFILE" = "release" ]; then
+  cargo build --release 2>/dev/null
+  BIN=target/release/sequel-mcp
+else
+  cargo build 2>/dev/null
+  BIN=target/debug/sequel-mcp
+fi
 N="${1:-30}"   # warm-path iterations
 
 iso_init
@@ -178,8 +184,12 @@ EOF
 echo "=== MCP process benchmarks (n=$N, isolated config)"
 run_bench
 echo "=== Environment"
-echo "PROFILE=debug"
-echo "BENCH_CLASS=development/directional (debug profile, same machine; not a release performance claim)"
+echo "PROFILE=$PROFILE"
+if [ "$PROFILE" = "release" ]; then
+  echo "BENCH_CLASS=release/LTO (packaging-grade; same machine, same methodology as the debug directional runs)"
+else
+  echo "BENCH_CLASS=development/directional (debug profile, same machine; not a release performance claim)"
+fi
 echo "ISOLATION=fail-closed (ISO_ROOT printed above; env-map spawns; TEST_MODE active)"
 echo "AUDIT_MODE=SQLite WAL + synchronous=NORMAL (AUDIT_WRITE measures API+transaction completion, not durable fsync)"
 echo "MAC=$(sysctl -n hw.model 2>/dev/null || echo unknown)"
