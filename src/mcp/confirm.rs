@@ -13,6 +13,15 @@ pub struct ChoiceForm {
 
 rmcp::elicit_safe!(ChoiceForm);
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct PasswordForm {
+    /// The MySQL/MariaDB password. Stored locally in the macOS Keychain;
+    /// never in tool arguments, logs, or the audit DB.
+    password: String,
+}
+
+rmcp::elicit_safe!(PasswordForm);
+
 /// A sink whose `confirm` blocks on a channel that the async side answers
 /// via elicitation. Built per request.
 pub struct ElicitationSink {
@@ -89,6 +98,28 @@ impl crate::app::gate::ApprovalSink for ElicitationSink {
                 reason: "approval channel dropped".into(),
             },
         }
+    }
+}
+
+/// Drive one password-capture elicitation round trip for
+/// `add_connection`. Accept-with-nonempty-string ⇒ `Ok(password)`
+/// (zeroized on drop); decline/cancel/unavailable ⇒ `Err(reason)` — the
+/// caller must NOT save the connection in that case.
+pub async fn run_password_elicitation(
+    peer: &rmcp::service::Peer<rmcp::RoleServer>,
+    message: String,
+) -> Result<zeroize::Zeroizing<String>, String> {
+    match peer.elicit::<PasswordForm>(message).await {
+        Ok(Some(form)) if !form.password.is_empty() => Ok(zeroize::Zeroizing::new(form.password)),
+        Ok(Some(_)) => Err("the client accepted but returned an empty password".into()),
+        Ok(None) => Err("the client accepted but returned no password content".into()),
+        Err(rmcp::service::ElicitationError::UserDeclined) => {
+            Err("password capture declined".into())
+        }
+        Err(rmcp::service::ElicitationError::UserCancelled) => {
+            Err("password capture cancelled".into())
+        }
+        Err(e) => Err(format!("elicitation unavailable: {e}")),
     }
 }
 

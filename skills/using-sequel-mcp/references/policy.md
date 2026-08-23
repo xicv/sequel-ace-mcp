@@ -33,7 +33,7 @@ same-user IPC, 60 s deadline) and only then fails closed — audited as `outcome
 
 ## Presets
 
-`sequel-mcp:add_sqlite_connection` (and `import_from_sequel_ace`) accept `policyPreset` ∈ `{ read-only, dev, admin }` (`development` / `administration` are accepted long forms).
+`sequel-mcp:add_connection` and `sequel-mcp:add_sqlite_connection` accept `policy_preset` ∈ `{ read-only, dev, admin }` (`development` / `administration` are accepted long forms).
 
 | Preset | read | write | ddl | admin | txCtrl | rowCap | stmtTimeoutMs | requireTouchID |
 |--------|------|-------|-----|-------|--------|--------|---------------|----------------|

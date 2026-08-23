@@ -63,6 +63,46 @@ pub struct AddSqliteParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AddConnectionParams {
+    pub name: String,
+    pub host: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    pub user: String,
+    #[serde(default)]
+    pub database: Option<String>,
+    #[serde(default)]
+    pub ssl: Option<bool>,
+    #[serde(default)]
+    pub policy_preset: Option<String>,
+    #[serde(default)]
+    pub ssh_host: Option<String>,
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+    #[serde(default)]
+    pub ssh_user: Option<String>,
+    #[serde(default)]
+    pub ssh_key_path: Option<String>,
+    /// Docker container name (validated `^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`).
+    #[serde(default)]
+    pub ssh_docker_container: Option<String>,
+    /// `nc` (default), `ncat`, or `socat`.
+    #[serde(default)]
+    pub ssh_docker_bridge_tool: Option<String>,
+    /// `lenient` (default) or `strict`.
+    #[serde(default)]
+    pub ssh_host_key_policy: Option<String>,
+    #[serde(default)]
+    pub ssh_known_hosts_path: Option<String>,
+    #[serde(default)]
+    pub ssl_server_name: Option<String>,
+    /// PEM/DER file of a private CA the server certificate is verified
+    /// against (merged with the system roots).
+    #[serde(default)]
+    pub ssl_ca_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RemoveParams {
     pub name: String,
 }
@@ -324,6 +364,20 @@ impl SequelServer {
             "defaultConnection": cfg.default_connection,
             "connections": items,
         }))
+    }
+
+    #[tool(
+        name = "add_connection",
+        title = "Add or update a MySQL/MariaDB connection",
+        description = "Persist a MySQL/MariaDB connection. The password is captured via elicitation and stored in the macOS Keychain; it never appears in tool arguments or logs.",
+        annotations(idempotent_hint = true, open_world_hint = false)
+    )]
+    fn add_connection(&self, _p: Parameters<AddConnectionParams>) -> CallToolResult {
+        // Hand-routed in call_tool: password capture needs the session
+        // peer for the elicitation round trip.
+        error_tool_result(
+            "add_connection is hand-routed for password elicitation; connect through the full tool call path",
+        )
     }
 
     #[tool(
@@ -1535,6 +1589,165 @@ impl SequelServer {
 }
 
 impl SequelServer {
+    /// add_connection: validates arguments, elicits the password through
+    /// the session peer (never via tool args), stores it in the secret
+    /// store (macOS Keychain; the in-memory store under test mode), and
+    /// upserts the connection. Any decline/cancel/unavailable prompt
+    /// leaves config AND secrets untouched.
+    async fn call_add_connection(
+        &self,
+        p: AddConnectionParams,
+        peer: rmcp::service::Peer<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        use crate::config::{BridgeTool, MySqlConnection, SshDocker, SshHostKeyPolicy, SshTunnel};
+
+        let preset = match parse_preset(&p.policy_preset) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(CallToolResponse::Complete(error_tool_result(e)));
+            }
+        };
+        if p.name.trim().is_empty() {
+            return Ok(CallToolResponse::Complete(error_tool_result(
+                "connection name must not be empty",
+            )));
+        }
+        if p.host.trim().is_empty() {
+            return Ok(CallToolResponse::Complete(error_tool_result(
+                "host must not be empty",
+            )));
+        }
+        if p.user.trim().is_empty() {
+            return Ok(CallToolResponse::Complete(error_tool_result(
+                "user must not be empty",
+            )));
+        }
+
+        let bridge_tool = match p.ssh_docker_bridge_tool.as_deref() {
+            None => BridgeTool::Nc,
+            Some("nc") => BridgeTool::Nc,
+            Some("ncat") => BridgeTool::Ncat,
+            Some("socat") => BridgeTool::Socat,
+            Some(other) => {
+                return Ok(CallToolResponse::Complete(error_tool_result(format!(
+                    "unknown bridge tool {other:?} (nc | ncat | socat)"
+                ))));
+            }
+        };
+        let host_key_policy = match p.ssh_host_key_policy.as_deref() {
+            None => None,
+            Some("lenient") => Some(SshHostKeyPolicy::Lenient),
+            Some("strict") => Some(SshHostKeyPolicy::Strict),
+            Some(other) => {
+                return Ok(CallToolResponse::Complete(error_tool_result(format!(
+                    "unknown host key policy {other:?} (lenient | strict)"
+                ))));
+            }
+        };
+
+        let ssh = match (p.ssh_host.as_deref(), p.ssh_user.as_deref()) {
+            (Some(host), Some(user)) if !host.trim().is_empty() && !user.trim().is_empty() => {
+                Some(SshTunnel {
+                    host: host.trim().to_string(),
+                    port: p.ssh_port.unwrap_or(22),
+                    user: user.trim().to_string(),
+                    auth_method: if p.ssh_key_path.is_some() {
+                        crate::config::SshAuthMethod::Key
+                    } else {
+                        crate::config::SshAuthMethod::Password
+                    },
+                    private_key_path: p.ssh_key_path.clone(),
+                    docker: p
+                        .ssh_docker_container
+                        .as_deref()
+                        .map(|container| SshDocker {
+                            container: container.to_string(),
+                            bridge_tool,
+                        }),
+                    host_key_policy,
+                    host_key_policy_migrated: false,
+                    known_hosts_path: p.ssh_known_hosts_path.clone(),
+                })
+            }
+            (None, None) => None,
+            _ => {
+                return Ok(CallToolResponse::Complete(error_tool_result(
+                    "ssh tunnel requires both ssh_host and ssh_user",
+                )));
+            }
+        };
+
+        let port = p.port.unwrap_or(3306);
+        let mut mc = MySqlConnection {
+            name: p.name.clone(),
+            host: p.host.trim().to_string(),
+            port,
+            user: p.user.trim().to_string(),
+            database: p.database.clone(),
+            ssl: p.ssl.unwrap_or(false),
+            ssl_server_name: p.ssl_server_name.clone(),
+            ssl_ca_path: p.ssl_ca_path.clone(),
+            ssh,
+            ..MySqlConnection::default()
+        };
+        mc.policy = crate::policy::model::policy_from_preset(preset);
+        let conn = Connection::Mysql(mc);
+        if let Err(e) = conn.validate() {
+            return Ok(CallToolResponse::Complete(error_tool_result(format!(
+                "{e}"
+            ))));
+        }
+
+        // Elicit the password LAST, after every argument check, so a
+        // prompt only ever appears for a connection that would save.
+        let message = format!(
+            "Enter MySQL/MariaDB password for {}@{}:{} (connection \"{}\"). Stored locally in the macOS Keychain; never in tool arguments or logs.",
+            p.user.trim(),
+            p.host.trim(),
+            port,
+            p.name
+        );
+        let password = match super::confirm::run_password_elicitation(&peer, message).await {
+            Ok(pw) => pw,
+            Err(reason) => {
+                return Ok(CallToolResponse::Complete(error_tool_result(format!(
+                    "Password capture cancelled. Connection not saved. ({reason})"
+                ))));
+            }
+        };
+
+        let cfg = self
+            .ctx
+            .config
+            .load()
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        let (name, user, preset_name) = (
+            p.name.clone(),
+            p.user.trim().to_string(),
+            preset.as_str().to_string(),
+        );
+        match self.ctx.config.update(cfg.revision, move |c| {
+            upsert(c, conn);
+            Ok(())
+        }) {
+            Ok(()) => {
+                if let Err(e) = self.ctx.secrets.set_password(&name, &user, &password) {
+                    // The connection saved but the secret did not: say so
+                    // plainly rather than pretending all is well.
+                    return Ok(CallToolResponse::Complete(error_tool_result(format!(
+                        "Saved connection \"{name}\", but storing the password failed: {e}. Re-add the connection or store the password manually."
+                    ))));
+                }
+                Ok(CallToolResponse::Complete(text_tool_result(format!(
+                    "Saved connection \"{name}\" with policy preset \"{preset_name}\". Password stored in the secret store (macOS Keychain)."
+                ))))
+            }
+            Err(e) => Ok(CallToolResponse::Complete(error_tool_result(format!(
+                "{e}"
+            )))),
+        }
+    }
+
     /// restore_backup: dry-run returns the plan; execution is
     /// confirmation-gated (MRTR in the modern era, elicitation in the
     /// legacy era) and replays the plan on ONE connection inside ONE
@@ -2161,6 +2374,16 @@ Use only read-only tools: describe_table, list_databases, and query (SELECT/SHOW
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         let name = request.name.as_ref();
+        if name == "add_connection" {
+            let arg_value =
+                serde_json::Value::Object(request.arguments.clone().unwrap_or_default());
+            let Ok(p) = serde_json::from_value::<AddConnectionParams>(arg_value) else {
+                return Ok(CallToolResponse::Complete(error_tool_result(
+                    "invalid arguments for add_connection",
+                )));
+            };
+            return self.call_add_connection(p, context.peer.clone()).await;
+        }
         if name == "restore_backup" {
             let arg_value =
                 serde_json::Value::Object(request.arguments.clone().unwrap_or_default());

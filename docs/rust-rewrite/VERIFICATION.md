@@ -1033,6 +1033,50 @@ strings; fixing them requires a source commit). Documented truthfully
 in README/CHANGELOG/skills; flagged to the reviewer as the top
 follow-up parity item before un-drafting.
 
+## Session 18 (checkpoint #16: `add_connection` restored — parity complete)
+
+The one outstanding parity gap from Session 17 is closed with a
+source commit (the 28th tool):
+
+- **`add_connection`** (hand-routed in `call_tool` like
+  `restore_backup`, because password capture needs the session peer):
+  validates every argument FIRST (name/host/user non-empty, preset,
+  bridge tool, host-key policy, container-name regex via the existing
+  `Connection::validate`), then elicits the password through a LIVE
+  server-initiated `elicitation/create` round trip — arguments never
+  carry the password — and only then upserts the config and stores the
+  secret. The elicited password lives in a `Zeroizing` buffer; decline,
+  dismiss, empty content, or a client without elicitation support all
+  fail closed with "Password capture cancelled. Connection not saved."
+  — config AND secrets untouched. Argument surface matches the legacy
+  tool (name/host/port/user/database/ssl/policy_preset + ssh_host/
+  ssh_port/ssh_user/ssh_key_path/ssh_docker_container/
+  ssh_docker_bridge_tool/ssh_host_key_policy/ssh_known_hosts_path +
+  ssl_server_name, plus the Rust-era ssl_ca_path); SSH builds only
+  when host+user are both present; key-path presence selects key vs
+  password auth — all faithful to the legacy semantics. A secret-store
+  failure after a successful save is reported honestly instead of
+  pretending all is well.
+- **PasswordForm** (`confirm.rs`): the elicitation form type +
+  `run_password_elicitation` mapping accept-with-nonempty-string to
+  `Ok(Zeroizing<String>)` and everything else to typed reasons.
+
+**Verified automatically**: three new lifecycle tests against the real
+binary — full round trip (live elicitation answered with accept; saved
+message; `list_connections` shows driver mysql, `hasStoredPassword:
+true` under the test-mode in-memory store, read-only preset applied;
+`sequel-mcp://connections` echoes the SSH bastion + docker container),
+declined prompt leaves the config untouched, and a client without
+elicitation support gets the typed fail-closed error with nothing
+saved. Tool-count assertions across the suite updated 27 → 28
+(seven sites). Full suites: 161 lib + 19 lifecycle green, clippy
+`-D warnings` 0, fmt clean. The `setup-connection` prompt text and the
+`gate.rs` "Run add_connection …" hint are accurate again as-is.
+
+Docs flipped to match: README (28 tools; add_connection the guided
+MySQL path), CHANGELOG 0.10.0 (Removed → nothing missing), skill
+SKILL.md/policy.md/connections.md restored to add_connection-first.
+
 ## Session 5 record — unchanged summary
 
 Pool identity (CredentialGeneration, publish-after-healthy, coalescing,

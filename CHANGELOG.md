@@ -7,7 +7,7 @@ All notable changes to **sequel-mcp** are documented here. Format follows [Keep 
 ### Changed
 
 - **Full native-Rust rewrite.** The TypeScript/Node implementation is replaced by a single static `sequel-mcp` binary (Rust 2024, toolchain pinned in `rust-toolchain.toml`). The npm/`node dist/index.js` install path is gone: `cargo install --path . --locked` now. Not yet published to crates.io — the registry path arrives with the first real publish (verified publishable via `cargo publish --dry-run`).
-- **MCP surface**: 27 tools + 2 prompts (`setup-connection`, `analyze-table`) + the `sequel-mcp://connections` no-secrets resource, on rmcp 3.1.4 over stdio with a 1 MiB streaming line limit and bounded request state.
+- **MCP surface**: 28 tools + 2 prompts (`setup-connection`, `analyze-table`) + the `sequel-mcp://connections` no-secrets resource, on rmcp 3.1.4 over stdio with a 1 MiB streaming line limit and bounded request state. `add_connection` elicits the password over a live server-initiated prompt (zeroized in memory, stored straight to Keychain, never in arguments/logs).
 - **Two-layer permissions, now table-granular**: connection baseline plus exact (`db.table`) / wildcard (`db.*`) table rules — exact beats wildcard, strictest-wins across every table a statement touches, fail-closed. Rules that elevate a denied baseline still require per-statement confirmation. New tools: `set_table_policy`, `clear_table_policy`, `list_table_policies`, `explain_policy` (dry classification + resolution preview). Legacy per-database overrides migrate to `db.*` wildcards in place (v1→v2 config migration).
 - **Approvals, three fail-closed channels**: MCP elicitation first; when the client cannot elicit, an authenticated same-uid approval IPC (Unix socket, credential-checked before any protocol byte, single-use id-bound replies, 60 s deadline) answered by `sequel-mcp approve` (CLI) or `sequel-mcp gui` (native egui companion window); modern clients use server-side opaque `requestState` (MRTR) handles bound to the operation digest. Nothing is ever auto-approved; unavailable prompts audit as errors, never as declines.
 - **Transports**: direct TCP (TLS with private-CA support via `sslCaPath`, TLS hostname preservation via `sslServerName`), SSH tunnels (russh; strict/lenient host-key policy with `@revoked` always enforced; tunnel-lease generation pool keys; keepalives), and SSH + `docker exec` stdio bridge (`nc`/`ncat`/`socat`) for closed containers — works under `AllowTcpForwarding no`.
@@ -17,12 +17,12 @@ All notable changes to **sequel-mcp** are documented here. Format follows [Keep 
 
 ### Removed
 
-- **`add_connection` (interactive MySQL/MariaDB add via elicited password) is not yet re-implemented.** MySQL/MariaDB connections are added via `import_from_sequel_ace` or the documented manual config + Keychain steps (see README). This is the top follow-up parity item.
+- Nothing relative to the 0.9.x tool surface: `add_connection` (elicited password → Keychain, SSH/Docker fields in one call) ships in 0.10.0 alongside everything else.
 
 ### Notes
 
 - Keychain service names are unchanged (`sequel-mcp : <name>`, `<name>::ssh`) — stored 0.9.x passwords keep working.
-- Verification history for the rewrite: `docs/rust-rewrite/VERIFICATION.md` (16 sessions, checkpoint-by-checkpoint).
+- Verification history for the rewrite: `docs/rust-rewrite/VERIFICATION.md` (18 sessions, checkpoint-by-checkpoint).
 
 ## [0.9.3] — 2026-08-10
 
