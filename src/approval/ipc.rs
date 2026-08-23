@@ -202,7 +202,6 @@ fn peer_is_same_uid<Fd: std::os::unix::io::AsRawFd>(stream: &Fd) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::io::AsRawFd;
         let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
         let rc = unsafe {
