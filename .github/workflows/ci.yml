@@ -11,53 +11,56 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: test (node ${{ matrix.node }} on ${{ matrix.os }})
+  rust:
+    name: rust (${{ matrix.job }} on ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-24.04]
-        node: ['20', '22']
-        exclude:
-          # @napi-rs/keyring on Linux requires libsecret + a running D-Bus session.
-          # We test Keychain only on macOS; Linux runs everything except the
-          # keyring-touching code by mocking via InMemorySecretStore in tests.
+        include:
+          # Full gate set on macOS — the platform every step of this
+          # workflow was verified on locally (scripts/ci-local.sh):
+          # fmt, clippy -D warnings, workspace tests.
+          - os: macos-14
+            job: test
+          # Cross-platform compile proof only: the crate has macOS-only
+          # dependencies (Keychain, Touch ID), so Linux asserts that the
+          # tree at least checks cleanly there.
           - os: ubuntu-24.04
-            node: '20'
+            job: check
+    env:
+      CARGO_TERM_COLOR: always
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Rust toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master, 2026-08-23
         with:
-          fetch-depth: 0
+          components: clippy, rustfmt
 
-      - name: Setup Node ${{ matrix.node }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ matrix.node }}
-          cache: npm
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
-      - name: Install
-        run: npm ci
+      - name: Format
+        run: cargo fmt --all -- --check
 
-      - name: Typecheck
-        run: npm run typecheck
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Lint
-        run: npm run lint
+      - name: Check (all targets)
+        run: cargo check --workspace --all-targets --locked
 
       - name: Test
-        run: npm test
-
-      - name: Build
-        run: npm run build
+        if: matrix.job == 'test'
+        run: cargo test --workspace --locked
 
   secret-scan:
     name: secret scan
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout (full history)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -65,7 +68,7 @@ jobs:
         run: bash scripts/check-secrets.sh
 
       - name: Run gitleaks (history scan)
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:

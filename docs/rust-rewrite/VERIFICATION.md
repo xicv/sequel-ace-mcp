@@ -854,6 +854,44 @@ whitespace clean (the Rust tree is untouched this checkpoint; the
 package/publish gates above ran against the committed #9 tree and a
 scripts-only change does not invalidate them).
 
+## Session 13 (checkpoint #11: final local CI + workflow safety)
+
+Two closes out the pre-push sequence:
+
+- **Final clean-tree local CI**: the complete `scripts/ci-local.sh`
+  gate suite on the committed #10 tree — cargo check / workspace
+  tests (161 lib + 16 lifecycle + all groups) / clippy `-D warnings` 0 /
+  fmt / doc / `cargo package --locked` (86 files) / `cargo publish
+  --dry-run` (nothing published) / gitleaks clean / whitespace clean —
+  **ALL LOCAL CHECKS PASSED** with the package gates now genuinely
+  executing against a committed tree.
+- **Workflow safety (static analysis + rewrite)**:
+  - Exactly ONE workflow file exists (`.github/workflows/ci.yml`).
+    No publish/release/deploy/schedule workflows anywhere in `.github`.
+  - **Pushing `rewrite/rust-native` triggers NOTHING**: the push
+    trigger is filtered to `branches: [main]`; `workflow_dispatch` is
+    manual-only. The branch can be pushed with zero side effects.
+  - Opening the PR to main triggers the CI jobs — but the inherited
+    npm-era workflow would fail immediately (`npm ci`; package.json
+    was removed by the rewrite). Replaced with the Rust gate set:
+    fmt + clippy `-D warnings` + `cargo check --workspace --all-targets
+    --locked` on BOTH macOS and Ubuntu, `cargo test --workspace
+    --locked` on macOS only (the platform every gate was verified on;
+    the crate has macOS-only dependencies — Keychain, Touch ID — so
+    Ubuntu is compile-proof only).
+  - **Supply-chain pinning**: every action pinned to a commit SHA
+    resolved 2026-08-23 via `gh api` with tag comments —
+    actions/checkout `11d5960a…` (v4), dtolnay/rust-toolchain
+    `6c977a6c…` (master), Swatinem/rust-cache `6323deb1…` (v2),
+    gitleaks-action `ff98106e…` (v2).
+  - Permissions: `contents: read` only; the sole secret touched is the
+    read-only `GITHUB_TOKEN` for the gitleaks history scan.
+  - YAML validated (`yaml.safe_load`); job/matrix shape verified.
+    Honest limit: runner behavior is NOT claimed pre-verified — the
+    commands mirror the locally-green gate set, but the macOS runner
+    is not this Mac and the Ubuntu check job executes for the first
+    time on the PR.
+
 ## Session 5 record — unchanged summary
 
 Pool identity (CredentialGeneration, publish-after-healthy, coalescing,
