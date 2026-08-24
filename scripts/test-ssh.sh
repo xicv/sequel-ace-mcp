@@ -62,10 +62,15 @@ ssh-keygen -q -t ed25519 -N "" -f "$KEY_DIR/id_ed25519" -C "sqm-ssh-test"
 ssh-keygen -q -t ed25519 -N "$SSH_PASSWORD" -f "$KEY_DIR/id_enc" -C "sqm-ssh-enc"
 # ECDSA key (unencrypted).
 ssh-keygen -q -t ecdsa -N "" -f "$KEY_DIR/id_ecdsa" -C "sqm-ssh-ecdsa"
+# RSA-4096 (unencrypted): the real-world bastion key shape. Guards the
+# russh "rsa" feature — a build without it loads the key and even gets
+# USERAUTH_PK_OK, then fails to SIGN, which surfaced as a misleading
+# "authentication failed" (0.10.2 incident).
+ssh-keygen -q -t rsa -b 4096 -N "" -f "$KEY_DIR/id_rsa" -C "sqm-ssh-rsa"
 # Decoy keypair: its public half masquerades as the "known" host key in
 # the mismatch fixture.
 ssh-keygen -q -t ed25519 -N "" -f "$KEY_DIR/decoy" -C "sqm-decoy"
-PUB_KEY="$(cat "$KEY_DIR/id_ed25519.pub" "$KEY_DIR/id_enc.pub" "$KEY_DIR/id_ecdsa.pub")"
+PUB_KEY="$(cat "$KEY_DIR/id_ed25519.pub" "$KEY_DIR/id_enc.pub" "$KEY_DIR/id_ecdsa.pub" "$KEY_DIR/id_rsa.pub")"
 
 # --- Topology -----------------------------------------------------------
 # Private network; the database attached WITHOUT any published port
@@ -331,6 +336,7 @@ export SEQUEL_MCP_TEST_SSH_KNOWN_MISSING="$MISSING_KNOWN"
 export SEQUEL_MCP_TEST_SSH_KEY="$KEY_DIR/id_ed25519"
 export SEQUEL_MCP_TEST_SSH_KEY_ENC="$KEY_DIR/id_enc"
 export SEQUEL_MCP_TEST_SSH_KEY_ECDSA="$KEY_DIR/id_ecdsa"
+export SEQUEL_MCP_TEST_SSH_KEY_RSA="$KEY_DIR/id_rsa"
 export SEQUEL_MCP_TEST_SSH_MYSQL_CREDS="root:$DB_PASSWORD"
 # Rotation + half-open fixtures.
 SSH_PASSWORD2="$(head -c 18 /dev/urandom | base64 | tr -d '=+/' | head -c 20)"
@@ -422,6 +428,24 @@ docker exec "$SSHD_CONTAINER" pkill -HUP sshd || true
 sleep 1
 unset SEQUEL_MCP_TEST_SSH_BRIDGE SEQUEL_MCP_TEST_SSH_BRIDGE_CONTAINER
 fi
+
+# ---- Phase G: RSA hash-negotiation pin — restrict the bastion to
+# `PubkeyAcceptedAlgorithms rsa-sha2-256` and authenticate with the RSA
+# key again. The client must negotiate AND sign with SHA-256; the
+# incident's essence was signing without the negotiated hash. If the
+# negotiated hash ever stops reaching the signature, sshd rejects it
+# here and the test fails. Runs in every variant (engine-agnostic).
+docker exec "$SSHD_CONTAINER" sh -c \
+  'printf "PubkeyAcceptedAlgorithms rsa-sha2-256\n" >> /etc/ssh/sshd_config'
+docker exec "$SSHD_CONTAINER" pkill -HUP sshd || true
+sleep 1
+echo "==> pin phase: $(docker exec "$SSHD_CONTAINER" grep -i '^PubkeyAcceptedAlgorithms' /etc/ssh/sshd_config)"
+export SEQUEL_MCP_TEST_SSH_RSA_PIN="sha2-256"
+cargo test --test mysql_ssh ssh_rsa_sha2_256 -- --test-threads=1
+unset SEQUEL_MCP_TEST_SSH_RSA_PIN
+docker exec "$SSHD_CONTAINER" sed -i '/^PubkeyAcceptedAlgorithms rsa-sha2-256$/d' /etc/ssh/sshd_config
+docker exec "$SSHD_CONTAINER" pkill -HUP sshd || true
+sleep 1
 
 # ---- Optional bench phase (SSH cold/warm) ----
 if [ "${SEQUEL_MCP_TEST_SSH_BENCH:-0}" = "1" ]; then

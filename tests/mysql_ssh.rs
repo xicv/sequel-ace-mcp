@@ -27,6 +27,7 @@ struct Fixture {
     known_unknown: PathBuf,
     key_encrypted: Option<PathBuf>,
     key_ecdsa: Option<PathBuf>,
+    key_rsa: Option<PathBuf>,
     ssh_password_rotated: Option<String>,
     known_revoked: PathBuf,
     known_malformed: PathBuf,
@@ -37,6 +38,15 @@ struct Fixture {
 }
 
 fn fixture() -> Option<Fixture> {
+    // Honor RUST_LOG (e.g. russh=debug) for the live matrix: the
+    // wire-level trace is what cracked the 0.10.2 RSA diagnosis
+    // (USERAUTH_PK_OK followed by a local signature failure). stderr,
+    // so nothing can pollute a protocol stream. try_init: only the
+    // first test installs it; empty RUST_LOG filters to errors only.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
     let bastion = std::env::var("SEQUEL_MCP_TEST_SSH_BASTION").ok()?;
     let mut parts = bastion.splitn(4, ':');
     let bastion_host = parts.next()?.to_string();
@@ -59,6 +69,9 @@ fn fixture() -> Option<Fixture> {
             .ok()
             .map(PathBuf::from),
         key_ecdsa: std::env::var("SEQUEL_MCP_TEST_SSH_KEY_ECDSA")
+            .ok()
+            .map(PathBuf::from),
+        key_rsa: std::env::var("SEQUEL_MCP_TEST_SSH_KEY_RSA")
             .ok()
             .map(PathBuf::from),
         ssh_password_rotated: std::env::var("SEQUEL_MCP_TEST_SSH_PASSWORD2").ok(),
@@ -669,6 +682,66 @@ async fn ssh_ecdsa_key_auth() {
         .await
         .unwrap();
     assert_eq!(int_cell(&r.rows[0]["v"]), 6);
+}
+
+/// RSA-4096 key auth (unencrypted). Regression test for the 0.10.2
+/// incident: without russh's `rsa` feature the key LOADS and the server
+/// even answers USERAUTH_PK_OK, but the follow-up signature cannot be
+/// produced (`AlgorithmUnsupported { algorithm: Rsa { hash: None } }`)
+/// — which used to surface as a plain "authentication failed". This
+/// test MUST fail on any build where RSA signing is compiled out; the
+/// compile_error! guard in src/lib.rs makes such builds fail even
+/// earlier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_rsa_key_auth() {
+    let Some(fx) = fixture() else {
+        eprintln!("skipping: SEQUEL_MCP_TEST_SSH_* not set");
+        return;
+    };
+    let Some(key) = fx.key_rsa.clone() else {
+        eprintln!("skipping: rsa key fixture not generated");
+        return;
+    };
+    ssh::invalidate_all();
+    pool_manager().invalidate_all();
+    let mut tunnel = ssh_tunnel(&fx, &fx.known_good, SshAuthMethod::Key);
+    tunnel.private_key_path = Some(key.display().to_string());
+    let conn = mysql_conn(Some(tunnel.clone()), &fx.mysql_user);
+    let r = run_through_tunnel(&fx, &conn, &tunnel, "SELECT 8 AS v")
+        .await
+        .unwrap();
+    assert_eq!(int_cell(&r.rows[0]["v"]), 8);
+}
+
+/// Script-driven pin phase (scripts/test-ssh.sh restricts the bastion
+/// to `PubkeyAcceptedAlgorithms rsa-sha2-256`): the client must
+/// negotiate AND sign with SHA-256. The incident's root symptom was
+/// signing without the negotiated hash (SHA-1 behind the server's
+/// back); if the negotiated hash ever stops reaching the signature,
+/// this bastion rejects it and the test fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_rsa_sha2_256_only_auth() {
+    let Some(fx) = fixture() else {
+        eprintln!("skipping: SEQUEL_MCP_TEST_SSH_* not set");
+        return;
+    };
+    if std::env::var("SEQUEL_MCP_TEST_SSH_RSA_PIN").ok().as_deref() != Some("sha2-256") {
+        eprintln!("skipping: rsa sha2-256 pin phase not active");
+        return;
+    }
+    let Some(key) = fx.key_rsa.clone() else {
+        eprintln!("skipping: rsa key fixture not generated");
+        return;
+    };
+    ssh::invalidate_all();
+    pool_manager().invalidate_all();
+    let mut tunnel = ssh_tunnel(&fx, &fx.known_good, SshAuthMethod::Key);
+    tunnel.private_key_path = Some(key.display().to_string());
+    let conn = mysql_conn(Some(tunnel.clone()), &fx.mysql_user);
+    let r = run_through_tunnel(&fx, &conn, &tunnel, "SELECT 10 AS v")
+        .await
+        .unwrap();
+    assert_eq!(int_cell(&r.rows[0]["v"]), 10);
 }
 
 /// Credential rotation: with the server-side password rotated by the
