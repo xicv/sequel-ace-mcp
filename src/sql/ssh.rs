@@ -64,6 +64,13 @@ pub enum SshError {
         port: u16,
         user: String,
     },
+    #[error("authentication aborted as {user:?} on {host}:{port}: {reason}")]
+    AuthAborted {
+        host: String,
+        port: u16,
+        user: String,
+        reason: String,
+    },
     #[error("host key rejected for {host}:{port}: {reason}")]
     HostKey {
         host: String,
@@ -72,6 +79,48 @@ pub enum SshError {
     },
     #[error("tunnel setup: {0}")]
     Setup(String),
+}
+
+/// Why an auth exchange can end WITHOUT a server verdict. russh 0.62
+/// collapses a dead session into `AuthResult::Failure` with an empty
+/// remaining-method set (the reply channel closes and
+/// `wait_recv_reply` maps `None` to `Failure`), so the 0.10.2 incident
+/// — RSA signing compiled out, ssh-key rejecting the signature as
+/// `AlgorithmUnsupported { algorithm: Rsa { hash: None } }` AFTER the
+/// server had already answered USERAUTH_PK_OK — surfaced as
+/// "authentication failed", indistinguishable from a rejected
+/// credential. This reason must make the difference visible.
+fn auth_abort_reason(key_is_rsa: bool) -> String {
+    if key_is_rsa && cfg!(not(feature = "rsa")) {
+        "no server verdict was delivered — the SSH session ended mid-auth. \
+         This build cannot SIGN RSA keys: russh's `rsa` feature is missing \
+         (enabled by sequel-mcp's default `rsa` feature). The key itself is \
+         fine and the server had not rejected it"
+            .into()
+    } else if key_is_rsa {
+        "no server verdict was delivered — the SSH session ended mid-auth, a \
+         signing/transport failure and NOT a rejected credential. For RSA keys \
+         the classic cause is a build without russh's `rsa` feature; \
+         RUST_LOG=russh=debug shows the underlying error"
+            .into()
+    } else {
+        "no server verdict was delivered — the SSH session ended mid-auth, a \
+         transport failure and NOT a rejected credential; RUST_LOG=russh=debug \
+         shows the underlying error"
+            .into()
+    }
+}
+
+/// True when the error means "we could not produce the signature the
+/// protocol asked for" rather than "the network/auth exchange broke".
+/// ssh-key reports exactly this shape when RSA signing support is
+/// compiled out (`Rsa { hash: None }` = the negotiated hash never
+/// reached the signer).
+fn is_signature_algorithm_error(e: &russh::Error) -> bool {
+    matches!(
+        e,
+        russh::Error::SshKey(russh::keys::ssh_key::Error::AlgorithmUnsupported { .. })
+    )
 }
 
 /// `russh` client handler whose only job is host-key verification via
@@ -487,6 +536,7 @@ async fn establish(
         // Authenticate with EXACTLY the configured method — no silent
         // fallback between password and key. The secret doubles as the
         // private-key passphrase under key auth.
+        let mut key_algorithm_was_rsa = false;
         let auth = match ssh.auth_method {
             SshAuthMethod::Password => {
                 let Some(password) = ssh_password else {
@@ -521,7 +571,8 @@ async fn establish(
                 // Let the server's advertised algorithms pick the RSA
                 // signature hash (SHA-512 preferred, SHA-256 next;
                 // legacy ssh-rsa/SHA-1 is never selected).
-                let hash_alg = if key.algorithm().is_rsa() {
+                key_algorithm_was_rsa = key.algorithm().is_rsa();
+                let hash_alg = if key_algorithm_was_rsa {
                     match handle.best_supported_rsa_hash().await {
                         Ok(best) => best.unwrap_or(Some(russh::keys::HashAlg::Sha256)),
                         Err(_) => Some(russh::keys::HashAlg::Sha256),
@@ -535,15 +586,50 @@ async fn establish(
                         russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
                     )
                     .await
-                    .map_err(|e| SshError::Transport(format!("publickey auth transport: {e}")))?
+                    .map_err(|e| {
+                        // A signature we cannot produce is NOT a
+                        // transport problem: name it as an aborted
+                        // auth so it cannot masquerade as a rejected
+                        // credential (the 0.10.2 incident).
+                        if is_signature_algorithm_error(&e) {
+                            SshError::AuthAborted {
+                                host: ssh.host.clone(),
+                                port: ssh.port,
+                                user: ssh.user.clone(),
+                                reason: auth_abort_reason(key_algorithm_was_rsa),
+                            }
+                        } else {
+                            SshError::Transport(format!("publickey auth transport: {e}"))
+                        }
+                    })?
             }
         };
-        if !matches!(auth, russh::client::AuthResult::Success) {
-            return Err(SshError::Auth {
-                host: ssh.host.clone(),
-                port: ssh.port,
-                user: ssh.user.clone(),
-            });
+        match auth {
+            russh::client::AuthResult::Success => {}
+            russh::client::AuthResult::Failure {
+                remaining_methods, ..
+            } => {
+                // A genuine USERAUTH_FAILURE carries the server's
+                // remaining-method list. russh 0.62 ALSO maps "the
+                // session died during auth" — reply channel closed,
+                // e.g. the signature could not be produced — to
+                // Failure, but with an EMPTY method set. Collapsing
+                // both into Auth is what made the 0.10.2 RSA signing
+                // failure read as a rejected credential.
+                if remaining_methods.is_empty() {
+                    return Err(SshError::AuthAborted {
+                        host: ssh.host.clone(),
+                        port: ssh.port,
+                        user: ssh.user.clone(),
+                        reason: auth_abort_reason(key_algorithm_was_rsa),
+                    });
+                }
+                return Err(SshError::Auth {
+                    host: ssh.host.clone(),
+                    port: ssh.port,
+                    user: ssh.user.clone(),
+                });
+            }
         }
         Ok(handle)
     };
@@ -803,5 +889,41 @@ mod tests {
         std::fs::write(&f, b"content-b").unwrap();
         assert_ne!(s1, known_hosts_stamp(Some(&f)));
         assert_eq!(known_hosts_stamp(None), "");
+    }
+
+    #[test]
+    fn auth_abort_reason_never_claims_rejection() {
+        // RSA: the reason must point at signing support (the feature
+        // gap), never at the credential. Wording differs between a
+        // feature-less build ("cannot SIGN") and a full build ("NOT a
+        // rejected credential"), so accept either shape.
+        let rsa = auth_abort_reason(true);
+        assert!(rsa.to_lowercase().contains("rsa"), "{rsa}");
+        assert!(
+            rsa.to_lowercase().contains("not rejected")
+                || rsa.to_lowercase().contains("not a rejected credential")
+                || rsa.to_lowercase().contains("cannot sign"),
+            "must not read as a rejected credential: {rsa}"
+        );
+        // Non-RSA: generic transport wording, no RSA red herring.
+        let other = auth_abort_reason(false);
+        assert!(
+            other.to_lowercase().contains("not a rejected credential"),
+            "{other}"
+        );
+        assert!(!other.to_lowercase().contains("rsa"), "{other}");
+    }
+
+    #[test]
+    fn signature_algorithm_error_discriminates() {
+        // The exact ssh-key shape from the 0.10.2 incident: an RSA
+        // signature whose negotiated hash never reached the signer.
+        let unsupported = russh::Error::SshKey(russh::keys::ssh_key::Error::AlgorithmUnsupported {
+            algorithm: russh::keys::Algorithm::Rsa { hash: None },
+        });
+        assert!(is_signature_algorithm_error(&unsupported));
+        // Other SshKey errors stay transport-classified.
+        let other = russh::Error::SshKey(russh::keys::ssh_key::Error::AlgorithmUnknown);
+        assert!(!is_signature_algorithm_error(&other));
     }
 }

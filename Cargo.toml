@@ -1,6 +1,6 @@
 [package]
 name = "sequel-mcp"
-version = "0.10.2"
+version = "0.10.3"
 edition = "2024"
 rust-version = "1.95"
 description = "Local-first, policy-gated MySQL/MariaDB and SQLite access for AI agents: native Rust MCP server, CLI and GUI"
@@ -14,6 +14,13 @@ exclude = ["docs/rust-rewrite", "tests/fixtures/legacy", ".github", ".codex", "s
 [[bin]]
 name = "sequel-mcp"
 path = "src/bin/sequel_mcp.rs"
+
+[features]
+# RSA SSH key support forwards to russh's `rsa` feature (RSA signing +
+# PKCS key parsing). See the compile_error! guard in src/lib.rs: a build
+# without it fails HERE rather than at runtime against a bastion.
+default = ["rsa"]
+rsa = ["russh/rsa"]
 
 [lib]
 name = "sequel_mcp"
@@ -37,8 +44,10 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # negotiated hash and signs as `Rsa { hash: None }` (SHA-1) — which ssh-key
 # rejects with `AlgorithmUnsupported`. It fails at AUTH, after the server has
 # already sent USERAUTH_PK_OK, so it looks like a rejected credential rather
-# than a missing feature. Keep "rsa" whenever default-features is false.
-russh = { version = "0.62", default-features = false, features = ["ring", "rsa"] }
+# than a missing feature. The feature is forwarded from OUR [features] table
+# (NOT listed here) so the compile_error! guard in src/lib.rs can track it;
+# do not re-add "rsa" to this dependency's features list.
+russh = { version = "0.62", default-features = false, features = ["ring"] }
 plist = "1"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
