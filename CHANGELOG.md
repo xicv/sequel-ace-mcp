@@ -2,6 +2,24 @@
 
 All notable changes to **sequel-mcp** are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.3] — 2026-08-24
+
+### Fixed (RSA SSH keys could not authenticate)
+
+- **RSA-key SSH tunnels work again — no config change is needed, just upgrade.** Anyone on 0.10.0–0.10.2 whose bastion credentials are RSA keys (ed25519, ecdsa and password auth were never affected) saw every such connection fail as `authentication as "<user>" failed on <host>:22`. The key loaded, the bastion answered `USERAUTH_PK_OK`, and only the follow-up signature failed — so the error read as a rejected credential. Root cause: russh's default features are `["flate2", "aws-lc-rs", "rsa"]`, and this crate selects the `ring` backend via `default-features = false`, which silently dropped `rsa` too. Without it, an RSA keypair falls through to russh's generic signer, loses the negotiated SHA-2 hash and signs as SHA-1, which ssh-key rejects (`AlgorithmUnsupported { algorithm: Rsa { hash: None } }`).
+- **A build without RSA support now fails at compile time instead of at a customer bastion.** `rsa` is a first-class feature of this crate (default-on, forwarding to russh's `rsa`); building without it trips a `compile_error!` in `src/lib.rs` naming the feature and the exact failure mode. Previously such a build shipped fine and failed only at runtime with the misleading auth error.
+- **Auth errors no longer lie about signature failures.** russh 0.62 reports "the SSH session died during authentication" — e.g. because the signature could not be produced — as a plain `AuthResult::Failure`, identical to a server rejection. sequel-mcp now distinguishes the two: a server verdict surfaces as before, while a session that ended without one surfaces as `authentication aborted as … : no server verdict was delivered — … NOT a rejected credential`, naming the classic RSA-feature cause for RSA keys and pointing at `RUST_LOG=russh=debug` for the underlying error. This distinction is what the incident lacked: a multi-hour hunt behind a message that implicated the credential.
+
+### Tests
+
+- The SSH harness finally covers RSA: a 4096-bit key (the real-world bastion shape) is generated per run, installed in the bastion's `authorized_keys`, and drives a full authenticate-and-query test (`ssh_rsa_key_auth`). Dropping russh's `rsa` feature makes exactly this test fail — verified by deliberately removing the feature and watching it fail with the aborted-auth error naming the missing feature, then restoring it (the other 23 tests were unaffected either way, proving ed25519/encrypted/ecdsa/password never depended on it).
+- New harness phase pins the hash negotiation: the bastion is reconfigured to accept ONLY `rsa-sha2-256` (`PubkeyAcceptedAlgorithms`), and the RSA test re-runs against it — proving the negotiated hash actually reaches the signature. The incident's essence was signing SHA-1 behind the server's back; a hash-negotiation regression now fails against the restricted bastion.
+- The live matrix honors `RUST_LOG` (e.g. `russh=debug`) through a stderr tracing subscriber — the wire-level trace that cracked this diagnosis now works in the harness, not only in ad-hoc probes.
+
+### Notes
+
+- Patch bump: this restores functionality 0.10.x always documented (RSA keys among the supported SSH credentials), adds no API, and default-feature installs are strictly fixed. The new compile guard changes behavior only for `--no-default-features` builds — which were already broken at runtime, with a misleading error.
+
 ## [0.10.2] — 2026-08-23
 
 ### Fixed (security integrity — review P1)
