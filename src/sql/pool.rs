@@ -43,9 +43,10 @@ impl CredentialGeneration {
     /// identical passwords yield identical generations (same process);
     /// the same password leaked from another process does not match.
     pub fn derive(password: &str) -> Self {
-        use hmac::Mac;
+        // hmac 0.13: key construction lives on `KeyInit`, not `Mac`.
+        use hmac::{KeyInit, Mac};
         let key = process_key();
-        let mut mac = <hmac::Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(key)
+        let mut mac = <hmac::Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key)
             .expect("HMAC accepts any key length");
         mac.update(b"sequel-mcp/credential-generation/v1\n");
         mac.update(password.as_bytes());

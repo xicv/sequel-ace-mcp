@@ -371,7 +371,8 @@ pub fn decide_host_key(
 /// primitive — it is never used for signatures, password hashing, or any
 /// secret-protection purpose.
 fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
-    use hmac::Mac;
+    // hmac 0.13: key construction lives on `KeyInit`, not `Mac`.
+    use hmac::{KeyInit, Mac};
     type HmacSha1 = hmac::Hmac<sha1::Sha1>;
     let mut mac = HmacSha1::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);

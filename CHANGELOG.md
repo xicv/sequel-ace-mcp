@@ -2,6 +2,20 @@
 
 All notable changes to **sequel-mcp** are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] — 2026-09-04
+
+### Changed (dependency refresh — no config or behavior change for existing users)
+
+- **russh 0.62.7 → 0.63.2.** Picks up the upstream fix for the RSA-signing trap this project reported ([Eugeny/russh#758](https://github.com/Eugeny/russh/issues/758), fixed in russh 0.63.2): russh now fails loudly at signing time when built without its `rsa` feature instead of silently signing SHA-1 behind the server's back. sequel-mcp keeps its own stronger layers — the `compile_error!` build guard and the aborted-vs-rejected auth discrimination (upstream still collapses a session that dies mid-auth into a plain `AuthResult::Failure`; the typed `AuthAborted` error remains our caller-visible fix). One visible nuance: a bastion presenting an SSH **certificate** as its host key is now refused outright — no known_hosts entry can match a certificate, and reducing it to its signing key would bypass the pin.
+- **rmcp 3.1.4 → 3.2.0** (MCP protocol layer; the full lifecycle suite — tools, prompts, resources, elicitation, approval replay — is green on it).
+- **Crypto utility lines: sha2 0.11, sha1 0.11, hmac 0.13, base64 0.23.** Digest outputs are unchanged by construction (SHA-256 is SHA-256), so audit-chain hashes, known_hosts stamps and credential-generation keys remain exactly what they were; the only code change was hmac 0.13 moving key construction to the `KeyInit` trait (internal).
+- **Lockfile refresh across the tree** (mysql_async 0.37.1, uuid 1.26, aws-lc-sys, naga, flate2 and dozens more patch-level updates).
+
+### Notes
+
+- **Deliberately held back:** `rand` stays 0.9 (0.10 removes the `RngCore` re-export this codebase uses, for zero functional gain); `sqlparser` is already at its latest (0.62.0, exact-pinned by design for classifier stability).
+- **Why a minor bump:** cross-major dependency moves (russh 0.62→0.63, the crypto 0.x lines) plus the new fail-closed behavior for certificate host keys — a patch would understate the surface, and none of it breaks existing configurations.
+
 ## [0.10.3] — 2026-08-24
 
 ### Fixed (RSA SSH keys could not authenticate)

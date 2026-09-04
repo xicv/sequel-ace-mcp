@@ -33,4 +33,4 @@ compile_error!(
 );
 
 pub const PACKAGE_NAME: &str = "sequel-mcp";
-pub const PACKAGE_VERSION: &str = "0.10.3";
+pub const PACKAGE_VERSION: &str = "0.11.0";

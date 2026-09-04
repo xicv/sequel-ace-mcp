@@ -81,15 +81,18 @@ pub enum SshError {
     Setup(String),
 }
 
-/// Why an auth exchange can end WITHOUT a server verdict. russh 0.62
-/// collapses a dead session into `AuthResult::Failure` with an empty
-/// remaining-method set (the reply channel closes and
-/// `wait_recv_reply` maps `None` to `Failure`), so the 0.10.2 incident
-/// — RSA signing compiled out, ssh-key rejecting the signature as
-/// `AlgorithmUnsupported { algorithm: Rsa { hash: None } }` AFTER the
-/// server had already answered USERAUTH_PK_OK — surfaced as
-/// "authentication failed", indistinguishable from a rejected
-/// credential. This reason must make the difference visible.
+/// Why an auth exchange can end WITHOUT a server verdict. russh
+/// (0.62 and 0.63 alike) collapses a dead session into
+/// `AuthResult::Failure` with an empty remaining-method set (the reply
+/// channel closes and `wait_recv_reply` maps `None` to `Failure`), so
+/// the 0.10.2 incident — RSA signing compiled out, ssh-key rejecting
+/// the signature as `AlgorithmUnsupported { algorithm: Rsa { hash:
+/// None } }` AFTER the server had already answered USERAUTH_PK_OK —
+/// surfaced as "authentication failed", indistinguishable from a
+/// rejected credential. This reason must make the difference visible.
+/// (russh 0.63.2 also logs-and-fails this case inside the session task
+/// — Eugeny/russh#758 — but the caller-visible shape is unchanged, so
+/// this discrimination remains ours.)
 fn auth_abort_reason(key_is_rsa: bool) -> String {
     if key_is_rsa && cfg!(not(feature = "rsa")) {
         "no server verdict was delivered — the SSH session ended mid-auth. \
@@ -143,9 +146,17 @@ impl client::Handler for HostKeyHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &russh::keys::PublicKey,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        let raw = server_public_key.public_key_bytes();
+        // The known_hosts engine compares raw key bytes. russh 0.63 can
+        // also surface host CERTIFICATES here; no stored entry can ever
+        // match one, so they fail closed rather than being reduced to
+        // their signing key (which would smuggle an unverified
+        // certificate's key past the pin).
+        let raw = match server_public_key {
+            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => key.public_key_bytes(),
+            russh::keys::PublicKeyOrCertificate::Certificate(_) => return Ok(false),
+        };
         let mut logs: Vec<String> = Vec::new();
         let decision = known_hosts::decide_host_key(
             self.policy,

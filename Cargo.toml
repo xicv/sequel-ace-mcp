@@ -1,6 +1,6 @@
 [package]
 name = "sequel-mcp"
-version = "0.10.3"
+version = "0.11.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Local-first, policy-gated MySQL/MariaDB and SQLite access for AI agents: native Rust MCP server, CLI and GUI"
@@ -27,7 +27,7 @@ name = "sequel_mcp"
 path = "src/lib.rs"
 
 [dependencies]
-rmcp = { version = "=3.1.4", features = ["server", "macros", "schemars", "transport-io", "elicitation"] }
+rmcp = { version = "=3.2.0", features = ["server", "macros", "schemars", "transport-io", "elicitation"] }
 schemars = "1"
 futures-util = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "fs", "process", "signal"] }
@@ -47,15 +47,15 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # than a missing feature. The feature is forwarded from OUR [features] table
 # (NOT listed here) so the compile_error! guard in src/lib.rs can track it;
 # do not re-add "rsa" to this dependency's features list.
-russh = { version = "0.62", default-features = false, features = ["ring"] }
+russh = { version = "0.63", default-features = false, features = ["ring"] }
 plist = "1"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sha2 = "0.10"
-sha1 = "0.10"
-hmac = "0.12"
-base64 = "0.22"
+sha2 = "0.11"
+sha1 = "0.11"
+hmac = "0.13"
+base64 = "0.23"
 thiserror = "2"
 rand = "0.9"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
