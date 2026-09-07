@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/xicv-sequel-mcp-badge.png)](https://mseep.ai/app/xicv-sequel-mcp)
+
 # sequel-mcp
 
 [![CI](https://github.com/xicv/sequel-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/xicv/sequel-mcp/actions/workflows/ci.yml)
